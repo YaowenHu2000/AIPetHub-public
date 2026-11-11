@@ -1,0 +1,104 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>三种做法对比</title>
+<style>
+  :root { --bg: #110f1e; --stage: #0f0d1b; --panel: #161427; --border: rgba(255,255,255,.08); --text: #f1eefb; --muted: rgba(241,238,251,.66); --faint: rgba(241,238,251,.42); --accent: #8e7cf0; --accent-soft: rgba(142,124,240,.15); }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--text); font: 14px/1.6 -apple-system, "PingFang SC", sans-serif; }
+  main { max-width: 1200px; margin: 0 auto; padding: 24px 16px 48px; }
+  h1 { font-size: 20px; margin: 0 0 4px; }
+  .sub { color: var(--muted); margin: 0 0 16px; }
+  .bar { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; margin-bottom: 14px; }
+  .bar span { color: var(--faint); margin-right: 4px; }
+  button { background: transparent; color: var(--muted); border: 1px solid var(--border); border-radius: 8px; padding: 5px 12px; font: inherit; cursor: pointer; }
+  button.on { background: var(--accent-soft); border-color: var(--accent); color: var(--text); }
+  .cols { display: grid; grid-template-columns: repeat(3, 1fr); gap: 14px; }
+  @media (max-width: 760px) { .cols { grid-template-columns: 1fr; } }
+  .col { background: var(--panel); border: 1px solid var(--border); border-radius: 14px; padding: 12px; }
+  .col h2 { font-size: 15px; margin: 0; }
+  .col p { margin: 2px 0 8px; color: var(--faint); font-size: 12.5px; min-height: 2.6em; }
+  .stage { position: relative; aspect-ratio: 1; background: var(--stage); border-radius: 10px; overflow: hidden; }
+  .stage .box { position: absolute; left: 17.5%; bottom: 3%; width: 65%; aspect-ratio: 1; }
+  .stage img { position: absolute; inset: 0; width: 100%; height: 100%; object-fit: contain; }
+  .frame-box img { filter: drop-shadow(0 8px 12px rgba(0,0,0,.5)); }
+  .pet-rig-canvas { position: absolute; left: -20%; top: -20%; width: 140%; height: 140%; pointer-events: none; }
+  .grid { margin-top: 22px; }
+  .grid h3 { font-size: 15px; margin: 0 0 8px; }
+  .gifs { display: grid; grid-template-columns: repeat(7, 1fr); gap: 8px; }
+  @media (max-width: 760px) { .gifs { grid-template-columns: repeat(2, 1fr); } }
+  .gifs figure { margin: 0; background: var(--stage); border-radius: 10px; padding: 6px; text-align: center; }
+  .gifs img { width: 100%; display: block; }
+  .gifs figcaption { color: var(--muted); font-size: 12px; }
+</style>
+</head>
+<body>
+<main>
+  <h1>极其猫：逐帧 / 分层骨骼 / GIF 对比</h1>
+  <p class="sub">同一个动作三种做法并排放。逐帧是 App 现在的 12 帧图；骨骼是分层美术 + 代码驱动；GIF 是 APIMart 一次画好的 12 帧（256 色、透明只有全透 / 不透）。</p>
+  <div class="bar" id="modes"><span>动作</span></div>
+  <div class="cols">
+    <div class="col"><h2>AI 逐帧</h2><p id="i1"></p><div class="stage"><div class="box frame-box"><img id="frame" alt=""></div></div></div>
+    <div class="col"><h2>分层美术 + 骨骼</h2><p id="i2">和 App 用的是同一套运行库</p><div class="stage"><div class="box" id="rigBox"></div></div></div>
+    <div class="col"><h2>GIF（APIMart）</h2><p id="i3"></p><div class="stage"><div class="box"><img id="gif" alt=""></div></div></div>
+  </div>
+  <div class="grid">
+    <h3>极其猫全部 GIF</h3>
+    <div class="gifs" id="all"></div>
+  </div>
+</main>
+<script src="../rig/pet-rig.js"></script>
+<script>
+const MODES = { idle: '待机', thinking: '思考', reading: '查阅', working: '施工', dragged: '拖拽', walk: '走路', happy: '开心' };
+const SKIN = '../sprites/gemini/default/';
+const pad = i => String(i).padStart(2, '0');
+let mode = 'idle', timer = null, rig = null;
+
+function playFrames() {
+  clearInterval(timer); clearTimeout(timer);
+  const img = document.getElementById('frame'), info = document.getElementById('i1');
+  let urls, ms, seq;
+  if (mode === 'idle') {
+    info.textContent = '一张待机图，隔几秒换三张眨眼图';
+    const blink = () => {
+      let t = 0;
+      for (const [k, d] of [['idle', 2600], ['idle_blink_half', 70], ['idle_blink_closed', 110], ['idle_blink_half', 70]]) { timer = setTimeout(() => { if (mode === 'idle') img.src = SKIN + k + '.png'; }, t); t += d; }
+      timer = setTimeout(() => { if (mode === 'idle') blink(); }, t);
+    };
+    img.src = SKIN + 'idle.png'; blink(); return;
+  }
+  if (mode === 'happy') { info.textContent = '一张开心图'; img.src = SKIN + 'happy.png'; return; }
+  if (mode === 'walk') { urls = Array.from({ length: 8 }, (_, i) => `${SKIN}walk_f${i}.png`); seq = [...urls.keys()]; ms = 95; info.textContent = '8 帧走路（每帧 95ms）'; }
+  else {
+    urls = Array.from({ length: 12 }, (_, i) => `${SKIN}${mode}_g${pad(i)}.png`);
+    const all = [...urls.keys()];
+    seq = mode === 'dragged' ? [...all, ...all.slice(1, -1).reverse()] : all;
+    ms = { thinking: 180, reading: 120, working: 100, dragged: 100 }[mode];
+    info.textContent = `12 帧轮流换（每帧 ${ms}ms）`;
+  }
+  urls.forEach(u => { new Image().src = u; });
+  let i = 0; img.src = urls[seq[0]];
+  timer = setInterval(() => { i = (i + 1) % seq.length; img.src = urls[seq[i]]; }, ms);
+}
+
+function setMode(m) {
+  mode = m;
+  for (const b of document.querySelectorAll('#modes button')) b.classList.toggle('on', b.dataset.m === m);
+  playFrames();
+  if (rig) rig.setState(m);
+  document.getElementById('gif').src = `gif/gemini/${m}.gif`;
+  document.getElementById('i3').textContent = m === 'walk' ? '8 帧，一张图上一起画好' : '12 帧，一张图上一起画好（每帧 200ms）';
+}
+
+const bar = document.getElementById('modes');
+for (const [m, n] of Object.entries(MODES)) { const b = document.createElement('button'); b.textContent = n; b.dataset.m = m; b.onclick = () => setMode(m); bar.append(b); }
+const all = document.getElementById('all');
+for (const [m, n] of Object.entries(MODES)) { all.insertAdjacentHTML('beforeend', `<figure><img src="gif/gemini/${m}.gif" alt="${n}"><figcaption>${n}</figcaption></figure>`); }
+
+PetRig.create('gemini', document.getElementById('rigBox'), '../rig/').then(c => { rig = c; if (rig) rig.setState(mode); else document.getElementById('i2').textContent = '骨骼模型没加载出来'; });
+setMode('idle');
+</script>
+</body>
+</html>

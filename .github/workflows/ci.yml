@@ -1,0 +1,15 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  build-and-test:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: 离线测试（解析器、Markdown、脚本语法）
+        run: ai-pet-hub/tools/test.sh
+      - name: 打包
+        run: ai-pet-hub/build.sh

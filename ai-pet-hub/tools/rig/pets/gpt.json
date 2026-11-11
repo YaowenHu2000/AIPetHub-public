@@ -1,0 +1,20 @@
+{
+ "desc": "She is a chibi dragon girl with long wavy silver-lavender hair, a pair of curled pale purple dragon horns, a white rose hair ornament, pointed elf ears, purple eyes, a white dress with a flowing sheer overskirt, bat wings, a white scaly dragon tail, and a small blue cloud spirit floating at her right side.",
+ "arms": "both hands, the bracelets, and the long flowing white sleeve on her raised arm",
+ "ears": null,
+ "head_extra": "the dragon horns, the pointed ears and the white rose ornament",
+ "nobody_keep": "the long silver-lavender back hair, the bat wings, the white dragon tail and the small blue cloud spirit",
+ "iso_extra": "wings, tail, the cloud spirit",
+ "poses": {
+  "working": "Change only her arms: both hands now held in front of her chest at stomach height, fingers lightly curled downward as if typing on an invisible floating keyboard. Do not draw any keyboard.",
+  "reading": "Change only her arms: she holds a light cyan translucent data tablet with both hands in front of her chest and looks at it.",
+  "thinking": "Change only her arms: her right hand (on the left side of the image) is raised with the index finger touching her chin while thinking; her other arm rests across her waist.",
+  "dragged": "Change only her arms: both arms raised up and outward, hands open and flailing in panic as if she is being picked up."
+ },
+ "skin": "gpt/v2",
+ "props": {
+  "thinking": "the blue cloud-shaped thought bubbles with gears and the small bubbles",
+  "reading": "the light cyan translucent data tablet she holds",
+  "working": "the green holographic keyboard in front of her and the green holographic screens beside her"
+ }
+}

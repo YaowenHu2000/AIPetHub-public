@@ -1,0 +1,23 @@
+# 编译输出（./build.sh 生成）
+ai-pet-hub/build/
+
+# 已停用的旧版独立桌宠：含编译好的二进制和大体积 base64 脚本，只在本机保留作参考
+claude-desktop-pet/
+gemini-desktop-pet/
+gpt-desktop-pet/
+
+# 系统 / 工具的本地文件
+.DS_Store
+.claude/*
+!.claude/skills/
+*.swp
+
+# 鲸鱼娘的参考设定图是别人的作品，只在本机当参考，不进仓库
+ai-pet-hub/tools/sprites/deepseek/ref/
+
+# 鲸鱼娘画图过程中的候选图和预览：只在本机留着，成品在 web/sprites/deepseek/
+ai-pet-hub/tools/sprites/deepseek/candidates/
+ai-pet-hub/tools/sprites/deepseek/out/
+
+# 本机生图代理的地址和密钥（tools/rig/imgapi.py 读它）
+ai-pet-hub/tools/rig/cpa.local

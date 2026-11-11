@@ -1,0 +1,20 @@
+{
+ "desc": "She is a chibi cat girl with long blue-to-purple gradient hair, cat ears, a star hair clip, heterochromia eyes (left pink, right gold), navy top with big detached sleeves with white cuffs, white frilled skirt, white socks, navy shoes, and a fluffy purple cat tail.",
+ "arms": "both hands, the white wrist cuffs and both big navy detached sleeves",
+ "ears": "the two cat ears",
+ "head_extra": "the cat ears, the hair buns and the star hair clip",
+ "nobody_keep": "the long blue-to-purple back hair and the fluffy purple cat tail",
+ "iso_extra": "tail, sparkles",
+ "poses": {
+  "working": "Change only her arms: both hands now held in front of her chest at the height of her stomach, fingers lightly curled downward as if typing on an invisible floating keyboard; the big sleeves hang naturally from her forearms. Do not draw any keyboard.",
+  "reading": "Change only her arms: she holds a glowing translucent holographic page (light cyan, with lines of text) with both hands in front of her chest, a little to her left side, and looks at it.",
+  "thinking": "Change only her arms: her right hand (on the left side of the image) is raised with the index finger touching her chin while thinking; her other arm rests across her waist; the big sleeves hang naturally.",
+  "dragged": "Change only her arms: both arms raised up and outward, hands open and flailing in panic as if she is being picked up; the big sleeves flutter."
+ },
+ "skin": "gemini/default",
+ "props": {
+  "thinking": "the starry purple thought bubble with a question mark above her and the sparkles",
+  "reading": "the star-shaped glasses, the glowing translucent holographic text page and the star magnifier",
+  "working": "the glowing purple holographic keyboard in front of her and the floating code symbols and golden sparkles"
+ }
+}

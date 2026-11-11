@@ -1,0 +1,95 @@
+/* ===== 连续曲率的圆角 =====
+   CSS 的 border-radius 是四分之一圆：直边到圆弧的地方曲率是突然从 0 跳上去的，看着生硬。
+   这里换成苹果界面用的那种圆角（曲率从直边慢慢过渡进弯里），用 clip-path: shape() 画，曲线是 iOS 圆角矩形的那组三段贝塞尔。
+   这份 WebKit 还不支持 corner-shape，所以分两种做法：
+   · 只有底色的（按钮、列表行、气泡、代码块）：直接把元素裁成这个形状；
+   · 有边线 / 阴影 / 内发光的（桌宠卡片、输入框、弹出面板、改动卡片）：元素自己不画底和边，
+     由两个伪元素画——::after 是底，::before 是 1px 的环（外圈减内圈），颜色用 --sq-fill / --sq-line 传进来；
+     阴影用 filter: drop-shadow 加在元素上（box-shadow 会被裁掉，也不跟着这个形状走）。
+   半径 --r 要满足 1.53 × --r ≤ 短边的一半，否则曲线会交叉；又扁又圆的（状态胶囊、滑杆）本来就是胶囊形，不用改。
+   两条 shape() 很长但是机械的：同一组系数（--a … --g = 半径 × 固定比例）在四个角各用一遍；环的内圈用 --ia … --ig（半径减去线宽）。 */
+
+/* ---------- 各处的半径 ---------- */
+.icon-btn, .card-gear, .mp-icon { --r: 7px; }
+.chip, .conv-row, .grp-head, .suggest-row { --r: 8px; }
+.pop-item { --r: 10px; }
+.composer-box .chip { --r: 9px; }   /* 输入框里的按钮：尽量跟输入框的角同心（18 − 7 = 11），但它只有 28 高，再大曲线会交叉 */
+.msg pre, .md-doc pre.md-code { --r: 10px; }
+.msg.user:not(.has-images), .msg.user .msg-text { --r: 13px; }
+.agent-badge { --r: 9px; }
+.files-card, .req-card { --r: 12px; }
+#popover, #popover-sub { --r: 18px; border-radius: 18px; }   /* 和输入框同一档：它就是从输入框上弹出来的，两个角挨着 */
+.composer-box { --r: 18px; }
+.pet-card { --r: 20px; }
+
+/* ---------- 只有底色的：直接裁 ---------- */
+.icon-btn, .card-gear, .chip, .pop-item, .conv-row, .grp-head, .suggest-row, .mp-icon, .msg pre, .md-doc pre.md-code {
+  --a: calc(var(--r) * 1.528665); --b: calc(var(--r) * 1.088493); --c: calc(var(--r) * 0.868407); --d: calc(var(--r) * 0.631494); --e: calc(var(--r) * 0.074911); --f: calc(var(--r) * 0.372824); --g: calc(var(--r) * 0.16906);
+  border-radius: var(--r);
+  clip-path: shape(from var(--a) 0, line to calc(100% - var(--a)) 0, curve to calc(100% - var(--d)) var(--e) with calc(100% - var(--b)) 0 / calc(100% - var(--c)) 0, curve to calc(100% - var(--e)) var(--d) with calc(100% - var(--f)) var(--g) / calc(100% - var(--g)) var(--f), curve to 100% var(--a) with 100% var(--c) / 100% var(--b), line to 100% calc(100% - var(--a)), curve to calc(100% - var(--e)) calc(100% - var(--d)) with 100% calc(100% - var(--b)) / 100% calc(100% - var(--c)), curve to calc(100% - var(--d)) calc(100% - var(--e)) with calc(100% - var(--g)) calc(100% - var(--f)) / calc(100% - var(--f)) calc(100% - var(--g)), curve to calc(100% - var(--a)) 100% with calc(100% - var(--c)) 100% / calc(100% - var(--b)) 100%, line to var(--a) 100%, curve to var(--d) calc(100% - var(--e)) with var(--b) 100% / var(--c) 100%, curve to var(--e) calc(100% - var(--d)) with var(--f) calc(100% - var(--g)) / var(--g) calc(100% - var(--f)), curve to 0 calc(100% - var(--a)) with 0 calc(100% - var(--c)) / 0 calc(100% - var(--b)), line to 0 var(--a), curve to var(--e) var(--d) with 0 var(--b) / 0 var(--c), curve to var(--d) var(--e) with var(--g) var(--f) / var(--f) var(--g), curve to var(--a) 0 with var(--c) 0 / var(--b) 0, close);
+}
+.md-doc pre.md-code { border: none; }
+
+/* ---------- 有边线的：两个伪元素画底和环 ---------- */
+.pet-card, .composer-box, #popover:not(.scrolls), #popover-sub, .files-card, .req-card, .agent-badge, .msg.user:not(.has-images), .msg.user .msg-text {
+  --sq-w: 1px;
+  --a: calc(var(--r) * 1.528665); --b: calc(var(--r) * 1.088493); --c: calc(var(--r) * 0.868407); --d: calc(var(--r) * 0.631494); --e: calc(var(--r) * 0.074911); --f: calc(var(--r) * 0.372824); --g: calc(var(--r) * 0.16906);
+  --ia: calc((var(--r) - var(--sq-w)) * 1.528665); --ib: calc((var(--r) - var(--sq-w)) * 1.088493); --ic: calc((var(--r) - var(--sq-w)) * 0.868407); --id: calc((var(--r) - var(--sq-w)) * 0.631494); --ie: calc((var(--r) - var(--sq-w)) * 0.074911); --if: calc((var(--r) - var(--sq-w)) * 0.372824); --ig: calc((var(--r) - var(--sq-w)) * 0.16906);
+  position: relative; isolation: isolate;
+  border: 0 solid transparent; border-radius: var(--r); background: none; box-shadow: none;
+  filter: var(--sq-shadow, none);
+}
+#popover:not(.scrolls), #popover-sub { position: fixed; }
+.pet-card::before, .composer-box::before, #popover:not(.scrolls)::before, #popover-sub::before, .files-card::before, .req-card::before, .agent-badge::before, .msg.user:not(.has-images)::before, .msg.user .msg-text::before, .pet-card::after, .composer-box::after, #popover:not(.scrolls)::after, #popover-sub::after, .files-card::after, .req-card::after, .agent-badge::after, .msg.user:not(.has-images)::after, .msg.user .msg-text::after {
+  content: ''; position: absolute; inset: 0; pointer-events: none; border-radius: var(--r);
+  transition: background-color 0.25s, box-shadow 0.25s;
+}
+.pet-card::after, .composer-box::after, #popover:not(.scrolls)::after, #popover-sub::after, .files-card::after, .req-card::after, .agent-badge::after, .msg.user:not(.has-images)::after, .msg.user .msg-text::after {
+  z-index: -2; background: var(--sq-fill, transparent); box-shadow: var(--sq-glow, none);
+  clip-path: shape(from var(--a) 0, line to calc(100% - var(--a)) 0, curve to calc(100% - var(--d)) var(--e) with calc(100% - var(--b)) 0 / calc(100% - var(--c)) 0, curve to calc(100% - var(--e)) var(--d) with calc(100% - var(--f)) var(--g) / calc(100% - var(--g)) var(--f), curve to 100% var(--a) with 100% var(--c) / 100% var(--b), line to 100% calc(100% - var(--a)), curve to calc(100% - var(--e)) calc(100% - var(--d)) with 100% calc(100% - var(--b)) / 100% calc(100% - var(--c)), curve to calc(100% - var(--d)) calc(100% - var(--e)) with calc(100% - var(--g)) calc(100% - var(--f)) / calc(100% - var(--f)) calc(100% - var(--g)), curve to calc(100% - var(--a)) 100% with calc(100% - var(--c)) 100% / calc(100% - var(--b)) 100%, line to var(--a) 100%, curve to var(--d) calc(100% - var(--e)) with var(--b) 100% / var(--c) 100%, curve to var(--e) calc(100% - var(--d)) with var(--f) calc(100% - var(--g)) / var(--g) calc(100% - var(--f)), curve to 0 calc(100% - var(--a)) with 0 calc(100% - var(--c)) / 0 calc(100% - var(--b)), line to 0 var(--a), curve to var(--e) var(--d) with 0 var(--b) / 0 var(--c), curve to var(--d) var(--e) with var(--g) var(--f) / var(--f) var(--g), curve to var(--a) 0 with var(--c) 0 / var(--b) 0, close);
+}
+.pet-card::before, .composer-box::before, #popover:not(.scrolls)::before, #popover-sub::before, .files-card::before, .req-card::before, .agent-badge::before, .msg.user:not(.has-images)::before, .msg.user .msg-text::before {
+  z-index: -1; background: var(--sq-line, transparent);
+  clip-path: shape(evenodd from var(--a) 0, line to calc(100% - var(--a)) 0, curve to calc(100% - var(--d)) var(--e) with calc(100% - var(--b)) 0 / calc(100% - var(--c)) 0, curve to calc(100% - var(--e)) var(--d) with calc(100% - var(--f)) var(--g) / calc(100% - var(--g)) var(--f), curve to 100% var(--a) with 100% var(--c) / 100% var(--b), line to 100% calc(100% - var(--a)), curve to calc(100% - var(--e)) calc(100% - var(--d)) with 100% calc(100% - var(--b)) / 100% calc(100% - var(--c)), curve to calc(100% - var(--d)) calc(100% - var(--e)) with calc(100% - var(--g)) calc(100% - var(--f)) / calc(100% - var(--f)) calc(100% - var(--g)), curve to calc(100% - var(--a)) 100% with calc(100% - var(--c)) 100% / calc(100% - var(--b)) 100%, line to var(--a) 100%, curve to var(--d) calc(100% - var(--e)) with var(--b) 100% / var(--c) 100%, curve to var(--e) calc(100% - var(--d)) with var(--f) calc(100% - var(--g)) / var(--g) calc(100% - var(--f)), curve to 0 calc(100% - var(--a)) with 0 calc(100% - var(--c)) / 0 calc(100% - var(--b)), line to 0 var(--a), curve to var(--e) var(--d) with 0 var(--b) / 0 var(--c), curve to var(--d) var(--e) with var(--g) var(--f) / var(--f) var(--g), curve to var(--a) 0 with var(--c) 0 / var(--b) 0, close, move to calc(var(--sq-w) + var(--ia)) var(--sq-w), line to calc(100% - var(--sq-w) - var(--ia)) var(--sq-w), curve to calc(100% - var(--sq-w) - var(--id)) calc(var(--sq-w) + var(--ie)) with calc(100% - var(--sq-w) - var(--ib)) var(--sq-w) / calc(100% - var(--sq-w) - var(--ic)) var(--sq-w), curve to calc(100% - var(--sq-w) - var(--ie)) calc(var(--sq-w) + var(--id)) with calc(100% - var(--sq-w) - var(--if)) calc(var(--sq-w) + var(--ig)) / calc(100% - var(--sq-w) - var(--ig)) calc(var(--sq-w) + var(--if)), curve to calc(100% - var(--sq-w)) calc(var(--sq-w) + var(--ia)) with calc(100% - var(--sq-w)) calc(var(--sq-w) + var(--ic)) / calc(100% - var(--sq-w)) calc(var(--sq-w) + var(--ib)), line to calc(100% - var(--sq-w)) calc(100% - var(--sq-w) - var(--ia)), curve to calc(100% - var(--sq-w) - var(--ie)) calc(100% - var(--sq-w) - var(--id)) with calc(100% - var(--sq-w)) calc(100% - var(--sq-w) - var(--ib)) / calc(100% - var(--sq-w)) calc(100% - var(--sq-w) - var(--ic)), curve to calc(100% - var(--sq-w) - var(--id)) calc(100% - var(--sq-w) - var(--ie)) with calc(100% - var(--sq-w) - var(--ig)) calc(100% - var(--sq-w) - var(--if)) / calc(100% - var(--sq-w) - var(--if)) calc(100% - var(--sq-w) - var(--ig)), curve to calc(100% - var(--sq-w) - var(--ia)) calc(100% - var(--sq-w)) with calc(100% - var(--sq-w) - var(--ic)) calc(100% - var(--sq-w)) / calc(100% - var(--sq-w) - var(--ib)) calc(100% - var(--sq-w)), line to calc(var(--sq-w) + var(--ia)) calc(100% - var(--sq-w)), curve to calc(var(--sq-w) + var(--id)) calc(100% - var(--sq-w) - var(--ie)) with calc(var(--sq-w) + var(--ib)) calc(100% - var(--sq-w)) / calc(var(--sq-w) + var(--ic)) calc(100% - var(--sq-w)), curve to calc(var(--sq-w) + var(--ie)) calc(100% - var(--sq-w) - var(--id)) with calc(var(--sq-w) + var(--if)) calc(100% - var(--sq-w) - var(--ig)) / calc(var(--sq-w) + var(--ig)) calc(100% - var(--sq-w) - var(--if)), curve to var(--sq-w) calc(100% - var(--sq-w) - var(--ia)) with var(--sq-w) calc(100% - var(--sq-w) - var(--ic)) / var(--sq-w) calc(100% - var(--sq-w) - var(--ib)), line to var(--sq-w) calc(var(--sq-w) + var(--ia)), curve to calc(var(--sq-w) + var(--ie)) calc(var(--sq-w) + var(--id)) with var(--sq-w) calc(var(--sq-w) + var(--ib)) / var(--sq-w) calc(var(--sq-w) + var(--ic)), curve to calc(var(--sq-w) + var(--id)) calc(var(--sq-w) + var(--ie)) with calc(var(--sq-w) + var(--ig)) calc(var(--sq-w) + var(--if)) / calc(var(--sq-w) + var(--if)) calc(var(--sq-w) + var(--ig)), curve to calc(var(--sq-w) + var(--ia)) var(--sq-w) with calc(var(--sq-w) + var(--ic)) var(--sq-w) / calc(var(--sq-w) + var(--ib)) var(--sq-w), close);
+}
+
+/* ---------- 各自的底色、边线（原来写在 border / background / box-shadow 上的） ---------- */
+/* 边线不是一圈均匀的颜色：像头顶有光，上边亮一点、下边暗一点（--rim 给浮层和输入框，--rim-soft 给平铺的卡片） */
+:root {
+  --rim: linear-gradient(180deg, rgba(255, 255, 255, 0.22), rgba(255, 255, 255, 0.07));
+  --rim-soft: linear-gradient(180deg, rgba(255, 255, 255, 0.13), rgba(255, 255, 255, 0.045));
+}
+.pet-card {
+  --sq-line: var(--rim-soft);
+  --sq-fill: radial-gradient(120% 90% at 50% 100%, rgba(255, 255, 255, 0.07), rgba(255, 255, 255, 0.012));
+}
+.pet-card[data-phase] {
+  --sq-line: color-mix(in srgb, var(--phase-color) 52%, transparent);
+  --sq-fill:
+    radial-gradient(95% 70% at 50% 100%, color-mix(in srgb, var(--phase-color) 20%, transparent), transparent 72%),
+    radial-gradient(120% 90% at 50% 100%, rgba(255, 255, 255, 0.07), rgba(255, 255, 255, 0.012));
+}
+.pet-card:hover { --sq-line: var(--rim); }
+.pet-card.active { --sq-line: var(--card-accent); --sq-glow: inset 0 0 26px -10px var(--card-accent); }
+.pet-card.active[data-phase] { --sq-line: var(--phase-color); --sq-glow: inset 0 0 30px -10px var(--phase-color); }
+
+.composer-box { --sq-line: var(--rim); --sq-fill: rgba(255, 255, 255, 0.04); }
+.composer-box:focus-within { --sq-line: var(--accent-strong); box-shadow: 0 0 0 3.5px var(--accent-soft); }   /* 聚焦：边线变色，外面再一圈柔和的光 */
+
+/* 弹出面板：不透明的底（试过半透明加背景模糊的毛玻璃，后面的字会透上来干扰菜单，这里要的是看得清）。
+   阴影用 box-shadow（很虚，形状差一点看不出来），具体的颜色在 feel.css */
+#popover:not(.scrolls), #popover-sub { --sq-line: var(--rim); --sq-fill: var(--bg-popover); }
+
+.files-card { --sq-line: var(--rim-soft); --sq-fill: rgba(255, 255, 255, 0.025); }
+.req-card { --sq-line: color-mix(in srgb, var(--accent) 55%, transparent); --sq-fill: color-mix(in srgb, var(--accent) 9%, transparent); }
+.agent-badge { --sq-line: var(--accent-strong); --sq-fill: var(--accent-soft); }
+/* 用户的气泡：底是这一位的主色，投下来的影子也带着这个颜色（气泡边上还有悬停时出来的「编辑」，所以不能直接裁） */
+.msg.user:not(.has-images), .msg.user .msg-text {
+  --sq-fill: var(--accent);
+  --sq-shadow: drop-shadow(0 5px 11px color-mix(in srgb, var(--accent) 34%, transparent));
+}
+.msg.user.queued { --sq-line: rgba(255, 255, 255, 0.5); }
+
+/* ---------- 子菜单出现时的一下 ---------- */
+#popover-sub:not([hidden]) { animation: popIn 0.16s cubic-bezier(0.2, 0.9, 0.3, 1); }   /* 主面板的出现和收回在 menus.js 的 playPop 里 */
+@keyframes popIn { from { opacity: 0; transform: translateY(5px) scale(0.975); } }

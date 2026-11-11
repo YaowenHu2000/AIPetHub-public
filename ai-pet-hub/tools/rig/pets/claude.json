@@ -1,0 +1,19 @@
+{
+ "desc": "She is a chibi girl with very long wavy orange hair, a sunflower hair ornament with black ribbons, amber eyes, a cream blouse with puffy sleeves, a layered orange and black skirt, and cream ankle boots.",
+ "arms": "both arms with the puffy cream sleeves, both hands, and the small brown book she is holding",
+ "ears": null,
+ "head_extra": "the sunflower ornament and the black ribbons",
+ "nobody_keep": "the long orange back hair",
+ "poses": {
+  "working": "Change only her arms: she holds a large open book on her left arm and writes in it with a golden quill pen in her right hand.",
+  "reading": "Change only her arms: she holds a glowing open book with both hands in front of her chest and reads it.",
+  "thinking": "Change only her arms: her right hand (on the left side of the image) is raised with the index finger touching her chin while thinking; her other arm rests across her waist. No book.",
+  "dragged": "Change only her arms: both arms raised up and outward, hands open and flailing in panic as if she is being picked up. No book."
+ },
+ "skin": "claude/v2",
+ "props": {
+  "thinking": "the golden magic circles, geometric symbols and the thought bubble with a light bulb and question mark",
+  "reading": "the round glasses, the glowing open book with a magnifier, and the floating glowing scrolls behind her",
+  "working": "the large open book and the golden quill, and the floating golden geometric symbols and sparkles"
+ }
+}

@@ -1,0 +1,81 @@
+/* ===== 文件预览面板（参考反重力右侧的编辑器） ===== */
+#preview-pane { width: var(--preview-w, 560px); flex-shrink: 0; min-width: 0; display: flex; flex-direction: column; background: #141124; }
+#preview-pane[hidden], #resize-preview[hidden] { display: none; }
+body.preview-max #chat-column, body.preview-max #resize-preview { display: none; }
+body.preview-max #preview-pane { flex: 1; width: auto; }
+/* 左栏收起、预览又放到最大时，预览的标签栏在窗口最左边：也要让开红绿灯 */
+body.sidebar-hidden.preview-max .ed-tabs { padding-left: var(--lights); }
+.ed-tabs { height: 44px; flex-shrink: 0; display: flex; align-items: stretch; background: #100d1d; border-bottom: 1px solid var(--border); }
+.ed-tabs-list { flex: 1; min-width: 0; display: flex; overflow-x: auto; }
+.ed-tabs-list::-webkit-scrollbar { height: 0; }
+.ed-tab {
+  display: flex; align-items: center; gap: 6px; max-width: 210px; padding: 0 6px 0 12px; flex-shrink: 0;
+  border-right: 1px solid var(--border); color: var(--text-muted); font-size: 13px; cursor: pointer;
+}
+.ed-tab:hover { color: var(--text); }
+.ed-tab.on { background: #141124; color: var(--text); box-shadow: inset 0 2px 0 var(--accent); }
+.ed-tab-icon { width: 13px; height: 13px; display: inline-flex; flex-shrink: 0; color: var(--text-faint); }
+.ed-tab-icon svg { width: 13px; height: 13px; }
+.ed-tab-name { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.ed-tab.changed .ed-tab-name::after { content: " M"; color: #e2b93d; font-size: 11px; font-weight: 700; }
+.ed-tab-x { width: 18px; height: 18px; flex-shrink: 0; border: none; border-radius: 4px; background: transparent; color: var(--text-faint); display: inline-flex; align-items: center; justify-content: center; cursor: pointer; opacity: 0; }
+.ed-tab-x svg { width: 11px; height: 11px; }
+.ed-tab:hover .ed-tab-x, .ed-tab.on .ed-tab-x { opacity: 1; }
+.ed-tab-x:hover { background: var(--hover); color: var(--text); }
+.ed-actions { flex-shrink: 0; display: flex; align-items: center; gap: 2px; padding: 0 6px; }
+.ed-bar { height: 34px; flex-shrink: 0; display: flex; align-items: center; gap: 10px; padding: 0 8px 0 14px; border-bottom: 1px solid var(--border); }
+.ed-crumbs { flex: 1; min-width: 0; display: flex; align-items: center; gap: 5px; overflow: hidden; white-space: nowrap; font-size: 12px; color: var(--text-faint); }
+.ed-crumb { min-width: 0; overflow: hidden; text-overflow: ellipsis; }   /* 窄时前面的目录先缩成省略号 */
+.ed-crumb.last { color: var(--text); flex-shrink: 0; max-width: 100%; }  /* 文件名尽量完整显示 */
+.ed-sep { flex-shrink: 0; }
+.ed-sep { opacity: 0.6; }
+.ed-tools { flex-shrink: 0; display: flex; align-items: center; gap: 2px; }
+.ed-diffinfo { margin-right: 4px; font: 12px "SF Mono", Menlo, monospace; }
+.ed-diffinfo .add { color: #4ade80; }
+.ed-diffinfo .del { color: #f87171; }
+.ed-tool { width: 24px; height: 24px; }
+.ed-tool svg { width: 13px; height: 13px; }
+.ed-tool.flip svg { transform: rotate(180deg); }
+.ed-seg { display: flex; gap: 2px; margin-left: 6px; padding: 2px; border-radius: 7px; background: rgba(255, 255, 255, 0.06); }
+.ed-seg button { height: 22px; padding: 0 10px; border: none; border-radius: 5px; background: transparent; color: var(--text-muted); font-size: 12px; cursor: pointer; }
+.ed-seg button.on { background: rgba(255, 255, 255, 0.12); color: var(--text); }
+.ed-body { flex: 1; min-height: 0; overflow: auto; position: relative; }
+/* 内置浏览器：网页由原生视图盖在 .browser-host 上 */
+.ed-body.browser-mode { overflow: hidden; display: flex; }
+.browser-host { flex: 1; position: relative; background: #141124; }
+.browser-empty { position: absolute; inset: 0; display: flex; align-items: center; justify-content: center; padding: 28px; text-align: center; color: var(--text-faint); font-size: 13px; line-height: 1.7; }
+.browser-url {
+  flex: 1; min-width: 0; height: 26px; padding: 0 10px; border: 1px solid var(--border); border-radius: 7px;
+  background: rgba(255, 255, 255, 0.04); color: var(--text); font: inherit; font-size: 13px; outline: none;
+  user-select: text; -webkit-user-select: text;
+}
+.browser-url:focus { border-color: var(--accent-strong); background: rgba(255, 255, 255, 0.07); }
+.ed-tool:disabled { opacity: 0.35; cursor: default; }
+.ed-tool.flip-h svg { transform: rotate(180deg); }
+#btn-browser { margin-left: auto; }
+.ed-note { padding: 10px 14px; font-size: 13px; color: var(--text-faint); }
+
+/* 代码：行号 + 改动标记 + 着色；新增行绿色、删除行红色 */
+.ed-code { min-width: max-content; padding: 6px 0 28px; font: 13px/1.65 "SF Mono", Menlo, monospace; color: #d6deeb; user-select: text; -webkit-user-select: text; }
+.cl { display: flex; white-space: pre; border-left: 3px solid transparent; }
+.cl .gn { width: 3.8em; flex-shrink: 0; padding-right: 8px; text-align: right; color: #4c4f6e; user-select: none; -webkit-user-select: none; }
+.cl .gm { width: 1.5em; flex-shrink: 0; text-align: center; font-weight: 700; user-select: none; -webkit-user-select: none; }
+.cl .tx { padding-right: 28px; }
+.cl.add { background: rgba(46, 160, 67, 0.17); border-left-color: #3fb950; }
+.cl.add .gn { color: #6fc77d; }
+.cl.add .gm { color: #3fb950; }
+.cl.del { background: rgba(248, 81, 73, 0.16); border-left-color: #f85149; }
+.cl.del .gm { color: #f85149; }
+.cl.del .tx, .cl.del .tx span { color: #ffaba5 !important; font-style: normal !important; }
+.flash { animation: flashChange 0.9s ease; }
+@keyframes flashChange { 0% { box-shadow: inset 0 0 0 2px var(--accent); } 100% { box-shadow: inset 0 0 0 2px transparent; } }
+.tk-kw { color: #c792ea; }
+.tk-str { color: #c3e88d; }
+.tk-com { color: #6b7096; font-style: italic; }
+.tk-num { color: #f78c6c; }
+.tk-fn { color: #82aaff; }
+.tk-type { color: #ffcb6b; }
+.tk-key { color: #89ddff; }
+.tk-tag { color: #f07178; }
+.tk-attr { color: #c792ea; }
+.tk-var { color: #f78c6c; }

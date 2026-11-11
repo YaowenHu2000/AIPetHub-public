@@ -1,0 +1,186 @@
+/* ===== 手感和细节：按压反馈、窗口不在前台时收敛、搜索框、同心圆角、数字对齐 ===== */
+
+/* ---------- 按下去有反应：轻轻缩一点、底色深一级，松手弹回来 ---------- */
+.icon-btn, .card-gear, .mp-icon, #send-btn, .chip, .dock-btn, .mp-model, .confirm-btn, .req-btn, .chg-btn, .pop-item, .ed-seg button {
+  transition: transform var(--spring-bouncy-ms) var(--spring-bouncy), background-color 0.15s, color 0.15s, border-color 0.15s, opacity 0.2s;   /* 松手：弹簧弹回来（core/spring.js） */
+}
+.icon-btn:active, .card-gear:active, .mp-icon:active:not(:disabled), #send-btn:active:not(:disabled) { transform: scale(0.92); transition: transform 0.07s ease-out, background-color 0.07s; }
+.chip:active, .dock-btn:active, .mp-model:active, .confirm-btn:active, .req-btn:active, .chg-btn:active { transform: scale(0.96); transition: transform 0.07s ease-out, background-color 0.07s; }
+.pop-item:active { transform: scale(0.985); transition: transform 0.07s ease-out, background-color 0.07s; }
+.icon-btn:active, .chip:active, .pop-item:active, .mp-icon:active:not(:disabled), .mp-model:active { background: rgba(255, 255, 255, 0.11); }
+
+/* ---------- 窗口不在前台：彩色的选中和光晕收一收 ---------- */
+body.window-inactive .pet-card.active:not([data-phase]) { --sq-line: var(--rim); --sq-glow: none; }
+body.window-inactive .hist-section.active .conv-row.active { background: rgba(255, 255, 255, 0.07); }
+body.window-inactive .hist-section.active .hist-head { border-left-color: var(--border-strong); }
+body.window-inactive .composer-box:focus-within { --sq-line: var(--rim); box-shadow: none; }
+
+/* ---------- 搜索框：放大镜、⌘F 的按键提示、有内容时的清空按钮、聚焦时一圈柔和的光 ---------- */
+.search-field {
+  flex: 1; min-width: 0; height: 28px; margin-right: 6px; padding: 0 7px; display: flex; align-items: center; gap: 6px;
+  border-radius: 8px; background: rgba(255, 255, 255, 0.055); box-shadow: inset 0 0 0 0.5px var(--border-strong);
+  color: var(--text-faint); cursor: text; transition: box-shadow 0.18s, background-color 0.18s;
+}
+.search-field:focus-within { background: rgba(255, 255, 255, 0.08); box-shadow: inset 0 0 0 1px var(--accent-strong), 0 0 0 3px var(--accent-soft); }
+.search-icon { width: 13px; height: 13px; flex-shrink: 0; }
+.search-field #hist-search { flex: 1; min-width: 0; height: 100%; margin: 0; padding: 0; border: none; border-radius: 0; background: none; }
+.search-field #hist-search:focus { background: none; }
+.search-field #hist-search::-webkit-search-cancel-button { display: none; }
+.search-field kbd {
+  flex-shrink: 0; padding: 0 5px; border-radius: 5px; font: 500 11px/16px -apple-system, sans-serif; letter-spacing: 0.04em;
+  color: var(--text-faint); background: rgba(255, 255, 255, 0.07); box-shadow: inset 0 0 0 0.5px var(--border);
+}
+.search-clear {
+  display: none; width: 15px; height: 15px; flex-shrink: 0; padding: 0; border: none; border-radius: 50%;
+  align-items: center; justify-content: center; background: var(--text-faint); color: var(--bg-sidebar); cursor: pointer;
+}
+.search-clear svg { width: 9px; height: 9px; }
+.search-clear:hover { background: var(--text-muted); }
+.search-field #hist-search:not(:placeholder-shown) ~ kbd, .search-field:focus-within kbd { display: none; }
+.search-field #hist-search:not(:placeholder-shown) ~ .search-clear { display: inline-flex; }
+
+/* ---------- 同心圆角：外框的半径 = 里面那一圈的半径 + 间距 ---------- */
+.suggest-box { border-radius: 12px; }                          /* 里面的行是 8，间距 4 */
+.composer-box { padding: 10px 7px 7px 14px; }                  /* 发送按钮到右边和下边一样远 */
+.ed-seg { border-radius: 8px; }
+.ed-seg button { border-radius: 6px; }
+.ed-seg button.on { box-shadow: 0 1px 2.5px rgba(0, 0, 0, 0.35), inset 0 0.5px 0 rgba(255, 255, 255, 0.16); }
+
+/* ---------- 字：数字等宽（上下行对得齐）、分组标题不用太粗 ---------- */
+.grp-count, .conv-time, .diff-count, .gn, .pet-status, .usage-reset, .usage-age { font-variant-numeric: tabular-nums; }
+.hist-name { font-weight: 600; letter-spacing: -0.01em; }
+
+/* ---------- 用到才出现：桌宠卡片上的「散步 / 小憩」和齿轮平时隐去，光标移到卡片上才浮出来。
+   开着的那个（正在散步、睡觉）也一样隐去——右上角的状态已经写着了；只有齿轮的菜单开着时齿轮留着 ---------- */
+.dock-btn, .card-gear { opacity: 0; }
+.pet-card:hover .dock-btn, .pet-card:hover .card-gear, .card-gear.open { opacity: 1; }
+
+/* ---------- 少画线：顶栏下面的线平时不画，聊天内容滚到它下面才出现；左栏三位之间的线淡一点 ---------- */
+.hist-splitter::after { left: 14px; right: 14px; opacity: 0.6; }
+.hist-splitter:hover::after, .hist-splitter.dragging::after { opacity: 1; }
+
+/* ---------- 其余会动的地方也用弹簧：折叠箭头、桌宠头顶的气泡和工作标签 ---------- */
+.work-head svg.chev, .step-caret svg { transition: transform var(--spring-snappy-ms) var(--spring-snappy); }
+.pet-bubble { transition: opacity 0.2s ease, transform var(--spring-bouncy-ms) var(--spring-bouncy); }
+.pet-work-badge { transition: opacity 0.18s ease, transform var(--spring-bouncy-ms) var(--spring-bouncy), border-color 0.22s ease, background 0.22s ease; }
+.req-card { animation: req-in var(--spring-bouncy-ms) var(--spring-bouncy); }
+#popover-sub:not([hidden]) { animation: popIn var(--spring-snappy-ms) var(--spring-snappy); }
+
+/* ---------- 有颜色的东西，影子也带着它的颜色（像它把周围照亮了一点），不是一团黑 ---------- */
+#send-btn { box-shadow: 0 5px 14px -3px color-mix(in srgb, var(--accent) 62%, transparent); }
+#send-btn.stop { box-shadow: inset 0 0 0 1px rgba(248, 113, 113, 0.5), 0 5px 14px -4px rgba(248, 113, 113, 0.45); }
+#send-btn:disabled { box-shadow: none; }
+.agent-badge { --sq-shadow: drop-shadow(0 3px 8px color-mix(in srgb, var(--accent) 40%, transparent)); }
+/* 选中的桌宠卡片：往下投一片它自己颜色的光；干活时是那个阶段的颜色 */
+.pet-card.active { box-shadow: 0 14px 34px -16px color-mix(in srgb, var(--card-accent) 75%, transparent); }
+.pet-card.active[data-phase] { box-shadow: 0 14px 36px -14px color-mix(in srgb, var(--phase-color) 80%, transparent); }
+body.window-inactive .pet-card.active:not([data-phase]) { box-shadow: none; }
+/* 桌宠脚下：一小片她自己颜色的反光 */
+.pet-floor::after {
+  content: ''; position: absolute; left: 22%; right: 22%; bottom: 0; height: 12%; border-radius: 50%; pointer-events: none; z-index: -1;
+  background: radial-gradient(closest-side, color-mix(in srgb, var(--phase-color) 30%, transparent), transparent);
+}
+/* 滑杆：条下面一片它那个颜色的光，圆钮的影子也带一点 */
+.mp-slider { box-shadow: 0 8px 18px -9px color-mix(in srgb, var(--s2) 85%, transparent); }
+.mp-slider i { box-shadow: 0 1px 5px color-mix(in srgb, var(--s1) 55%, rgba(0, 0, 0, 0.5)); }
+.mp-fast.on { box-shadow: 0 3px 12px -3px rgba(255, 210, 63, 0.55); }
+/* 弹出面板：黑影之外，再带一点这一位主色的环境光 */
+#popover:not(.scrolls), #popover-sub {
+  box-shadow: 0 18px 40px rgba(0, 0, 0, 0.46), 0 3px 9px rgba(0, 0, 0, 0.3), 0 0 70px -26px color-mix(in srgb, var(--accent) 60%, transparent);
+}
+/* 左栏里正在回答 / 没看过的小点，文件改动的「新建」标签这些小色块不加：太碎，加了反而脏 */
+
+/* ===== 对齐（数字是 tools/uitest/measure.js 量出来的，改了这里再量一遍） ===== */
+
+/* ---------- 左栏：图标一列、文字一列、右边的数字一列 ----------
+   三层（名字、工作空间、会话）的图标都放在 16px 宽的格子里，中心在第 22px；文字都从第 36px 开始；
+   右边的数量和时间都收在同一条线上（左栏宽 260 时是第 242px） */
+.hist-head { padding-left: 11px; }
+.hist-icon, .grp-icon { width: 16px; justify-content: center; }
+.grp-head { gap: 6px; }
+.conv-row { padding-right: 4px; }
+.conv-time { margin-right: 2px; }
+.grp-count { margin-right: 2px; }
+.conv-row.running::before, .conv-row.unread::before { left: 13px; }   /* 小圆点的中心也在图标那一列 */
+
+/* ---------- 基线：同一行里大小不同的字踩在同一条线上（盒子居中的话小字会飘高） ---------- */
+.hist-brand, .conv-time, .grp-count { transform: translateY(0.5px); }
+.conv-label, .crumb-sep { transform: translateY(1.5px); }
+.ws-crumb .ws-name { transform: translateY(1px); }
+
+/* ---------- 顶栏：线不占高度（原来 1px 的下边框让里面的东西比红绿灯高半个像素） ---------- */
+#chat-header { border-bottom: none; box-shadow: 0 1px 0 transparent; transition: box-shadow 0.2s; }
+#chat-header.scrolled { box-shadow: 0 1px 0 var(--border); }
+
+/* ---------- 底边：三栏最下面的东西离窗口底一样远（输入框是 16px） ---------- */
+#stage-column { padding-bottom: 16px; }
+
+/* ---------- 视觉重心：向上的箭头上尖下空，几何居中看着偏下，往上提半个像素 ---------- */
+#send-btn:not(.stop) svg { transform: translateY(-0.5px); }
+
+/* ---------- 分割线缩进到文字：不从最左画到最右 ---------- */
+.pop-sep { margin-left: 10px; margin-right: 10px; }
+.files-head { position: relative; border-bottom: none; }
+.files-head::after { content: ''; position: absolute; left: 12px; right: 12px; bottom: 0; height: 1px; background: var(--border); }
+
+/* ---------- 左栏展开 / 折叠时正在淡出的行（history.js 的 renderHistorySmooth）：放在原来的位置，不占地方 ---------- */
+.hist-list { position: relative; }
+.row-ghost { position: absolute; left: 6px; right: 6px; pointer-events: none; }
+
+/* ===== 材质：毛玻璃（都从「不太透」开始，底色留八九成，只透上来一点颜色） =====
+   · 左栏：窗口最底下垫着系统的毛玻璃（AppDelegate 里的 NSVisualEffectView，固定深色外观），左栏的底留 90%，带一点桌面的颜色；
+     网页自己不画底，别的栏都是不透明的，盖住它。
+   · 弹出面板：底留 86%，后面的内容模糊着透上来一点（背景模糊加在画底的那个伪元素上）。
+   这两样只有在真实窗口里才看得出对不对（tools/uitest/e2e-chrome.js，REAL=1），testSnapshot 截不出背景模糊。 */
+html, body { background: transparent; }
+/* 左栏的底：带一点靛紫的深色（不是中性灰），上面略亮、往下沉下去；留 90%，桌面的颜色只透上来一点点 */
+:root { --side-glass: linear-gradient(180deg, rgba(27, 23, 48, 0.9), rgba(17, 15, 32, 0.92)); }
+#history-sidebar { background: var(--side-glass); --text-muted: rgba(241, 238, 251, 0.78); --text-faint: rgba(241, 238, 251, 0.55); }
+.col-resizer { background: var(--bg-chat); }
+#resize-sidebar { background: linear-gradient(90deg, transparent 50%, var(--bg-chat) 50%), var(--side-glass); }
+#resize-stage { background: linear-gradient(90deg, var(--bg-chat) 50%, var(--bg-stage) 50%); }
+#popover:not(.scrolls), #popover-sub { --sq-fill: color-mix(in srgb, var(--bg-popover) 86%, transparent); }
+#popover:not(.scrolls)::after, #popover-sub::after { -webkit-backdrop-filter: blur(24px) saturate(160%); backdrop-filter: blur(24px) saturate(160%); }
+
+/* ===== 长对话里跳转（chat/jump.js）：聊天区右下角一颗竖着的胶囊，上面是「上一句我说的」，下面是「下一句 / 到底」 ===== */
+.jump-nav {
+  position: absolute; right: 16px; bottom: 12px; z-index: 6; display: flex; flex-direction: column; padding: 3px; border-radius: 17px;
+  background: color-mix(in srgb, var(--bg-popover) 88%, transparent); -webkit-backdrop-filter: blur(18px) saturate(160%); backdrop-filter: blur(18px) saturate(160%);
+  box-shadow: inset 0 0 0 0.5px var(--border-strong), inset 0 0.5px 0 rgba(255, 255, 255, 0.14), 0 6px 18px rgba(0, 0, 0, 0.36);
+}
+.jump-nav[hidden] { display: none; }
+.jump-nav button {
+  width: 28px; height: 28px; border: none; border-radius: 50%; background: transparent; color: var(--text-muted); cursor: pointer;
+  display: inline-flex; align-items: center; justify-content: center;
+  transition: transform var(--spring-bouncy-ms) var(--spring-bouncy), background-color 0.15s, color 0.15s, opacity 0.2s;
+}
+.jump-nav button:hover { background: var(--hover); color: var(--text); }
+.jump-nav button:active { transform: scale(0.9); transition: transform 0.07s ease-out; }
+.jump-nav button.dim { opacity: 0.3; pointer-events: none; }
+.jump-nav svg { width: 15px; height: 15px; }
+.jump-nav .jump-down svg { transform: rotate(180deg); }
+
+/* ---------- 排着的话：「往前排一位」（前面还有别的排着的话时才出现） ---------- */
+.queued-up { display: none; width: 16px; height: 16px; padding: 0; border: none; background: transparent; color: inherit; cursor: pointer; }
+.queued-up svg { width: 12px; height: 12px; }
+.msg.user.queued.can-up .queued-up { display: inline-flex; align-items: center; justify-content: center; }
+.queued-up:hover { opacity: 0.7; }
+
+/* ===== 预览面板：和聊天区、左栏用同一套手感 ===== */
+/* 标签不再是一格一格的方块加顶上一条色线：每个标签是一枚圆角的小片，选中的那枚亮一点、带一点高光和投影 */
+.ed-tabs { background: #141124; align-items: center; padding: 0 2px 0 6px; }
+.ed-tabs-list { gap: 4px; align-items: center; }
+.ed-tab { height: 30px; padding: 0 5px 0 10px; border-right: none; border-radius: 8px; transition: background-color 0.15s, color 0.15s; }
+.ed-tab:hover { background: var(--hover); }
+.ed-tab.on { background: rgba(255, 255, 255, 0.1); box-shadow: inset 0 0.5px 0 rgba(255, 255, 255, 0.16), 0 1px 2.5px rgba(0, 0, 0, 0.32); }
+.ed-tab-x { border-radius: 50%; transition: opacity 0.15s, background-color 0.15s; }
+/* 地址栏：和搜索框一样，细边、聚焦时一圈柔和的光 */
+.browser-url {
+  height: 28px; border: none; border-radius: 8px; background: rgba(255, 255, 255, 0.055);
+  box-shadow: inset 0 0 0 0.5px var(--border-strong); transition: box-shadow 0.18s, background-color 0.18s;
+}
+.browser-url:focus { background: rgba(255, 255, 255, 0.08); box-shadow: inset 0 0 0 1px var(--accent-strong), 0 0 0 3px var(--accent-soft); }
+.ed-tool { transition: transform var(--spring-bouncy-ms) var(--spring-bouncy), background-color 0.15s, color 0.15s; }
+.ed-tool:active:not(:disabled) { transform: scale(0.9); transition: transform 0.07s ease-out; }
+.ed-diffinfo .add, .diff-count .add { color: #30d158; }
+.ed-diffinfo .del, .diff-count .del { color: #ff453a; }

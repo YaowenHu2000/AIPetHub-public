@@ -1,0 +1,94 @@
+/* ===== 左栏：三格历史会话 ===== */
+#history-sidebar { width: var(--sidebar-w); flex-shrink: 0; display: flex; flex-direction: column; background: var(--bg-sidebar); }
+body.sidebar-hidden #history-sidebar, body.sidebar-hidden #resize-sidebar { display: none; }
+.sidebar-top { height: 44px; flex-shrink: 0; display: flex; align-items: center; justify-content: flex-end; padding: 0 8px 0 max(10px, var(--lights)); }   /* 左边让开红绿灯（全屏时没有，见 base.css 的 --lights） */
+#hist-search {
+  flex: 1; min-width: 0; height: 26px; margin-right: 6px; padding: 0 9px;
+  border: 1px solid var(--border); border-radius: 7px; background: rgba(255, 255, 255, 0.04);
+  color: var(--text); font: inherit; font-size: 13px; outline: none; -webkit-appearance: none; appearance: none;
+}
+#hist-search:focus { border-color: var(--accent-strong); background: rgba(255, 255, 255, 0.07); }
+#hist-search::placeholder { color: var(--text-faint); }
+#hist-sections { flex: 1; min-height: 0; display: flex; flex-direction: column; }
+
+.hist-section {
+  --sec-accent: #8e7cf0; --sec-soft: rgba(142, 124, 240, 0.16);
+  flex: 1 1 0px; min-height: 34px; display: flex; flex-direction: column; overflow: hidden;
+}
+.hist-section[data-agent="claude"] { --sec-accent: #d97757; --sec-soft: rgba(217, 119, 87, 0.17); }
+.hist-section[data-agent="gpt"]    { --sec-accent: #10a37f; --sec-soft: rgba(16, 163, 127, 0.18); }
+.hist-section[data-agent="deepseek"] { --sec-accent: #4d6bfe; --sec-soft: rgba(77, 107, 254, 0.2); }
+.hist-splitter { height: 7px; flex-shrink: 0; position: relative; cursor: row-resize; }
+.hist-splitter::after { content: ""; position: absolute; left: 10px; right: 10px; top: 3px; height: 1px; background: var(--border); }
+.hist-splitter:hover::after, .hist-splitter.dragging::after { top: 2px; height: 3px; border-radius: 2px; background: rgba(255, 255, 255, 0.22); }
+
+.hist-head {
+  height: 34px; flex-shrink: 0; display: flex; align-items: center; gap: 6px;
+  padding: 0 6px 0 12px; cursor: pointer; border-left: 3px solid transparent;
+}
+.hist-head:hover { background: rgba(255, 255, 255, 0.025); }
+.hist-section.active .hist-head { border-left-color: var(--sec-accent); }
+.hist-icon { width: 15px; height: 15px; display: inline-flex; color: var(--text); }
+.hist-icon svg { width: 15px; height: 15px; }
+.hist-name { font-size: 13px; font-weight: 700; color: var(--text-muted); white-space: nowrap; }
+.hist-section.active .hist-name { color: var(--text); }
+.hist-brand { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 11px; color: var(--text-faint); }   /* 左栏窄时先缩它，按钮不被挤出去 */
+.hist-spacer { flex: 1; }
+.hist-refresh { display: none; }
+.hist-head:hover .hist-refresh { display: inline-flex; }
+.tab-dot { width: 7px; height: 7px; border-radius: 50%; display: none; flex-shrink: 0; }
+.hist-section.busy .tab-dot { display: inline-block; background: var(--sec-accent); box-shadow: 0 0 8px var(--sec-accent); animation: pulse 0.9s ease-in-out infinite alternate; }
+.hist-section.unread .tab-dot { display: inline-block; background: #f472b6; }
+@keyframes pulse { from { opacity: 0.35; transform: scale(0.8); } to { opacity: 1; transform: scale(1.15); } }
+
+.hist-list { flex: 1; min-height: 0; overflow-y: auto; padding: 0 6px 8px; scroll-snap-type: y proximity; }
+/* 滚动停下来时最上面是一整行（底边被切一半的行由 layout.js 的 trimPartialRows 整行藏起来） */
+.hist-list .grp-head, .hist-list .conv-row { scroll-snap-align: start; }
+.grp-head {
+  display: flex; align-items: center; gap: 7px; height: 28px; padding: 0 4px 0 8px;
+  border-radius: 6px; color: var(--text-muted); font-size: 13px; cursor: pointer;
+}
+.grp-head:hover { background: var(--hover); color: var(--text); }
+.grp-icon { width: 15px; height: 15px; flex-shrink: 0; display: inline-flex; }
+.grp-icon svg { width: 15px; height: 15px; }
+.grp-name { flex: 1; min-width: 0; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.grp-count { font-size: 11px; color: var(--text-faint); }
+/* 悬停时数字换成「⋮」「＋」（参考反重力 Projects） */
+.grp-btn { width: 22px; height: 22px; display: none; }
+.grp-btn svg { width: 14px; height: 14px; }
+.grp-head:hover .grp-btn, .grp-btn.open { display: inline-flex; }
+.grp-head:hover .grp-count { display: none; }
+/* 只亮正在看的那位的当前会话；另外两位各自的当前会话不亮 */
+.hist-section.active .grp-head.has-active { background: var(--sec-soft); color: var(--text); }   /* 折叠着，但当前对话在里面 */
+.grp-empty { display: flex; align-items: center; height: 26px; padding-left: 30px; font-size: 12px; color: var(--text-faint); }
+.conv-row {
+  position: relative; display: flex; align-items: center; gap: 8px;
+  height: 30px; padding: 0 6px 0 30px; border-radius: 6px;
+  font-size: 13px; color: var(--text); cursor: pointer;
+}
+.conv-row:hover { background: var(--hover); }
+.hist-section.active .conv-row.active { background: var(--sec-soft); }
+/* 会话正在回答（绿点闪烁）/ 回答完了还没看（粉点） */
+.conv-row.running::before, .conv-row.unread::before {
+  content: ""; position: absolute; left: 15px; top: 50%; width: 6px; height: 6px; margin-top: -3px; border-radius: 50%;
+}
+.conv-row.running::before { background: var(--sec-accent); box-shadow: 0 0 6px var(--sec-accent); animation: pulse 0.9s ease-in-out infinite alternate; }
+.conv-row.unread:not(.running)::before { background: #f472b6; }
+.conv-title { flex: 1; min-width: 0; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.conv-fork {
+  display: inline-block; margin-right: 5px; padding: 0 5px; border-radius: 5px; vertical-align: 1px;
+  font-size: 11px; line-height: 15px; color: var(--sec-accent); background: var(--sec-soft);
+}
+.conv-time { flex-shrink: 0; font-size: 12px; color: var(--text-faint); }
+.conv-del {
+  display: none; flex-shrink: 0; height: 22px; min-width: 22px; padding: 0 5px; border-radius: 5px; border: none;
+  background: transparent; color: var(--text-faint); font-size: 12px; cursor: pointer;
+}
+.conv-row:hover .conv-time { display: none; }
+.conv-row:hover .conv-del, .conv-del.confirm { display: inline-flex; align-items: center; }
+.conv-del:hover { background: rgba(248, 113, 113, 0.16); color: #fca5a5; }
+.conv-del.confirm { background: rgba(248, 113, 113, 0.24); color: #fee2e2; font-size: 11px; }
+.conv-del svg { width: 13px; height: 13px; }
+.see-all { height: 26px; display: flex; align-items: center; padding-left: 30px; font-size: 12px; color: var(--text-faint); cursor: pointer; border-radius: 6px; }
+.see-all:hover { color: var(--text-muted); background: var(--hover); }
+.hist-empty { padding: 10px 14px; color: var(--text-faint); font-size: 12px; }

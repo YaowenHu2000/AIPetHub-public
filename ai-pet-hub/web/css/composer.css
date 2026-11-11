@@ -1,0 +1,43 @@
+/* 输入框：参考反重力，底部一排文字式选择器，向上弹出 */
+#composer { flex-shrink: 0; padding: 8px 18px 16px; }
+.composer-box {
+  display: flex; flex-direction: column; gap: 4px;
+  padding: 10px 8px 6px 14px; border-radius: 14px;
+  border: 1px solid var(--border-strong); background: rgba(255, 255, 255, 0.035);
+}
+.composer-box:focus-within { border-color: var(--accent-strong); }
+#chat-input {
+  min-height: 24px; max-height: 200px; resize: none; outline: none; border: none; padding: 2px 6px 2px 0;
+  background: transparent; color: var(--text); font-family: inherit; font-size: 14px; line-height: 1.5;
+  user-select: text; -webkit-user-select: text;
+}
+#chat-input::placeholder { color: var(--text-faint); }
+.composer-bar { display: flex; align-items: center; gap: 2px; margin-left: -6px; }
+.composer-spacer { flex: 1; }
+.chip {
+  display: inline-flex; align-items: center; gap: 5px; height: 28px; max-width: 280px; padding: 0 8px;
+  border: none; border-radius: 7px; background: transparent; color: var(--text-muted);
+  font-size: 13px; cursor: pointer; white-space: nowrap;
+}
+.chip:hover, .chip.open { background: rgba(255, 255, 255, 0.07); color: var(--text); }
+.chip svg { width: 14px; height: 14px; flex-shrink: 0; }
+.chip svg.caret { width: 10px; height: 10px; opacity: 0.75; }
+.chip-label { overflow: hidden; text-overflow: ellipsis; }
+.chip-label { font-weight: 500; }
+.chip-sub { color: color-mix(in srgb, var(--accent) 72%, #fff); font-weight: 500; }
+#send-btn {
+  width: 32px; height: 32px; flex-shrink: 0; margin-left: 4px; border-radius: 50%; border: none;
+  display: inline-flex; align-items: center; justify-content: center;
+  background: var(--accent); color: #fff; cursor: pointer;
+}
+#send-btn:hover { filter: brightness(1.1); }
+#send-btn svg { width: 16px; height: 16px; }
+#send-btn.stop { background: rgba(248, 113, 113, 0.18); color: #fecaca; box-shadow: inset 0 0 0 1px rgba(248, 113, 113, 0.5); }
+#send-btn:disabled { opacity: 0.5; cursor: default; }
+
+/* 这个会话正开在别的程序里：在这里发会另开一个分支（chat/fork.js） */
+#fork-hint {
+  width: fit-content; margin: 0 0 6px 6px; padding: 2px 10px; border-radius: 99px; font-size: 12px; line-height: 18px;
+  color: var(--text-muted); background: var(--accent-soft); cursor: default;
+}
+#fork-hint[hidden] { display: none; }

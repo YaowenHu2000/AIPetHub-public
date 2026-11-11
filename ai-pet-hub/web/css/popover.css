@@ -1,0 +1,127 @@
+/* ===== 弹出面板 ===== */
+#popover {
+  position: fixed; z-index: 100; min-width: 230px; max-width: 360px; max-height: min(460px, 72vh); overflow-y: auto;
+  padding: 6px; border-radius: 12px; background: var(--bg-popover);
+  border: 1px solid var(--border-strong); box-shadow: 0 14px 36px rgba(0, 0, 0, 0.5);
+}
+#popover[hidden] { display: none; }
+.pop-title { padding: 6px 10px 3px; font-size: 11px; font-weight: 600; color: var(--text-faint); }
+.pop-sep { height: 1px; margin: 5px 6px; background: var(--border); }
+.pop-item {
+  width: 100%; display: flex; align-items: flex-start; gap: 8px; padding: 7px 10px;
+  border: none; border-radius: 8px; background: transparent; color: var(--text); text-align: left; cursor: pointer;
+}
+.pop-item:hover { background: rgba(255, 255, 255, 0.07); }
+.pop-check { width: 14px; height: 14px; flex-shrink: 0; margin-top: 2px; color: var(--accent); }
+.pop-check svg { width: 14px; height: 14px; }
+.pop-text { min-width: 0; }
+.pop-name { display: block; font-size: 13px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.pop-desc { display: block; margin-top: 1px; font-size: 12px; color: var(--text-faint); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.pop-item.selected .pop-name { font-weight: 600; }
+.pop-item.danger .pop-name { color: #f87171; }
+
+/* 删除项目前的确认（在同一个弹出面板里） */
+#popover.confirm { width: 300px; min-width: 0; }
+.confirm-box { padding: 8px 8px 4px; }
+.confirm-title { margin-bottom: 6px; font-size: 14px; font-weight: 600; color: var(--text); overflow-wrap: anywhere; }
+.confirm-text { font-size: 13px; line-height: 1.6; color: var(--text-muted); overflow-wrap: anywhere; }
+.confirm-actions { display: flex; justify-content: flex-end; gap: 8px; margin-top: 12px; }
+.confirm-btn {
+  height: 28px; padding: 0 14px; border-radius: 7px; border: 1px solid var(--border-strong);
+  background: transparent; color: var(--text); font-size: 13px; cursor: pointer;
+}
+.confirm-btn:hover { background: var(--hover); }
+.confirm-btn.danger { border-color: transparent; background: rgba(239, 68, 68, 0.85); color: #fff; }
+.confirm-btn.danger:hover { background: #ef4444; }
+.confirm-btn:disabled { opacity: 0.45; cursor: default; }
+
+/* 模型面板（参考 Codex 桌面版）：⚡ ｜ 思考强度 ｜ 还原，模型名，滑杆，剩余用量。
+   大小跟着窗口走：宽度按窗口宽度的比例，里面的字号、滑杆、图标都用 em 跟着一起缩放 */
+#popover.model-pop { width: clamp(214px, 25vw, 320px); padding: 0.9em 1em; font-size: clamp(10px, 1.08vw, 13.5px); }
+.mp-head { display: flex; align-items: center; justify-content: space-between; padding: 0.1em 0.1em 0; }
+.mp-icon {
+  width: 2.1em; height: 2.1em; border: none; border-radius: 0.6em; background: transparent; color: var(--text-faint); font-size: inherit;
+  display: inline-flex; align-items: center; justify-content: center; cursor: pointer;
+}
+.mp-icon svg { width: 1.25em; height: 1.25em; }
+.mp-icon:hover:not(:disabled) { background: var(--hover); color: var(--text); }
+.mp-icon:disabled { opacity: 0.25; cursor: default; }
+.mp-fast.on { color: #ffd23f; background: rgba(255, 210, 63, 0.14); }
+.mp-fast.on svg { fill: currentColor; }
+/* 思考强度的名字：档位越高颜色越往这一位的主色靠（--lvl 0…1）；最高档是渐变色 */
+.mp-effort {
+  font-family: "SF Pro Display", -apple-system, BlinkMacSystemFont, sans-serif; font-size: 1.5em; font-weight: 600; letter-spacing: -0.02em; line-height: 1.25;
+  color: color-mix(in srgb, var(--accent) calc(22% + 60% * var(--lvl, 0.5)), #fff);
+}
+#popover.top .mp-effort, .chip-sub.top {
+  background: var(--top-text); -webkit-background-clip: text; background-clip: text; color: transparent; -webkit-text-fill-color: transparent;
+}
+.mp-model {
+  display: flex; align-items: center; justify-content: center; gap: 0.2em; margin: 0 auto 0.9em; padding: 0.2em 0.75em; border: none; border-radius: 0.5em;
+  background: transparent; color: var(--text-muted); font-size: 1em; cursor: pointer;
+}
+.mp-model:hover { background: var(--hover); color: var(--text); }
+.mp-model svg { width: 0.95em; height: 0.95em; opacity: 0.7; }
+.mp-slider {
+  --t: 0; --h: 2.5em; position: relative; height: var(--h); margin: 0 0.15em 0.75em; border-radius: calc(var(--h) / 2); cursor: pointer; touch-action: none;
+  background: rgba(255, 255, 255, 0.07);
+  /* 滑过的那一段的三个颜色：深 → 主色 → 亮 */
+  --s1: color-mix(in srgb, var(--accent) 52%, #171a5c); --s2: var(--accent); --s3: color-mix(in srgb, var(--accent) 58%, #fff);
+}
+#popover.top .mp-slider { --s1: var(--top-1); --s2: var(--top-2); --s3: var(--top-3); }
+/* 圆钮和滑过的那一段的位置都看 --t（menus.js 里一根弹簧在管，拖过头时会略微超出 0…1）。
+   滑过的那一段：壳按档位裁宽度，里面的画布铺满整条（颜色和粒子怎么动见 js/ui/effort-flow.js） */
+.mp-fill {
+  position: absolute; inset: 0; width: calc(var(--h) + (100% - var(--h)) * var(--t)); border-radius: calc(var(--h) / 2); overflow: hidden;
+}
+.mp-fill canvas { position: absolute; left: 0; top: 0; display: block; }
+.mp-slider i {
+  position: absolute; top: 0.15em; left: calc(0.15em + (100% - var(--h)) * var(--t)); width: calc(var(--h) - 0.3em); height: calc(var(--h) - 0.3em); border-radius: 50%;
+  background: #fff; box-shadow: 0 1px 5px rgba(0, 0, 0, 0.45);
+}
+.mp-slider.fixed { cursor: default; opacity: 0.6; }
+.mp-back { display: flex; align-items: center; gap: 4px; width: 100%; border: none; background: transparent; cursor: pointer; text-align: left; }
+.mp-back:hover { color: var(--text); }
+.mp-back svg { width: 13px; height: 13px; }
+.model-row { align-items: center; gap: 8px; padding: 8px 10px; }
+.model-row.sub-open { background: rgba(255, 255, 255, 0.07); }
+.model-row .pop-check { margin: 0 0 0 auto; color: var(--text); }
+.mr-name { font-size: 14px; color: var(--text); white-space: nowrap; }
+.model-row.selected .mr-name { font-weight: 600; }
+.mr-effort { margin-left: auto; font-size: 13px; color: var(--text-faint); white-space: nowrap; }
+.mr-chev { display: inline-flex; width: 14px; height: 14px; flex-shrink: 0; padding-left: 4px; box-sizing: content-box; color: var(--text-faint); }
+.mr-chev svg { width: 14px; height: 14px; }
+#popover-sub {
+  position: fixed; z-index: 101; min-width: 160px; padding: 6px; border-radius: 12px; background: var(--bg-popover);
+  border: 1px solid var(--border-strong); box-shadow: 0 14px 36px rgba(0, 0, 0, 0.5);
+}
+#popover-sub[hidden] { display: none; }
+.sub-item { align-items: center; justify-content: space-between; gap: 18px; padding: 8px 12px; }
+.sub-item .pop-name { font-size: 14px; }
+.sub-item .pop-check { margin-top: 0; color: var(--text); }
+
+/* 模型面板里只有一条左边线和一条右边线（面板的内边距）：滑杆、分割线、用量的字和数都贴着它；
+   两个图标按钮的底比图形大一圈，所以往外挪半圈，让图形（不是底）落在这条线上 */
+#popover.model-pop .mp-head { padding: 0; }
+#popover.model-pop .mp-icon:first-child { margin-left: -0.7em; }
+#popover.model-pop .mp-icon:last-child { margin-right: -0.64em; }
+#popover.model-pop .mp-slider { margin-left: 0; margin-right: 0; }
+#popover.model-pop .pop-sep { margin-left: 0; margin-right: 0; }
+
+/* 模型面板最下面的剩余用量 */
+.usage-box { padding: 0.15em 0; }
+.usage-title { display: flex; align-items: baseline; justify-content: space-between; padding-left: 0; padding-right: 0; font-size: 0.86em; letter-spacing: 0.04em; }
+.usage-age { font-weight: 400; letter-spacing: 0; color: var(--text-faint); opacity: 0.8; }
+.usage-note { font-size: 0.93em; color: var(--text-faint); }
+.usage-row { display: flex; align-items: center; gap: 0.6em; height: 1.85em; font-size: 0.93em; color: var(--text-muted); white-space: nowrap; }
+.usage-label { width: 6.2em; flex-shrink: 0; overflow: hidden; text-overflow: ellipsis; }
+.usage-bar { flex: 1; min-width: 2.5em; height: 0.4em; border-radius: 0.2em; background: rgba(255, 255, 255, 0.1); overflow: hidden; }
+/* 平时是中性的灰白（够用的时候不需要颜色来抢眼），剩得不多才变黄、变红（系统色） */
+.usage-bar i { display: block; height: 100%; border-radius: 0.2em; background: rgba(255, 255, 255, 0.5); }
+.usage-bar.mid ~ .usage-left { color: #ffd60a; }
+.usage-bar.low ~ .usage-left { color: #ff453a; }
+.usage-bar.mid i { background: #ffd60a; }
+.usage-bar.low i { background: #ff453a; }
+.usage-left { width: 2.8em; text-align: right; color: var(--text); font-weight: 600; font-variant-numeric: tabular-nums; }
+.usage-reset { width: 8.6em; text-align: right; color: var(--text-faint); font-size: 0.92em; }
+.usage-text { margin-left: auto; color: var(--text); font-variant-numeric: tabular-nums; }

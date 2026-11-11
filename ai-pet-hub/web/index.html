@@ -1,0 +1,166 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>AIPetHub</title>
+<link rel="stylesheet" href="vendor/katex/katex.min.css" />
+<link rel="stylesheet" href="css/base.css" />
+<link rel="stylesheet" href="css/sidebar.css" />
+<link rel="stylesheet" href="css/chat.css" />
+<link rel="stylesheet" href="css/preview.css" />
+<link rel="stylesheet" href="css/markdown.css" />
+<link rel="stylesheet" href="css/composer.css" />
+<link rel="stylesheet" href="css/popover.css" />
+<link rel="stylesheet" href="css/stage.css" />
+<link rel="stylesheet" href="css/live.css" />
+<link rel="stylesheet" href="css/squircle.css" />
+<link rel="stylesheet" href="css/feel.css" />
+</head>
+<body data-agent="gemini">
+<!-- Gemini 图标的渐变只定义一次，所有图标引用它 -->
+<svg width="0" height="0" style="position:absolute" aria-hidden="true">
+  <defs>
+    <linearGradient id="gemini-grad" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#4796E3" />
+      <stop offset="0.55" stop-color="#9177C7" />
+      <stop offset="1" stop-color="#CA6673" />
+    </linearGradient>
+  </defs>
+</svg>
+
+<main id="main">
+  <!-- 左栏：三位的历史会话上下三格（由 app.js 生成），顶部留给红绿灯 -->
+  <aside id="history-sidebar">
+    <div class="sidebar-top">
+      <label class="search-field">
+        <svg class="search-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round"><circle cx="11" cy="11" r="6.5" /><path d="M16 16l4.5 4.5" /></svg>
+        <input id="hist-search" type="search" placeholder="搜索会话" autocomplete="off" spellcheck="false" />
+        <kbd>⌘F</kbd>
+        <button class="search-clear" type="button" title="清空" tabindex="-1"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="3" stroke-linecap="round"><path d="M8 8l8 8M16 8l-8 8" /></svg></button>
+      </label>
+      <button class="icon-btn" id="btn-hide-sidebar" title="收起历史会话栏"></button>
+    </div>
+    <div id="hist-sections"></div>
+  </aside>
+  <div class="col-resizer" id="resize-sidebar" title="拖动调整宽度，双击恢复默认"></div>
+
+  <section id="chat-column">
+    <div id="chat-header">
+      <button class="icon-btn" id="btn-show-sidebar" title="展开历史会话栏"></button>
+      <span class="agent-badge" id="agent-badge"></span>
+      <span class="chat-name" id="chat-name"></span>
+      <button class="ws-crumb" id="ws-crumb"><span class="ws-icon"></span><span class="ws-name"></span></button>
+      <span class="crumb-sep">›</span>
+      <span class="conv-label" id="conv-label"></span>
+      <button class="icon-btn" id="btn-browser" title="内置浏览器：预览网页、本地开发服务器"></button>
+    </div>
+
+    <div id="chat-stack"></div>
+
+    <div id="composer">
+      <div class="composer-box">
+        <textarea id="chat-input" rows="1" placeholder="输入消息"></textarea>
+        <div class="composer-bar">
+          <button class="chip" id="chip-model"></button>
+          <span class="composer-spacer"></span>
+          <button class="chip" id="chip-perm"></button>
+          <button id="send-btn"></button>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- 文件预览面板（参考反重力右侧的编辑器）：点回答里的文件标签、改动卡片或步骤里的文件打开 -->
+  <div class="col-resizer" id="resize-preview" title="拖动调整预览宽度，双击恢复默认" hidden></div>
+  <section id="preview-pane" hidden>
+    <div class="ed-tabs">
+      <div class="ed-tabs-list"></div>
+      <div class="ed-actions">
+        <button class="icon-btn ed-reveal" title="在访达中显示"></button>
+        <button class="icon-btn ed-open" title="用默认应用打开"></button>
+        <button class="icon-btn ed-max" title="放大 / 还原（Esc 还原）"></button>
+        <button class="icon-btn ed-close" title="关闭预览"></button>
+      </div>
+    </div>
+    <div class="ed-bar"></div>
+    <div class="ed-body"></div>
+  </section>
+
+  <div class="col-resizer" id="resize-stage" title="拖动调整桌宠活动空间，双击恢复默认"></div>
+  <aside id="stage-column"></aside>
+</main>
+
+<div id="popover" hidden></div>
+<div id="popover-sub" hidden></div>
+
+<template id="pet-card-tpl">
+  <div class="pet-card">
+    <div class="pet-card-top">
+      <span class="pet-name"><span class="pet-icon"></span><span class="pet-label"></span></span>
+      <span class="pet-top-right">
+        <span class="pet-status"></span>
+        <button class="card-gear" title="自动入睡设置"></button>
+      </span>
+    </div>
+    <div class="pet-floor">
+      <div class="pet-bubble"></div>
+      <div class="pet-work-badge" hidden>
+        <span class="pwb-icon"></span>
+        <span class="pwb-text"></span>
+        <span class="pwb-dots"><i></i><i></i><i></i></span>
+      </div>
+      <div class="pet-walker">
+        <div class="pet-body anim-idle">
+          <img class="sprite back" alt="" />
+          <img class="sprite front" alt="" />
+        </div>
+      </div>
+    </div>
+    <div class="pet-dock">
+      <button class="dock-btn" data-act="roam">🐾 散步</button>
+      <button class="dock-btn" data-act="sleep">💤 小憩</button>
+    </div>
+  </div>
+</template>
+
+<script src="vendor/highlight.min.js"></script>
+<script src="vendor/katex/katex.min.js"></script>
+<script src="vendor/katex/contrib/mhchem.min.js"></script>
+<script src="js/core/markdown.js"></script>
+<script src="rig/pet-rig.js"></script>
+<script src="js/core/logic.js"></script>
+<script src="js/core/spring.js"></script>
+<script src="js/core/config.js"></script>
+<script src="js/core/state.js"></script>
+<script src="js/chat/messages.js"></script>
+<script src="js/chat/turn.js"></script>
+<script src="js/chat/live-steps.js"></script>
+<script src="js/ui/effort-flow.js"></script>
+<script src="js/ui/menus.js"></script>
+<script src="js/ui/history.js"></script>
+<script src="js/ui/layout.js"></script>
+<script src="js/chat/send.js"></script>
+<script src="js/native-callbacks.js"></script>
+<script src="js/chat/stream.js"></script>
+<script src="js/chat/live.js"></script>
+<script src="js/chat/changes.js"></script>
+<script src="js/chat/jump.js"></script>
+<script src="js/chat/elsewhere.js"></script>
+<script src="js/chat/fork.js"></script>
+<script src="js/ui/composer.js"></script>
+<script src="js/stage/sprites.js"></script>
+<script src="js/stage/pet.js"></script>
+<script src="js/stage/pet-reactions.js"></script>
+<script src="js/stage/pet-motion.js"></script>
+<script src="js/stage/pet-sleep.js"></script>
+<script src="js/ui/agents.js"></script>
+<script src="js/ui/welcome.js"></script>
+<script src="js/boot.js"></script>
+<script src="js/preview/files.js"></script>
+<script src="js/preview/highlight.js"></script>
+<script src="js/preview/diff.js"></script>
+<script src="js/preview/pane.js"></script>
+<script src="js/preview/browser.js"></script>
+</body>
+</html>

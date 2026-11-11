@@ -1,0 +1,109 @@
+/* ===== 回答进行中的交互（live.js）：审批 / 提问 / 计划 的卡片，排队的话 ===== */
+.live-requests { display: flex; flex-direction: column; gap: 8px; margin-top: 8px; }
+.live-requests:empty { display: none; }
+.req-card {
+  border: 1px solid color-mix(in srgb, var(--accent) 55%, transparent); border-radius: 10px; padding: 10px 12px;
+  background: color-mix(in srgb, var(--accent) 9%, transparent); display: flex; flex-direction: column; gap: 8px;
+  animation: req-in 0.18s ease-out;
+}
+@keyframes req-in { from { opacity: 0; transform: translateY(4px); } }
+.req-card.answered { opacity: 0.5; pointer-events: none; }
+.req-head { display: flex; align-items: center; gap: 7px; font-size: 13px; font-weight: 600; color: var(--text); }
+.req-icon { display: inline-flex; color: var(--accent); }
+.req-icon svg { width: 15px; height: 15px; }
+.req-path { font: 12px "SF Mono", Menlo, monospace; color: var(--text-muted); word-break: break-all; }
+.req-detail, .req-diff {
+  margin: 0; padding: 8px 10px; border-radius: 7px; background: rgba(0, 0, 0, 0.28); max-height: 220px; overflow: auto;
+  font: 12px/1.5 "SF Mono", Menlo, monospace; color: var(--text); white-space: pre-wrap; word-break: break-word;
+  user-select: text; -webkit-user-select: text;
+}
+.req-diff .add { color: #7ee2a8; }
+.req-diff .del { color: #ff9a9a; }
+.req-input {
+  height: 28px; padding: 0 9px; border: 1px solid var(--border-strong); border-radius: 7px; background: rgba(0, 0, 0, 0.2);
+  color: var(--text); font-size: 13px; outline: none;
+}
+.req-input:focus { border-color: var(--accent); }
+.req-actions { display: flex; flex-wrap: wrap; gap: 6px; }
+.req-btn {
+  height: 28px; padding: 0 12px; border: 1px solid var(--border-strong); border-radius: 7px; background: transparent;
+  color: var(--text); font-size: 13px; cursor: pointer;
+}
+.req-btn:hover { background: var(--hover); }
+.req-btn.primary { background: var(--accent); border-color: var(--accent); color: #fff; }
+.req-btn.primary:hover { filter: brightness(1.1); }
+.req-btn.danger { color: #ff9a9a; }
+.req-q { display: flex; flex-direction: column; gap: 6px; }
+.req-q-title { font-size: 13px; font-weight: 600; color: var(--text); }
+.req-options { display: flex; flex-direction: column; gap: 5px; }
+.req-option {
+  display: flex; flex-direction: column; align-items: flex-start; gap: 2px; padding: 7px 10px; text-align: left; cursor: pointer;
+  border: 1px solid var(--border-strong); border-radius: 8px; background: transparent; color: var(--text); font-size: 13px;
+}
+.req-option:hover { background: var(--hover); }
+.req-option.on { border-color: var(--accent); background: color-mix(in srgb, var(--accent) 18%, transparent); }
+.req-option-desc { font-size: 12px; color: var(--text-muted); }
+.req-option-desc:empty { display: none; }
+.req-plan-body { max-height: 320px; overflow: auto; padding: 8px 10px; border-radius: 7px; background: rgba(0, 0, 0, 0.22); font-size: 13px; }
+/* 回答没完又发的话：送过去 / 排着 */
+.msg.user.queued { opacity: 0.72; border: 1px dashed rgba(255, 255, 255, 0.45); }
+.queued-note { display: flex; align-items: center; justify-content: flex-end; gap: 6px; margin-top: 4px; font-size: 11px; opacity: 0.85; }
+.queued-cancel { display: none; width: 16px; height: 16px; padding: 0; border: none; background: transparent; color: inherit; cursor: pointer; }
+.queued-cancel svg { width: 11px; height: 11px; }
+.msg.user.queued.can-cancel .queued-cancel { display: inline-flex; align-items: center; justify-content: center; }
+.queued-now { display: none; padding: 1px 8px; border: 1px solid rgba(255, 255, 255, 0.6); border-radius: 9px; background: transparent; color: inherit; font-size: 11px; cursor: pointer; }
+.queued-now:hover { background: rgba(255, 255, 255, 0.18); }
+.msg.user.queued.can-jump .queued-now { display: inline-block; }
+/* 工作过程里：你中途补充的一句 */
+.step-user { display: flex; gap: 6px; padding: 3px 6px; font-size: 13px; color: var(--text); }
+.step-user-tag { flex-shrink: 0; padding: 0 6px; border-radius: 5px; background: var(--accent); color: #fff; font-size: 11px; line-height: 18px; }
+.step-user-text { white-space: pre-wrap; word-break: break-word; }
+/* 改动卡片上：查看全部改动 */
+.files-all { margin-right: auto; font-size: 12px; color: var(--accent); cursor: pointer; }
+.files-all:hover { text-decoration: underline; }
+/* 「全部改动」标签 */
+.chg-summary { font-size: 13px; font-weight: 600; color: var(--text); margin-right: 8px; }
+.chg-spacer { flex: 1; }
+.chg-btn { flex-shrink: 0; white-space: nowrap; height: 22px; padding: 0 9px; margin-left: 6px; border: 1px solid var(--border-strong); border-radius: 6px; background: transparent; color: var(--text-muted); font-size: 12px; cursor: pointer; }
+.chg-btn:hover { background: var(--hover); color: var(--text); }
+.chg-list { display: flex; flex-direction: column; }
+.chg-file { border-bottom: 1px solid var(--border-strong); }
+.chg-file-head { position: sticky; top: 0; z-index: 2; display: flex; align-items: center; gap: 7px; padding: 7px 10px; background: var(--bg-chat); border-bottom: 1px solid var(--border-strong); font-size: 13px; }
+.chg-name { font-weight: 600; color: var(--text); }
+.chg-dir { min-width: 0; flex-shrink: 1; color: var(--text-faint); font-size: 12px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+/* 太长的会话：「显示更早的」 */
+.msg.sys.load-earlier { border: 1px dashed var(--border-strong); border-radius: 8px; background: transparent; cursor: pointer; padding: 4px 12px; }
+.msg.sys.load-earlier:hover { color: var(--text); border-color: var(--accent); }
+/* 输入框里的 / 命令和 @ 文件 */
+.composer-box { position: relative; }
+.suggest-box {
+  position: absolute; left: 8px; right: 8px; bottom: calc(100% + 6px); z-index: 30; max-height: 264px; overflow-y: auto;
+  border: 1px solid var(--border-strong); border-radius: 10px; background: var(--bg-sidebar); box-shadow: 0 8px 28px rgba(0, 0, 0, 0.45); padding: 4px;
+}
+.suggest-row { display: flex; align-items: baseline; gap: 10px; padding: 5px 9px; border-radius: 7px; cursor: pointer; font-size: 13px; }
+.suggest-row.on, .suggest-row:hover { background: var(--hover); }
+.suggest-name { flex-shrink: 0; color: var(--text); font-family: "SF Mono", Menlo, monospace; font-size: 12px; }
+.suggest-desc { min-width: 0; color: var(--text-faint); font-size: 12px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+/* 用户消息上的「编辑」 */
+.msg.user { position: relative; }
+.msg-edit {
+  position: absolute; left: -26px; top: 50%; transform: translateY(-50%); width: 22px; height: 22px; padding: 0; border: none; border-radius: 6px;
+  background: transparent; color: var(--text-faint); cursor: pointer; opacity: 0; transition: opacity 0.12s;
+}
+.msg-edit svg { width: 13px; height: 13px; }
+.msg.user:hover .msg-edit { opacity: 1; }
+.msg-edit:hover { background: var(--hover); color: var(--text); }
+.msg.user.queued .msg-edit { display: none; }
+/* 图片附件 */
+.attach-row { display: flex; flex-wrap: wrap; gap: 6px; padding: 8px 10px 0; }
+.attach-row[hidden] { display: none; }
+.attach-chip { display: flex; align-items: center; gap: 6px; max-width: 200px; padding: 3px 4px 3px 3px; border: 1px solid var(--border-strong); border-radius: 8px; background: rgba(255, 255, 255, 0.04); font-size: 12px; color: var(--text-muted); }
+.attach-thumb { width: 30px; height: 30px; border-radius: 5px; object-fit: cover; }
+.attach-icon { display: inline-flex; width: 30px; height: 30px; align-items: center; justify-content: center; }
+.attach-icon svg { width: 15px; height: 15px; }
+.attach-name { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.attach-x { flex-shrink: 0; width: 16px; height: 16px; padding: 0; border: none; background: transparent; color: var(--text-faint); cursor: pointer; }
+.attach-x svg { width: 10px; height: 10px; }
+.attach-x:hover { color: var(--text); }
+/* 搜索正文命中的那条消息 */
+.msg.search-hit { outline: 2px solid var(--accent); outline-offset: 3px; border-radius: 10px; transition: outline-color 0.6s; }

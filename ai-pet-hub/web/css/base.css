@@ -1,0 +1,59 @@
+* { box-sizing: border-box; margin: 0; padding: 0; }
+/* 界面默认不能选中文字；回答、预览等内容区设成 text 后，里面的所有元素都跟着可选（不要再给 * 设 none，否则子元素又选不了） */
+body { user-select: none; -webkit-user-select: none; }
+
+:root {
+  --bg: #110f1e;
+  --bg-sidebar: #131120;
+  --bg-chat: #161427;
+  --bg-stage: #0f0d1b;
+  --bg-popover: #1f1c33;
+  --border: rgba(255, 255, 255, 0.08);
+  --border-strong: rgba(255, 255, 255, 0.16);
+  --text: #f1eefb;
+  --text-muted: rgba(241, 238, 251, 0.66);
+  --text-faint: rgba(241, 238, 251, 0.42);
+  --hover: rgba(255, 255, 255, 0.055);
+  --accent: #8e7cf0;
+  --accent-soft: rgba(142, 124, 240, 0.15);
+  --accent-strong: rgba(142, 124, 240, 0.4);
+  --lights: 86px;        /* 窗口左上角红绿灯占的宽度：最左边那一栏的顶栏要让开它。全屏时没有红绿灯，是 0 */
+  --sidebar-w: 260px;
+  --stage-w: 330px;
+}
+body.fullscreen { --lights: 0px; }
+/* 最高档（Ultra / Ultracode）的配色：--top-text 是字上的渐变，--top-1…3 是滑杆从深到亮的三个颜色 */
+body[data-agent="gpt"] { --top-text: linear-gradient(90deg, #b8a2ff, #8468ff 48%, #5ea6ff); --top-1: #2a2f9e; --top-2: #6f58f5; --top-3: #b49cff; }
+body[data-agent="claude"] { --top-text: linear-gradient(90deg, #ffb45c, #ff7d57 38%, #ee5f98 72%, #a57cff); --top-1: #a3382b; --top-2: #f2664f; --top-3: #c98bff; }
+body[data-agent="gemini"] { --accent: #8e7cf0; --accent-soft: rgba(142, 124, 240, 0.15); --accent-strong: rgba(142, 124, 240, 0.4); }
+body[data-agent="claude"] { --accent: #d97757; --accent-soft: rgba(217, 119, 87, 0.15); --accent-strong: rgba(217, 119, 87, 0.42); }
+body[data-agent="deepseek"] { --accent: #5b78ff; --accent-soft: rgba(77, 107, 254, 0.17); --accent-strong: rgba(77, 107, 254, 0.5); }
+body[data-agent="deepseek"] { --top-text: linear-gradient(90deg, #7fd4ff, #5b78ff 50%, #9a8bff); --top-1: #1b2a8f; --top-2: #4d6bfe; --top-3: #8fd2ff; }
+body[data-agent="gpt"]    { --accent: #10a37f; --accent-soft: rgba(16, 163, 127, 0.15); --accent-strong: rgba(16, 163, 127, 0.44); }
+
+html, body {
+  width: 100%; height: 100%; overflow: hidden;
+  background: var(--bg); color: var(--text);
+  font-family: -apple-system, BlinkMacSystemFont, "PingFang SC", "Hiragino Sans GB", sans-serif;
+  font-size: 13px; line-height: 1.5;   /* 字号只用这几档：11 / 12 / 13 / 14 / 15 / 16 / 20 / 24（不用 12.5、13.5 这种半档） */
+  -webkit-font-smoothing: antialiased; font-kerning: normal; text-rendering: optimizeLegibility;
+}
+button { font-family: inherit; }
+svg { display: block; }
+
+#main { height: 100%; display: flex; }
+
+.icon-btn {
+  width: 26px; height: 26px; flex-shrink: 0; border-radius: 6px; border: none;
+  display: inline-flex; align-items: center; justify-content: center;
+  background: transparent; color: var(--text-muted); cursor: pointer;
+}
+.icon-btn:hover { background: var(--hover); color: var(--text); }
+.icon-btn svg { width: 15px; height: 15px; }
+
+/* ===== 拖动分隔条 ===== */
+.col-resizer { width: 5px; flex-shrink: 0; position: relative; cursor: col-resize; z-index: 5; }
+.col-resizer::after { content: ""; position: absolute; top: 0; bottom: 0; left: 2px; width: 1px; background: var(--border); }
+.col-resizer:hover::after, .col-resizer.dragging::after { left: 1px; width: 3px; background: var(--accent-strong); }
+body.resizing-col, body.resizing-col * { cursor: col-resize !important; }
+body.resizing-row, body.resizing-row * { cursor: row-resize !important; }
