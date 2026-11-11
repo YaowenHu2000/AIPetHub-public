@@ -431,6 +431,35 @@ private func testLineSplitter() {
     eq(s.flush() ?? "", "尾巴", "结束时把没有换行的最后一行交出来")
 }
 
+/// 主动压缩上下文（/compact）：各家的结果怎么变成这一轮的回答；Gemini 报的上下文用量。
+private func testCompact() {
+    print("· 压缩上下文")
+    let t = TurnBuilder()
+    let p = ClaudeStreamParser(turn: t)
+    p.feed(json(#"{"type":"system","subtype":"status","status":"compacting","session_id":"s1"}"#))
+    eq(str(t.steps.first, "title"), "压缩上下文", "Claude：正在压缩是一步")
+    eq(str(t.steps.first, "status"), "running", "Claude：这一步在转")
+    p.feed(json(#"{"type":"system","subtype":"status","status":null,"compact_result":"success","session_id":"s1"}"#))
+    eq(str(t.steps.first, "status"), "ok", "Claude：压完了这一步是好的")
+    eq(p.compactNote ?? "", "前面的对话已经压缩成摘要，腾出了上下文空间。", "Claude：压完了的那句话")
+    eq(t.steps.count, 1, "Claude：只有一步")
+    let t2 = TurnBuilder()
+    let p2 = ClaudeStreamParser(turn: t2)
+    p2.feed(json(#"{"type":"system","subtype":"status","status":"compacting"}"#))
+    p2.feed(json(#"{"type":"system","subtype":"status","status":null,"compact_result":"failed","compact_error":"Not enough messages to compact."}"#))
+    eq(str(t2.steps.first, "status"), "error", "Claude：没压成这一步是失败的")
+    eq(p2.compactNote ?? "", "没有压缩：对话还太短，没有可以压缩的内容。", "Claude：对话太短的那句话")
+    eq(dshCompactReply("No compactable history yet."), "还没有可以压缩的历史：对话还太短。", "dsh：没有可压缩的")
+    eq(dshCompactReply(["text": "Compaction could not produce a useful summary. The conversation is unchanged; the attempt is recorded in the session log."]).hasPrefix("没有压缩"), true, "dsh：摘要没用不算出错")
+    eq(dshCompactReply(["result": ["message": "Compacted 12 items (~3400 tokens)."]]), "前面的对话已经压缩成摘要，腾出了上下文空间。\n\nCompacted 12 items (~3400 tokens).", "dsh：压完了，原话附在后面")
+    eq(dshCompactReply(nil), "前面的对话已经压缩成摘要，腾出了上下文空间。", "dsh：没有答复文字")
+    let a = AcpParser(turn: TurnBuilder())
+    var got = [0, 0]
+    a.onUsage = { got = [$0, $1] }
+    a.update(json(#"{"sessionUpdate":"usage_update","used":5300,"size":1000000}"#))
+    eq(got, [5300, 1000000], "Gemini：usage_update 报出已用和总量")
+}
+
 func runParserTests() -> Never {
     testHelpers()
     testTurnBuilder()
@@ -441,6 +470,7 @@ func runParserTests() -> Never {
     testCodexApp()
     testAcp()
     testDsh()
+    testCompact()
     testLineSplitter()
     print(failures == 0 ? "全部通过（\(checks) 项）" : "\(failures) / \(checks) 项没通过")
     exit(failures == 0 ? 0 : 1)

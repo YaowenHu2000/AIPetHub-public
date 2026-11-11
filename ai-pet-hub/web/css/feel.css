@@ -160,6 +160,23 @@ html, body { background: transparent; }
 .jump-nav svg { width: 15px; height: 15px; }
 .jump-nav .jump-down svg { transform: rotate(180deg); }
 
+/* 右边缘的一列小圆点：我说过的每一句一个，现在看到的那一句是亮的（chat/jump.js） */
+.jump-rail {
+  position: absolute; right: 8px; top: 50%; transform: translateY(-50%); z-index: 5; max-height: calc(100% - 150px);
+  display: flex; flex-direction: column; overflow-y: auto; scrollbar-width: none;
+}
+.jump-rail::-webkit-scrollbar { display: none; }
+.jump-rail[hidden], .jump-tip[hidden] { display: none; }
+.jump-dot { flex: none; width: 16px; height: 11px; padding: 0; border: none; background: none; cursor: pointer; display: flex; align-items: center; justify-content: center; }
+.jump-dot::before { content: ''; width: 6px; height: 6px; border-radius: 50%; background: rgba(255, 255, 255, 0.17); transition: background-color 0.15s ease, transform 0.15s ease; }
+.jump-dot:hover::before { background: rgba(255, 255, 255, 0.45); transform: scale(1.25); }
+.jump-dot.on::before { background: rgba(255, 255, 255, 0.62); }
+.jump-tip {
+  position: absolute; right: 28px; z-index: 6; transform: translateY(-50%); max-width: min(320px, 60%); padding: 5px 10px; border-radius: 8px; pointer-events: none;
+  background: var(--bg-popover); box-shadow: inset 0 0 0 0.5px var(--border-strong), 0 6px 18px rgba(0, 0, 0, 0.36);
+  font-size: 12px; color: var(--text); white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
+
 /* ---------- 排着的话：「往前排一位」（前面还有别的排着的话时才出现） ---------- */
 .queued-up { display: none; width: 16px; height: 16px; padding: 0; border: none; background: transparent; color: inherit; cursor: pointer; }
 .queued-up svg { width: 12px; height: 12px; }

@@ -252,7 +252,14 @@ final class CodexLiveTurn: LiveTurn {
             // 这个会话的上下文用了多少：最近一次请求带进去的加上它答出来的
             let n: (String) -> Int = { (last[$0] as? NSNumber)?.intValue ?? 0 }
             let used = n("totalTokens") > 0 ? n("totalTokens") : n("inputTokens") + n("outputTokens")
-            app.noteContext(agent: "gpt", conversationId: params["threadId"] as? String ?? parser.threadId, used: used, max: max)
+            // 明细：它只按「带进去的（其中多少是缓存里已有的）/ 答出来的」分，不分是什么内容
+            let cached = min(n("cachedInputTokens"), n("inputTokens"))
+            let parts: [[String: Any]] = [
+                ["id": "cached_input", "name": "Cached input", "tokens": cached],
+                ["id": "new_input", "name": "New input", "tokens": n("inputTokens") - cached],
+                ["id": "output", "name": "Output", "tokens": n("outputTokens")],
+            ].filter { ($0["tokens"] as? Int ?? 0) > 0 }
+            app.noteContext(agent: "gpt", conversationId: params["threadId"] as? String ?? parser.threadId, used: used, max: max, parts: parts)
         }
         parser.notify(method, params)
         noteConversation(parser.threadId)

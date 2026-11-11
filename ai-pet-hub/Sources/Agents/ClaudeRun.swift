@@ -152,7 +152,8 @@ extension AppDelegate {
 
     func claudeReply(_ req: AskRequest, res: CLIResult, parser: ClaudeStreamParser, turn: TurnBuilder) -> AgentReply {
         let convId = parser.sessionId.isEmpty ? req.conversationId : parser.sessionId
-        var built = turn.finish(finalText: parser.result)
+        // 压缩上下文的那一轮没有回答正文：结果那句话就是回答
+        var built = turn.finish(finalText: (parser.result ?? "").isEmpty ? (parser.compactNote ?? parser.result) : parser.result)
         var reply = built["text"] as? String ?? ""
         if res.cancelled { return AgentReply(reply: reply, conversationId: convId, cancelled: true, turn: built) }
         if reply.isEmpty, !parser.subtype.isEmpty, parser.subtype != "success" { reply = "Claude Code 提前结束：\(parser.subtype)" }

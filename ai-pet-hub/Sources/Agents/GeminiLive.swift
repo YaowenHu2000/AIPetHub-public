@@ -85,6 +85,11 @@ final class GeminiLiveTurn: LiveTurn {
     /// 返回 nil：这个版本的 agy 没有 acp、没登录、或者接不上这个会话，调用方退回 `agy -p`。
     func run() -> AgentReply? {
         parser.onCommands = { [weak app] list in app?.sendToJS("onAgentCommands", ["agent": "gemini", "commands": list]) }
+        let asked = req.conversationId
+        parser.onUsage = { [weak app, weak parser] used, size in
+            let sid = parser?.sessionId ?? ""
+            app?.noteContext(agent: "gemini", conversationId: sid.isEmpty ? asked : sid, used: used, max: size)
+        }
         if warm == nil { input.send(app.acpInitialize()) }
         let res = run(executable: agy, arguments: app.acpArgs(req), cwd: app.validWorkspace(req.workspace) ?? app.home)
         if let e = res.launchError {
@@ -111,6 +116,9 @@ final class GeminiLiveTurn: LiveTurn {
         }
         if reply.isEmpty, stop != "end_turn", !stop.isEmpty { reply = "⚠️ agy 提前结束：\(stop)" }
         if reply.isEmpty, refusedAny { reply = "你没有同意它要做的操作，它就停在这里了。想让它换个做法，直接告诉它。" }
+        // 压缩上下文的命令：agy 照做但什么都不回，这里补一句，免得看着像没反应
+        let said = req.prompt.trimmingCharacters(in: .whitespacesAndNewlines)
+        if reply.isEmpty, said == "/compact" || said == "/compress" { reply = "已经让它压缩前面的对话（agy 不回报压缩结果）" }
         if reply.isEmpty && ((built["steps"] as? [Any]) ?? []).isEmpty { reply = app.fallbackReply(res, cli: "agy", preferStderr: true) }
         built["text"] = reply
         return AgentReply(reply: reply, conversationId: convId, turn: built)

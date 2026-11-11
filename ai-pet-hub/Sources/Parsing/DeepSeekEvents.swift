@@ -243,3 +243,22 @@ func dshReadableError(_ message: String, code: String) -> String {
     if lower.contains("rate") && lower.contains("limit") { return "DeepSeek 限流了，稍后再试。\n\(message)" }
     return message.isEmpty ? "DeepSeek 出错了（没有给出原因）" : message
 }
+
+/// /compact 的答复 → 给人看的一句话。它答的是一句英文（压缩了多少条、多少 token，或者为什么没压）；格式认不出来就原样附在后面。
+func dshCompactReply(_ value: Any?) -> String {
+    func text(_ v: Any?) -> String? {
+        if let s = v as? String { return s.isEmpty ? nil : s }
+        if let d = v as? [String: Any] {
+            for k in ["text", "message", "output", "result", "value", "content"] { if let t = text(d[k]) { return t } }
+        }
+        if let a = v as? [Any] { return a.compactMap { text($0) }.first }
+        return nil
+    }
+    let said = (text(value) ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+    if said.hasPrefix("No compactable history") { return "还没有可以压缩的历史：对话还太短。" }
+    if said.hasPrefix("Compaction is unavailable") { return "⚠️ 现在压缩不了：它正在压缩，或者还在回答。等它停下来再试。" }
+    if said.hasPrefix("Compaction could not produce a useful summary") { return "没有压缩：没能得到一份有用的摘要（多半是对话还太短），对话没有变。" }
+    if said.contains("unchanged") { return "⚠️ 这次没有压缩成功，对话没有变。\n\n\(said)" }
+    if said.hasPrefix("Compaction did not finish") || said.hasPrefix("Compaction finished, but") { return "⚠️ 压缩没有干净地完成。\n\n\(said)" }
+    return said.isEmpty ? "前面的对话已经压缩成摘要，腾出了上下文空间。" : "前面的对话已经压缩成摘要，腾出了上下文空间。\n\n\(said)"
+}

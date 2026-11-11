@@ -102,7 +102,12 @@ final class ClaudeLiveTurn: LiveTurn {
             if response?["request_id"] as? String == claudeContextId {   // 这一轮答完后问的上下文用量：记下来，然后收
                 if let usage = response?["response"] as? [String: Any], let used = (usage["totalTokens"] as? NSNumber)?.intValue,
                    let max = (usage["maxTokens"] as? NSNumber)?.intValue {
-                    app.noteContext(agent: "claude", conversationId: parser.sessionId.isEmpty ? req.conversationId : parser.sessionId, used: used, max: max)
+                    // 明细：它分好类的（系统提示词、工具、技能、记忆文件、对话……）。没占地方的、延后加载的、空闲的不列；留给自动压缩的单独标出来
+                    let parts = (usage["categories"] as? [[String: Any]] ?? []).compactMap { c -> [String: Any]? in
+                        guard let tokens = (c["tokens"] as? NSNumber)?.intValue, tokens > 0, let kind = c["kind"] as? String, kind == "used" || kind == "buffer" else { return nil }
+                        return ["id": c["id"] as? String ?? "", "name": c["name"] as? String ?? "", "tokens": tokens, "kind": kind]
+                    }
+                    app.noteContext(agent: "claude", conversationId: parser.sessionId.isEmpty ? req.conversationId : parser.sessionId, used: used, max: max, parts: parts)
                 }
                 input.close()
             }

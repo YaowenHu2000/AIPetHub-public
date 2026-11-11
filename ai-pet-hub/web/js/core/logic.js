@@ -32,6 +32,11 @@ function syncPlan(shownIsUser, messages) {
   return messages.length - shownIsUser.length;
 }
 
+/** 这句话是不是「压缩上下文」的命令（各家叫 /compact 或 /compress）。它不是一轮对话：界面上显示成一条提示，不显示成一问一答。 */
+function isCompactCommand(text) {
+  return /^\/(compact|compress)$/.test((text || '').trim());
+}
+
 /** 发过的话里加一句：和已有的重复就挪到最后，最多留 50 句。 */
 function pushPrompt(list, text) {
   return [...list.filter(p => p !== text), text].slice(-50);

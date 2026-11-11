@@ -33,7 +33,8 @@ window.onConversationLoaded = data => {
     // 继续历史会话时，工作空间跟随该会话原来的目录
     if (typeof data.cwd === 'string') setWorkspace(id, wsKey(data.cwd), false);
   }
-  const messages = Array.isArray(data.messages) ? data.messages : [];
+  // 压缩上下文的命令不算一句话（有的 CLI 会把它记成一句提问）：不显示
+  const messages = (Array.isArray(data.messages) ? data.messages : []).filter(m => !(m.role === 'user' && isCompactCommand(m.text)));
   const last = messages[messages.length - 1] || {};
   const sig = `${messages.length}|${data.omitted || 0}|${(last.text || '').length}|${(last.steps || []).length}`;
   const syncing = st.syncing;
@@ -117,7 +118,17 @@ window.onAgentResponse = data => {
   const cwd = data.cwd || run.workspace || '';
   const shown = !!run.live?.el.isConnected;   // 这个会话正显示着（没有切走）
   const extra = rememberTurn(id, run, data, cwd);   // 这一轮改了哪些文件记下来：会话重新读一遍后改动卡片还在（live.js）
-  if (shown) {
+  const reply = (data.reply || '').trim();
+  if (shown && isCompactCommand(run.text) && !data.cancelled && !/^⚠️/.test(reply)) {
+    // 压缩上下文不是一轮对话（CLI 的记录里也没有这一问一答）：收起成一条提示，留在压缩发生的地方
+    const note = document.createElement('div');
+    note.className = 'msg sys fork-note compact-note';
+    note.textContent = reply.split('\n')[0] || '前面的对话已经压缩成摘要';
+    note.title = reply;
+    run.live.el.replaceWith(note);
+    (run.nodes || []).filter(n => n.classList && n.classList.contains('user')).forEach(n => n.remove());
+    if (nearBottom(st.msgEl)) scrollToBottom(st.msgEl);
+  } else if (shown) {
     const box = st.msgEl;
     const stick = nearBottom(box);
     const turn = renderTurn({

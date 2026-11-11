@@ -89,10 +89,12 @@ extension AppDelegate {
     }
 
     /// 一个会话的上下文用了多少（Claude 答完一轮后问 get_context_usage，Codex 每轮都会报）：告诉网页，模型面板里显示。
-    func noteContext(agent: String, conversationId: String, used: Int, max: Int) {
+    /// parts：是什么占的（每项 id / name / tokens；kind 为 "buffer" 的是留给自动压缩的，不算已用）。各家给得出什么就报什么，给不出就是空的。
+    /// estimated：明细是估算的（加起来不一定等于已用）。
+    func noteContext(agent: String, conversationId: String, used: Int, max: Int, parts: [[String: Any]] = [], estimated: Bool = false) {
         guard !conversationId.isEmpty, max > 0 else { return }
         DispatchQueue.main.async {
-            self.sendToJS("onAgentContext", ["agent": agent, "conversationId": conversationId, "used": used, "max": max])
+            self.sendToJS("onAgentContext", ["agent": agent, "conversationId": conversationId, "used": used, "max": max, "parts": parts, "estimated": estimated])
         }
     }
 

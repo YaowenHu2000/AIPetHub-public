@@ -135,6 +135,7 @@ final class AcpParser {
     var stopReason: String?      // end_turn / cancelled / refusal / max_tokens …
     /// agy 报出它认得的斜杠命令（输入框里打 / 时列出来）
     var onCommands: (([[String: String]]) -> Void)?
+    var onUsage: ((Int, Int) -> Void)?
     private var segment = 0
     private var current = ""     // 正在长的那一段的 key（"acp-text-N" / "acp-think-N"）
     private var buffer = ""
@@ -152,6 +153,8 @@ final class AcpParser {
                 return ["name": name, "desc": c["description"] as? String ?? ""]
             }
             if !list.isEmpty { onCommands?(list) }
+        case "usage_update":   // 这个会话的上下文用了多少（ACP：used / size）
+            if let used = (u["used"] as? NSNumber)?.intValue, let size = (u["size"] as? NSNumber)?.intValue, size > 0 { onUsage?(used, size) }
         case "tool_call", "tool_call_update":
             endSegment()
             guard let id = u["toolCallId"] as? String else { return }

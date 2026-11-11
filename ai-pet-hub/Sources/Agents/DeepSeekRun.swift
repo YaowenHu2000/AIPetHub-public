@@ -54,6 +54,7 @@ final class DeepSeekLiveTurn: LiveTurn {
     private var finished = false
     private var steers: [String: (id: String, text: String)] = [:]   // 中途补充的话：调用编号 → 网页那边的编号和内容（它看到时按调用编号认）
     private var reopened = 0
+    private var ctxUsed = 0, ctxMax = 0, ctxParts: [[String: Any]] = []   // 上下文用量：最近一次报的
 
     func run() -> AgentReply {
         app.registerLive(req.key, self)
@@ -89,6 +90,13 @@ final class DeepSeekLiveTurn: LiveTurn {
             else { asPaths.append(path) }
         }
         blocks.append(["type": "text", "text": asPaths.isEmpty ? req.prompt : req.prompt + "\n\n" + asPaths.joined(separator: "\n")])
+        // /compact：把前面的对话压缩成摘要。这是一条斜杠命令，不经过模型的一轮（当成普通的话发过去会被直接交给模型）
+        if req.prompt.trimmingCharacters(in: .whitespacesAndNewlines) == "/compact" {
+            let r = server.call("commands/execute", ["agentId": sid, "line": "/compact"], typert: true, timeout: 300)
+            Thread.sleep(forTimeInterval: 1.2)   // 等它把压缩后的上下文用量报过来
+            if let e = r.error { return AgentReply(reply: "⚠️ 没能压缩上下文：\(e)", conversationId: sid) }
+            return AgentReply(reply: dshCompactReply(r.value), conversationId: sid)
+        }
         locked { asked = true }
         var sent = server.call("session.prompt", ["sessionId": sid, "mode": "queue", "content": blocks])
         if sent.error != nil, blocks.count > 1 {   // 带图片被拒了：改成只发路径
@@ -175,11 +183,18 @@ final class DeepSeekLiveTurn: LiveTurn {
             }
             finish()
         case "session/projection":
-            // 上下文用了多少：模型面板里显示
-            if frame["key"] as? String == "contextPressure", let v = frame["value"] as? [String: Any],
-               let used = (v["pressureTokens"] as? NSNumber)?.intValue, let window = (v["contextWindow"] as? NSNumber)?.intValue {
-                app.noteContext(agent: "deepseek", conversationId: sid, used: used, max: window)
-            }
+            // 上下文用了多少、是什么占的：模型面板里显示。两样是分开报的，哪样来了就连同另一样最近的值一起告诉网页
+            guard let v = frame["value"] as? [String: Any] else { return }
+            let n: (String) -> Int? = { (v[$0] as? NSNumber)?.intValue }
+            if frame["key"] as? String == "contextPressure" {
+                // projectedTokens 是「下一次请求要带多少」，压缩之后马上就变；没有它才用上一次请求的实际大小
+                if let used = n("projectedTokens") ?? n("pressureTokens") { ctxUsed = used }
+                if let window = n("contextWindow") { ctxMax = window }
+            } else if frame["key"] as? String == "contextBreakdown" {
+                ctxParts = [("system", "System prompt", n("systemTokens") ?? 0), ("tools", "Tools", n("toolsTokens") ?? 0), ("messages", "Messages", n("messageTokens") ?? 0)]
+                    .filter { $0.2 > 0 }.map { ["id": $0.0, "name": $0.1, "tokens": $0.2] }
+            } else { return }
+            if ctxUsed > 0, ctxMax > 0 { app.noteContext(agent: "deepseek", conversationId: sid, used: ctxUsed, max: ctxMax, parts: ctxParts, estimated: true) }
         case "approval/requested":
             approval(frame)
         case "approval/resolved":

@@ -162,7 +162,7 @@ function renderPopover() {
 
 function positionPopover() {
   const box = els.popover;
-  if (!pop.anchor.isConnected) return;   // 左栏刚刷新、锚点已被替换：留在原处
+  if (!pop || !pop.anchor.isConnected) return;   // 面板已经收起（晚到的刷新）；或者左栏刚刷新、锚点已被替换：留在原处
   const r = pop.anchor.getBoundingClientRect();
   // 内容多到要滚动时，面板退回普通圆角（连续圆角的底和边是伪元素画的，会跟着内容滚走，见 squircle.css）
   box.classList.toggle('scrolls', box.scrollHeight > box.clientHeight + 1);
@@ -441,35 +441,86 @@ function renderModelList(box, id) {
   box.append(sep, moreRow);
 }
 
-// ===== 这个会话的上下文用了多少（模型面板里，剩余用量上面）：原生在每一轮答完后报过来（Usage.swift 的 noteContext） =====
-const agentContext = lsJson('context_usage', {});   // "谁:会话 ID" → { used, max }
-const tokenLabel = n => (n >= 1e6 ? `${+(n / 1e6).toFixed(n % 1e6 ? 1 : 0)}M` : n >= 1000 ? `${Math.round(n / 1000)}k` : String(n));
+// ===== 这个会话的上下文用了多少、是什么占的（模型面板里，剩余用量上面）：原生在每一轮答完后报过来（Usage.swift 的 noteContext） =====
+const agentContext = lsJson('context_usage', {});   // "谁:会话 ID" → { used, max, parts, estimated }
+const tokenLabel = n => (n >= 1e6 ? `${+(n / 1e6).toFixed(n % 1e6 ? 1 : 0)}M` : n >= 1000 ? `${+(n / 1000).toFixed(n < 10000 ? 1 : 0)}k` : String(n));
+// 各家报上来的分类 → 给人看的名字和颜色（没见过的分类用它自己的名字、轮着取颜色）
+const CONTEXT_PARTS = {
+  messages: ['对话内容', '#7aa2ff'], system_prompt: ['系统提示词', '#b79cff'], system: ['系统提示词', '#b79cff'],
+  system_tools: ['内置工具的说明', '#5fd0c5'], tools: ['工具的说明', '#5fd0c5'], mcp_tools: ['MCP 工具的说明', '#f2a65a'], mcp_instructions: ['MCP 服务的说明', '#e8875a'],
+  memory_files: ['记忆文件', '#f58fb1'], skills: ['技能', '#ffd166'], custom_agents: ['自定义智能体', '#9be28a'],
+  cached_input: ['带进去的（缓存里已有）', '#7aa2ff'], new_input: ['带进去的（新的）', '#5fd0c5'], output: ['这一次答出来的', '#ffd166'],
+  autocompact_buffer: ['留给自动压缩', 'rgba(255, 255, 255, 0.22)'],
+};
+const CONTEXT_SPARE = ['#7aa2ff', '#5fd0c5', '#ffd166', '#f58fb1', '#b79cff', '#f2a65a', '#9be28a'];
+const contextPart = (p, i) => { const known = CONTEXT_PARTS[p.id]; return { ...p, name: known ? known[0] : (p.name || p.id), color: known ? known[1] : CONTEXT_SPARE[i % CONTEXT_SPARE.length] }; };
+
+/** 这一位能不能主动压缩上下文、用哪条命令：Claude、Codex、DeepSeek 都是 /compact；Gemini（agy）看它报上来的命令里有没有，有就照发。 */
+function compactCommand(id) {
+  if (id === 'claude' || id === 'gpt' || id === 'deepseek') return 'compact';
+  return ((agentCommands[id] || []).find(c => /^(compact|compress)$/.test(c.name)) || {}).name || '';
+}
 
 function renderContext(box, id) {
+  if (!S[id].conversationId) return;
   const data = agentContext[`${id}:${S[id].conversationId}`];
-  if (!data || !S[id].conversationId) return;
-  const pct = Math.min(100, Math.round(data.used / data.max * 100));
+  const cmd = compactCommand(id);
+  if (!data && !cmd) return;
   const sep = document.createElement('div');
   sep.className = 'pop-sep';
   const wrap = document.createElement('div');
-  wrap.className = 'usage-box';
-  wrap.appendChild(elSpan('pop-title usage-title', '这个会话的上下文'));
+  wrap.className = 'usage-box ctx-box';
+  const title = elSpan('pop-title usage-title', '这个会话的上下文');
+  if (cmd) {
+    const b = document.createElement('button');
+    b.className = 'ctx-compact';
+    b.textContent = '压缩';
+    b.title = viewBusy(id) ? '还在回答，等这一轮结束再压缩' : `把前面的对话压缩成摘要，腾出上下文空间（发一句 /${cmd}）`;
+    b.disabled = viewBusy(id);
+    b.addEventListener('click', e => { e.stopPropagation(); if (viewBusy(id)) return; closePopover(); startRun(id, `/${cmd}`, []); });
+    title.appendChild(b);
+  }
+  wrap.appendChild(title);
+  box.append(sep, wrap);
+  if (!data) { wrap.appendChild(elSpan('usage-note', '这个会话答完一轮后显示用了多少')); return; }
+
+  const pct = Math.min(100, Math.round(data.used / data.max * 100));
+  const parts = (data.parts || []).filter(p => p.tokens > 0).map(contextPart);
+  const used = parts.filter(p => p.kind !== 'buffer').sort((a, b) => b.tokens - a.tokens), buffer = parts.filter(p => p.kind === 'buffer');
   const row = document.createElement('div');
   row.className = 'usage-row';
-  row.title = pct >= 80 ? '快满了：可以发 /compact 把前面的对话压缩成摘要' : '';
   const bar = document.createElement('span');
   bar.className = 'usage-bar' + (pct >= 92 ? ' low' : pct >= 80 ? ' mid' : '');   // 这里是用得越多越该提醒
   const fill = document.createElement('i');
   fill.style.width = `${Math.max(2, pct)}%`;
   bar.appendChild(fill);
+  row.title = pct >= 80 ? '快满了：可以点「压缩」把前面的对话压缩成摘要' : '';
   row.append(elSpan('usage-label', `已用 ${pct}%`), bar, elSpan('usage-reset', `${tokenLabel(data.used)} / ${tokenLabel(data.max)}`));
   wrap.appendChild(row);
-  box.append(sep, wrap);
+  if (used.length) {
+    // 已用的这些是什么占的：一条分段的条（整条 = 已用的全部，每一类一段），下面从多到少一行一类
+    const mix = document.createElement('div');
+    mix.className = 'ctx-mix';
+    used.forEach(p => { const seg = document.createElement('i'); seg.style.flex = `${p.tokens} 1 0px`; seg.style.background = p.color; seg.title = p.name; mix.appendChild(seg); });
+    wrap.appendChild(mix);
+  }
+  [...used, ...buffer].forEach(p => {
+    const line = document.createElement('div');
+    line.className = 'ctx-part' + (p.kind === 'buffer' ? ' spare' : '');
+    const dot = document.createElement('i');
+    dot.style.background = p.color;
+    const share = p.tokens / data.max * 100;
+    line.append(dot, elSpan('ctx-name', p.name), elSpan('ctx-tokens', tokenLabel(p.tokens)), elSpan('ctx-share', share >= 10 ? `${Math.round(share)}%` : share >= 0.1 ? `${share.toFixed(1)}%` : '<0.1%'));
+    wrap.appendChild(line);
+  });
+  if (used.length && data.estimated) wrap.appendChild(elSpan('usage-note ctx-note', '各项是估算的，加起来和已用的不完全相等'));
 }
 
 window.onAgentContext = function (data) {
   if (!data || !AGENTS[data.agent] || !data.conversationId || !(data.max > 0)) return;
-  agentContext[`${data.agent}:${data.conversationId}`] = { used: data.used, max: data.max };
+  const key = `${data.agent}:${data.conversationId}`, parts = Array.isArray(data.parts) ? data.parts : [];
+  // 这次没带明细（有的只在某些时候报）：沿用上一次的
+  agentContext[key] = { used: data.used, max: data.max, parts: parts.length ? parts : (agentContext[key]?.parts || []), estimated: !!data.estimated };
   const keys = Object.keys(agentContext);
   if (keys.length > 60) keys.slice(0, keys.length - 60).forEach(k => delete agentContext[k]);   // 只留最近的几十个会话
   lsSet('context_usage', JSON.stringify(agentContext));

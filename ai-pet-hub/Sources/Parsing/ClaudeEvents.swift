@@ -108,6 +108,8 @@ final class ClaudeStreamParser {
     var isError = false
     var subtype = ""
     var durationMs: Double?
+    /// 这一轮压缩过上下文（/compact）：结果怎么样，给人看的一句话。压缩不经过模型，没有回答正文，这句话就是这一轮的回答
+    var compactNote: String?
     private var pending: [String: PendingFile] = [:]
     // --include-partial-messages：回答文字边生成边推给界面（Claude 不给思考内容，思考仍然只是一步占位）
     private var currentMessage = ""
@@ -150,6 +152,20 @@ final class ClaudeStreamParser {
             isError = (obj["is_error"] as? Bool) == true
             subtype = obj["subtype"] as? String ?? ""
             durationMs = (obj["duration_ms"] as? NSNumber)?.doubleValue
+        case "system":
+            // /compact：先来一条「正在压缩」，再来一条带结果的（成功 / 没压成和原因）
+            let sub = obj["subtype"] as? String
+            if sub == "status", obj["status"] as? String == "compacting", turn.step("compact") == nil {
+                turn.add(makeStep("tool", "压缩上下文", status: "running"), key: "compact")
+            }
+            if sub == "status", let r = obj["compact_result"] as? String {
+                let ok = r == "success"
+                if turn.step("compact") == nil { turn.add(makeStep("tool", "压缩上下文", status: ok ? "ok" : "error"), key: "compact") }
+                else { turn.update("compact", ["status": ok ? "ok" : "error"]) }
+                compactNote = ok ? "前面的对话已经压缩成摘要，腾出了上下文空间。" : claudeCompactProblem(obj["compact_error"] as? String ?? "")
+            } else if sub == "compact_boundary", compactNote == nil {
+                compactNote = "前面的对话已经压缩成摘要，腾出了上下文空间。"
+            }
         default:
             break
         }
@@ -190,4 +206,10 @@ final class ClaudeStreamParser {
         if turn.step(key) == nil { turn.add(makeStep("text", "说明", detail: text, status: status), key: key) }
         else { turn.update(key, ["detail": text, "status": status]) }
     }
+}
+
+/// /compact 没压成的原因 → 给人看的一句话。
+func claudeCompactProblem(_ error: String) -> String {
+    if error.hasPrefix("Not enough messages") { return "没有压缩：对话还太短，没有可以压缩的内容。" }
+    return error.isEmpty ? "这次没有压缩成功，对话没有变。" : "这次没有压缩成功，对话没有变。\n\n\(error)"
 }
