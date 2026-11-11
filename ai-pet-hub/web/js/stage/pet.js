@@ -163,7 +163,7 @@ class Pet {
         if (token !== this.frameToken) return;
         this.front.style.transition = `opacity ${fadeMs}ms ease-out`;
         this.front.style.opacity = '1';
-        this.back.style.transition = `opacity ${outMs}ms ease-in ${fadeMs}ms`;
+        this.back.style.transition = `opacity ${outMs}ms ease ${fadeMs}ms`;
         this.back.style.opacity = '0';
       });
     };

@@ -78,6 +78,8 @@ function renderWelcome() {
 }
 
 function openWelcome() {
+  welcome.classList.remove('settled');
+  setTimeout(() => welcome.classList.add('settled'), 800);   // 依次出现只演这一遍
   welcomeSafe = ALL_AGENT_IDS.some(id => S[id].perm === AGENTS[id].safePerm && AGENTS[id].safePerm !== AGENTS[id].perm);
   renderWelcome();
   welcome.hidden = false;

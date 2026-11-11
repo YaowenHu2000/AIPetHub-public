@@ -22,5 +22,5 @@ fi
 git init -q -b main
 git add -A
 git -c user.name="${GIT_AUTHOR_NAME:-$(git -C "$ROOT" config user.name)}" -c user.email="${GIT_AUTHOR_EMAIL:-$(git -C "$ROOT" config user.email)}" \
-  commit -q -m "AIPetHub：在一个原生 macOS 窗口里使用 Gemini、Claude Code、Codex 与 DeepSeek"
+  commit -q -m "AIPetHub: One native macOS window for Claude Code, Codex, Gemini, and DeepSeek"
 echo "导出到 $DEST：$(git ls-files | wc -l | tr -d ' ') 个文件，$(du -sh .git | cut -f1)"

@@ -337,7 +337,8 @@ function effortSlider(id, opts, label) {
     els.popover.classList.toggle('top', TOP_EFFORTS.has(st.effort));
   };
   // 圆钮的位置（--t，0…1，拖过头时会略微超出）由一根弹簧管：拖的时候直接跟着手指，松手后带着拖的速度落到那一档上
-  const knobSpring = new Spring({ value: stepT(), stiffness: 380, damping: 24, onUpdate: t => track.style.setProperty('--t', t) });
+  // 手上的动作可以带一点回弹，但只一点（阻尼比约 0.8）
+  const knobSpring = new Spring({ value: stepT(), stiffness: 380, damping: 31, onUpdate: t => track.style.setProperty('--t', t) });
   track.style.setProperty('--t', stepT());
   label2();
   if (opts.length < 2) return track;

@@ -88,9 +88,10 @@ function relTime(ts) {
   if (s < 60) return '刚刚';
   if (s < 3600) return `${Math.floor(s / 60)}分钟`;
   if (s < 86400) return `${Math.floor(s / 3600)}小时`;
-  if (s < 86400 * 30) return `${Math.floor(s / 86400)}天`;
-  if (s < 86400 * 365) return `${Math.floor(s / 86400 / 30)}个月`;
-  return `${Math.floor(s / 86400 / 365)}年`;
+  if (s < 86400 * 7) return `${Math.floor(s / 86400)}天`;
+  // 一周以前的写日期：「47天」「3个月」得心算才知道是哪天
+  const d = new Date(ts * 1000);
+  return d.getFullYear() === new Date().getFullYear() ? `${d.getMonth() + 1}月${d.getDate()}日` : `${d.getFullYear()}/${d.getMonth() + 1}/${d.getDate()}`;
 }
 
 function currentTitle(id) {

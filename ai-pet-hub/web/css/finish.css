@@ -1,0 +1,55 @@
+/* ===== 收尾的一层（参考 Impeccable 的 craft floor，按「工具类界面」的标准：精确、克制，品牌只落在细节上） =====
+   放在最后加载。管的是这几样：
+   · 浏览器自带的那些面：选中的文字、输入光标、滚动条、键盘焦点环、链接下划线——都从配色里取，不留默认的样子；
+   · 对比度：次要文字（时间、计数、占位字）在深色底上不低于 4.5:1；
+   · 不用「彩色的粗左边线」标记当前项 / 提示块，改成浅底色和细边线；
+   · 不拿 emoji 当图标（桌宠的状态胶囊和头顶的工作标签换成线条图标，见 stage/pet-reactions.js）；
+   · 标题换行平衡，段落不留孤字。 */
+
+/* ---------- 对比度：--text-faint 从 42% 提到 56%（在 #161427 上约 3.8:1 → 5.6:1） ---------- */
+:root { --text-faint: rgba(241, 238, 251, 0.56); }
+#history-sidebar { --text-faint: rgba(241, 238, 251, 0.6); }
+
+/* ---------- 选中的文字、输入光标 ---------- */
+::selection { background: color-mix(in srgb, var(--accent) 46%, transparent); color: #fff; }
+.msg.user ::selection, .msg.user::selection { background: rgba(255, 255, 255, 0.36); color: #fff; }   /* 我发的话底色就是主色：选区换成白的才看得出 */
+input, textarea, [contenteditable] { caret-color: var(--accent); }
+
+/* ---------- 滚动条：细、带一点配色里的紫，悬停时亮一些 ---------- */
+::-webkit-scrollbar { width: 8px; height: 8px; }
+::-webkit-scrollbar-thumb { background: rgba(196, 188, 240, 0.16); border-radius: 8px; border: 2px solid transparent; background-clip: content-box; }
+::-webkit-scrollbar-thumb:hover { background: rgba(196, 188, 240, 0.34); background-clip: content-box; }
+::-webkit-scrollbar-corner { background: transparent; }
+
+/* ---------- 键盘焦点：用键盘走到的控件有一圈主色的环（鼠标点的不出现） ---------- */
+button:focus-visible, a:focus-visible, [tabindex]:focus-visible, .conv-row:focus-visible, .grp-head:focus-visible {
+  outline: 2px solid var(--accent-strong); outline-offset: 2px; border-radius: 8px;
+}
+button:focus:not(:focus-visible) { outline: none; }
+
+/* ---------- 链接：下划线细一点、离字远一点、颜色跟主色 ---------- */
+.answer a, .md a, .ext-link { text-decoration-thickness: 1px; text-underline-offset: 3px; text-decoration-color: color-mix(in srgb, var(--accent) 60%, transparent); }
+.answer a:hover, .md a:hover, .ext-link:hover { text-decoration-color: var(--accent); }
+
+/* ---------- 当前这一位的分区：不用彩色的粗左边线，改成标题那一行垫一层它的主色 ---------- */
+.hist-section.active .hist-head { border-left-color: transparent; background: linear-gradient(90deg, var(--sec-soft), transparent 82%); }
+.hist-section.active .hist-head:hover { background: linear-gradient(90deg, var(--sec-soft), rgba(255, 255, 255, 0.025) 82%); }
+body.window-inactive .hist-section.active .hist-head { background: linear-gradient(90deg, rgba(255, 255, 255, 0.05), transparent 82%); }
+
+/* ---------- 提示块（> [!NOTE] 这类）：细边线一圈加浅底，不是一条粗的彩色左边线 ---------- */
+.md-alert { border: 1px solid; border-left-width: 1px; border-radius: 8px; padding: 7px 12px; }
+.md-alert-note { border-color: rgba(88, 166, 255, 0.38); }
+.md-alert-tip { border-color: rgba(63, 185, 80, 0.38); }
+.md-alert-important { border-color: rgba(163, 113, 247, 0.4); }
+.md-alert-warning { border-color: rgba(210, 153, 34, 0.42); }
+.md-alert-caution { border-color: rgba(248, 81, 73, 0.4); }
+
+/* ---------- 排版：标题换行平衡，正文不留孤字 ---------- */
+.md h1, .md h2, .md h3, .md h4, .wl-title, .confirm-title { text-wrap: balance; }
+.answer p, .md p, .md li, .wl-sub, .confirm-text { text-wrap: pretty; }
+
+/* ---------- 桌宠状态里的线条图标 ---------- */
+.pet-status { display: inline-flex; align-items: center; gap: 4px; }
+.pet-status svg { width: 11px; height: 11px; flex-shrink: 0; }
+.pwb-icon { display: inline-flex; align-items: center; }
+.pwb-icon svg { width: 12px; height: 12px; }

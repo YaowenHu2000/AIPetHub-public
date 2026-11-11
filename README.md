@@ -1,125 +1,249 @@
 <p align="center">
-  <img src="docs/images/icon.png" width="104" alt="AIPetHub">
-</p>
-
-<h1 align="center">AIPetHub</h1>
-
-<p align="center">
-  <b>一个原生 macOS 窗口，同时用好 Claude Code、Codex、Gemini 和 DeepSeek 四个编程智能体。</b><br>
-  One native macOS app for your coding-agent CLIs — Claude Code, Codex, Gemini (Antigravity) and DeepSeek.
+  <img src="docs/images/poster-masthead.png" width="100%" alt="AIPetHub — One native macOS window for Claude Code, Codex, Gemini, and DeepSeek">
 </p>
 
 <p align="center">
-  <a href="../../releases/latest"><img alt="下载" src="https://img.shields.io/badge/下载-macOS%2013%2B-000000?logo=apple&logoColor=white"></a>
-  <img alt="Swift · AppKit · WebKit" src="https://img.shields.io/badge/Swift-AppKit%20%C2%B7%20WebKit-F05138?logo=swift&logoColor=white">
-  <img alt="Claude Code · Codex · Gemini · DeepSeek" src="https://img.shields.io/badge/CLI-Claude%20Code%20%C2%B7%20Codex%20%C2%B7%20Gemini%20%C2%B7%20DeepSeek-3B82F6">
-  <a href="LICENSE"><img alt="License: GPL-3.0" src="https://img.shields.io/badge/License-GPL--3.0-blue"></a>
+  <a href="../../releases/latest"><img alt="Download DMG" src="https://img.shields.io/badge/Download_DMG-macOS_13%2B-16161A?style=flat-square&logo=apple&logoColor=white"></a>
+  <img alt="Swift · AppKit · WebKit" src="https://img.shields.io/badge/Stack-Swift_%C2%B7_AppKit_%C2%B7_WebKit-F05138?style=flat-square&logo=swift&logoColor=white">
+  <img alt="CLIs: claude · codex · agy · dsh" src="https://img.shields.io/badge/CLIs-claude_%C2%B7_codex_%C2%B7_agy_%C2%B7_dsh-2563EB?style=flat-square">
+  <a href="LICENSE"><img alt="Code: GPL-3.0" src="https://img.shields.io/badge/Code-GPL--3.0-1D4ED8?style=flat-square"></a>
+  <a href="ASSETS-LICENSE.md"><img alt="Art: CC BY-NC-SA 4.0" src="https://img.shields.io/badge/Art-CC_BY--NC--SA_4.0-D97706?style=flat-square"></a>
 </p>
 
-![AIPetHub 主界面：左侧是四个智能体按项目分组的会话，中间是对话、工作过程和改动汇总，右侧是四位角色](docs/images/screenshot.png)
+<p align="center">
+  <b>English Poster Edition</b> &middot; <a href="README.zh-CN.md">简体中文说明</a> &middot; <a href="docs/ARCHITECTURE.md">Architecture Notes (ZH)</a>
+</p>
 
-## 它是什么
+---
 
-现在的编程智能体大多以**命令行工具（CLI）**的形式出现：Claude Code、Codex、Antigravity（Gemini）、DeepSeek Harness……每个都要开一个终端窗口，会话散落在各自的目录里，回答是滚动的纯文本，改了哪些文件要自己去翻。
+## `§ 01` &middot; Motivation & Architecture
 
-AIPetHub 把这些 CLI **集成到同一个窗口**里：
+<p align="center">
+  <img src="docs/images/poster-workflow.png" width="100%" alt="Fig. 1 — Problem and Architecture in Three Panels">
+</p>
 
-- **统一入口**：四个智能体并排，⌘1–⌘4 切换；同一个问题可以分别交给不同的智能体。
-- **统一会话**：直接读取各 CLI 自己的会话记录，按项目分组；在终端里聊过的会话也能在这里接着聊。
-- **看得懂的回答**：工作过程（思考、命令、读写文件）和正文分开呈现，改动的文件汇总成卡片，点开就是带差异标注的预览。
-- **不替代 CLI**：AIPetHub 本身不调用模型、不保存凭据，所有请求都交给你本机已经装好、登录好的 CLI，沿用它们自己的配置。
+Coding agents today mostly ship as command-line tools: **Claude Code** (`claude`), **Codex** (`codex`), **Antigravity / Gemini** (`agy`), and **DeepSeek Harness** (`dsh`). Running all four means juggling terminal tabs, hunting down session logs across separate dot-folders, reading raw text scrollback, and running `git diff` by hand to see what changed.
 
-每个智能体配有一个 Q 版角色——极其猫（Gemini）、克劳蒂娜（Claude）、吉佩缇（Codex）、大肥鱼（DeepSeek）——在右侧实时反映它在思考、查资料还是改代码。
+**AIPetHub** puts those local CLIs inside one macOS window without sitting between you and their servers:
 
-## 功能
+- **One desk, four agents**: Switch with `⌘1`–`⌘4`, or hand the same problem to two agents side by side and compare how they solve it.
+- **Shared history with Terminal**: Reads each CLI's own session store directly (`JSONL` and `SQLite`, opened read-only) and groups threads by project folder. Start a chat in `zsh`, continue it here.
+- **Readable turns**: Separates tool activity (reasoning, shell commands, file reads and writes) from the final answer. Modified files collect into a summary card that opens a line-by-line diff preview on click.
+- **Bring your own CLI**: AIPetHub makes no model API calls and stores no credentials. It spawns the CLI binaries already installed and signed in on your Mac, inheriting their configs, MCP servers, and skills.
 
-| | |
+---
+
+## `§ 02` &middot; Apparatus & Capabilities
+
+<p align="center">
+  <img src="docs/images/poster-anatomy.png" width="100%" alt="Fig. 2 — Annotated Interface Anatomy">
+</p>
+
+<p align="center"><sub><b>Table I.</b> Core Workbench Capabilities</sub></p>
+
+| Subsystem | Behavior |
 |---|---|
-| **多智能体** | 四个 CLI 并排使用；用哪几个可以随时增删，添加前会自动查找本机的命令并发一句话验证 |
-| **会话管理** | 按项目分组、全文搜索（⌘F）、同一智能体同时跑多个会话；会话在别处运行时自动同步新内容 |
-| **实时过程** | 回答边生成边显示；思考、命令与输出、文件读写按步骤展开，完成后折叠为「已工作 N 秒 · M 步」 |
-| **中途介入** | 回答进行中可以补充一句、插队、停止，或者审批它要做的操作 |
-| **改动审阅** | 改动文件汇总成卡片；预览面板在完整文件上逐行标注增删，Markdown、图片、PDF、Office 文档都能直接看 |
-| **内置浏览器** | 预览本地网页；智能体也能用它打开页面、截图、读控制台，自己检查做出来的网页 |
-| **模型与用量** | 模型和思考强度跟着 CLI 自动同步；面板里能看到上下文占用和剩余额度（DeepSeek 显示账户余额） |
-| **原生体验** | Swift + AppKit 窗口，深色毛玻璃界面；回答完成或需要你决定时 Dock 图标提醒，不弹系统通知 |
+| **Multi-Agent Roster** | Run up to four CLIs side by side. Enable or remove any slot at will; adding an agent probes your `PATH` (including `nvm` and `volta`) and runs a one-line handshake check. |
+| **Session Browser** | Groups conversations by workspace folder, supports full-text search (`⌘F`), runs multiple threads per agent in parallel, and live-syncs updates if a session advances outside the app. |
+| **Step Folding** | Streams reasoning, shell commands + stdout, and file operations step by step while running, then folds finished work into `"Worked N s · M steps"`. |
+| **Mid-Turn Steering** | Queue a follow-up, cut in immediately, abort the process tree, or approve/deny tool prompts while an answer is still streaming. |
+| **Diff & File Preview** | Highlights added and removed lines in full-file context. Also previews Markdown, images, PDFs, and Office documents (`docx` / `xlsx` / `pptx` rendered offline via macOS Quick Look). |
+| **Built-In Local Browser** | Preview localhost dev servers inside the window. Agents can also drive this browser to open pages, capture screenshots, and read console errors to check their own UI work. |
+| **Model & Quota Sync** | Pulls model lists and reasoning-effort tiers straight from each CLI. Displays context window usage and remaining quota (or account balance for DeepSeek). |
+| **Native AppKit Window** | Dark frosted-glass macOS chrome. Bounces/badges the Dock icon when a turn finishes or awaits approval instead of firing system notification banners. |
 
-## 支持的智能体
+---
 
-| 角色 | 智能体 | 需要安装的 CLI | 安装 |
-|---|---|---|---|
-| 克劳蒂娜 | Claude | Claude Code（`claude`） | `npm install -g @anthropic-ai/claude-code`，然后运行 `claude` 登录 |
-| 吉佩缇 | Codex | Codex CLI（`codex`） | `npm install -g @openai/codex`，然后运行 `codex login`；装了 ChatGPT 桌面版也能直接用它自带的 |
-| 极其猫 | Gemini | Antigravity CLI（`agy`） | 安装 [Antigravity](https://antigravity.google/)，然后运行 `agy` 登录 |
-| 大肥鱼 | DeepSeek | DeepSeek Harness（`dsh`） | `npm install -g @deepseek-ai/dsh`，按它的说明配置 API 密钥 |
+## `§ 03` &middot; Subject Profiles (Supported CLIs)
 
-装一个就能用，没装的不影响其他几个。AIPetHub 会在常见位置和登录 shell 的 `PATH` 里查找这些命令（nvm、volta 安装的也找得到）。
+Install at least one CLI below. Missing CLIs simply stay disabled without affecting the others.
 
-## 安装
+<p align="center"><sub><b>Table II.</b> Field Cast &amp; Local CLI Bindings</sub></p>
 
-1. 到 [Releases](../../releases/latest) 下载 `AIPetHub-<版本>.dmg`，打开后把 AIPetHub 拖进「应用程序」。
-2. 第一次打开时，系统会提示「无法验证开发者」（安装包没有经过苹果公证）。放行一次即可：
-   - 在「应用程序」里**右键** AIPetHub →「打开」→ 再点「打开」；
-   - 或者：「系统设置 › 隐私与安全性」→ 找到 AIPetHub →「仍要打开」；
-   - 或者在终端运行：`xattr -dr com.apple.quarantine /Applications/AIPetHub.app`
-3. 打开后有一页引导：列出本机找到了哪些智能体、缺的怎么装，并让你选择默认权限。
+<table>
+  <thead>
+    <tr>
+      <th width="25%" align="center">Claudina &middot; 克劳蒂娜<br><sub>Claude</sub></th>
+      <th width="25%" align="center">Jipeiti &middot; 吉佩缇<br><sub>Codex</sub></th>
+      <th width="25%" align="center">Jiqimao &middot; 极其猫<br><sub>Gemini</sub></th>
+      <th width="25%" align="center">Dafeiyu &middot; 大肥鱼<br><sub>DeepSeek</sub></th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td align="center">
+        <img src="ai-pet-hub/web/sprites/claude/v2/working_g00.png" width="136" alt="Claudina working"><br>
+        <sub><i>"Tome open. Writing patches."</i></sub>
+      </td>
+      <td align="center">
+        <img src="ai-pet-hub/web/sprites/gpt/v2/working_g00.png" width="136" alt="Jipeiti working"><br>
+        <sub><i>"Patching in parallel."</i></sub>
+      </td>
+      <td align="center">
+        <img src="ai-pet-hub/web/sprites/gemini/default/thinking_g00.png" width="136" alt="Jiqimao thinking"><br>
+        <sub><i>"Mapping the repo stars..."</i></sub>
+      </td>
+      <td align="center">
+        <img src="ai-pet-hub/web/sprites/deepseek/v2/working_g00.png" width="136" alt="Dafeiyu working"><br>
+        <sub><i>"Will optimize SQL for lunch."</i></sub>
+      </td>
+    </tr>
+    <tr>
+      <td valign="top">
+        <b>CLI:</b> <code>claude</code><br>
+        <b>Channel:</b> <code>stream-json</code> stdio<br>
+        <b>Setup:</b><br>
+        <code>npm i -g @anthropic-ai/claude-code</code>, then run <code>claude</code> to log in.
+      </td>
+      <td valign="top">
+        <b>CLI:</b> <code>codex</code><br>
+        <b>Channel:</b> <code>app-server</code> JSON-RPC<br>
+        <b>Setup:</b><br>
+        <code>npm i -g @openai/codex</code> and run <code>codex login</code> (or reuse the binary inside ChatGPT.app).
+      </td>
+      <td valign="top">
+        <b>CLI:</b> <code>agy</code><br>
+        <b>Channel:</b> <code>agy acp</code> protocol<br>
+        <b>Setup:</b><br>
+        Install <a href="https://antigravity.google/">Antigravity</a>, then run <code>agy</code> in Terminal to sign in.
+      </td>
+      <td valign="top">
+        <b>CLI:</b> <code>dsh</code><br>
+        <b>Channel:</b> Local <code>dsh web</code> HTTP + WS<br>
+        <b>Setup:</b><br>
+        <code>npm i -g @deepseek-ai/dsh</code>, then set your API key per <code>dsh</code> docs.
+      </td>
+    </tr>
+  </tbody>
+</table>
 
-**系统要求**：macOS 13 Ventura 或更高版本，至少装好并登录一个上面的 CLI。
+---
 
-## 权限与安全
+## `§ 04` &middot; Mascot Behavioral States
 
-> [!WARNING]
-> **默认使用最高权限**：智能体可以不经询问地执行命令、读写本机任何文件。这样用起来最顺手，但它做错了事不会先停下来问你。
+Each mascot on the right-hand stage reacts to the live event stream emitted by its underlying CLI process:
 
-- 第一次打开的引导页可以一键改成「保守」：改文件、跑命令前先问你，或者只允许修改当前工作空间（各 CLI 的档位不同）。
-- 之后随时可以在输入框右下角为每个智能体单独切换。
-- 建议只在你信任的项目里使用最高权限。
+<p align="center"><sub><b>Fig. 3.</b> Real-Time Stage State Transitions</sub></p>
 
-## 隐私
+<table>
+  <tr>
+    <td align="center" width="16%">
+      <img src="ai-pet-hub/web/sprites/gemini/default/idle.png" width="96" alt="Idle"><br>
+      <b>Idle</b><br><sub>Blinks, strolls, chats when clicked</sub>
+    </td>
+    <td align="center" width="16%">
+      <img src="ai-pet-hub/web/sprites/deepseek/v2/thinking_g00.png" width="96" alt="Thinking"><br>
+      <b>Thinking</b><br><sub>Reasoning blocks streaming</sub>
+    </td>
+    <td align="center" width="16%">
+      <img src="ai-pet-hub/web/sprites/claude/v2/reading_g00.png" width="96" alt="Reading"><br>
+      <b>Reading</b><br><sub>File reads, grep, web lookups</sub>
+    </td>
+    <td align="center" width="16%">
+      <img src="ai-pet-hub/web/sprites/gemini/default/working_g00.png" width="96" alt="Working"><br>
+      <b>Working</b><br><sub>Edits, writes, shell commands</sub>
+    </td>
+    <td align="center" width="16%">
+      <img src="ai-pet-hub/web/sprites/deepseek/v2/happy.png" width="96" alt="Done"><br>
+      <b>Done</b><br><sub>Turn complete; Dock bounces</sub>
+    </td>
+    <td align="center" width="16%">
+      <img src="ai-pet-hub/web/sprites/deepseek/v2/sleep.png" width="96" alt="Sleeping"><br>
+      <b>Sleeping</b><br><sub>Naps after configurable idle timer</sub>
+    </td>
+  </tr>
+</table>
 
-- AIPetHub 没有遥测，不收集任何数据；网络访问都由各 CLI 自己完成。
-- 会话保留在各 CLI 原来的位置，AIPetHub 只读取、不复制。
-- 不保存任何凭据。唯一读取的是 DeepSeek 的 API 密钥：dsh 没有查余额的接口，AIPetHub 用 dsh 配置的那把密钥每 5 分钟查一次账户余额（`api.deepseek.com/user/balance`），不另存、不发往别处。不需要的话把大肥鱼移除即可。
+---
 
-## 常用操作
+## `§ 05` &middot; Deployment Protocol (Installation)
 
-| 操作 | 方式 |
+**Requirements:** macOS 13 Ventura or later, plus at least one CLI from `§ 03` installed and authenticated.
+
+1. Download `AIPetHub-<version>.dmg` from [**Releases**](../../releases/latest), open it, and drag **AIPetHub** into `/Applications`.
+2. Because the build uses ad-hoc signing (not Apple-notarized), macOS Gatekeeper will block the very first launch. Clear it once using any of these three methods:
+   - **Finder:** Right-click `AIPetHub.app` in `/Applications` &rarr; **Open** &rarr; **Open**.
+   - **System Settings:** Go to **Privacy & Security**, scroll down to the blocked app notice, and click **Open Anyway**.
+   - **Terminal:**
+     ```bash
+     xattr -dr com.apple.quarantine /Applications/AIPetHub.app
+     ```
+3. On first launch, an onboarding screen lists which CLIs were detected on your machine, shows setup hints for missing ones, and lets you pick your default permission tier.
+
+---
+
+## `§ 06` &middot; Permissions, Safety & Privacy
+
+<table>
+  <tr>
+    <td width="130" align="center" valign="middle">
+      <img src="ai-pet-hub/web/sprites/claude/v2/dragged.png" width="110" alt="Claudina warning"><br>
+      <sub><i>"Read this before handing us root."</i></sub>
+    </td>
+    <td valign="middle">
+      <b>Warning: Full permissions are enabled by default.</b><br>
+      Unless changed, agents run with <code>bypassPermissions</code> / <code>danger-full-access</code> so they can edit files and execute shell commands without stopping to ask at every step. If an agent misjudges a command, it will not pause first.<br><br>
+      &bull; Switch to <b>Conservative</b> with one click on the first-launch onboarding screen (prompts before shell runs or restricts writes to the current workspace, depending on the CLI).<br>
+      &bull; Change permission tiers per agent anytime from the shield menu at the bottom-right of the input box.<br>
+      &bull; Use full permissions only inside repositories you trust and keep under version control.
+    </td>
+  </tr>
+</table>
+
+**Privacy Notes:**
+- **Zero telemetry:** AIPetHub collects no analytics and runs no backend servers. All model traffic happens inside each CLI's own process.
+- **In-place sessions:** Conversation logs stay in each CLI's native folder (`~/.claude`, `~/.codex`, etc.) and are opened read-only.
+- **No stored keys:** AIPetHub saves no tokens or passwords. The single key it reads is DeepSeek's API key from `dsh`'s config: because `dsh` exposes no balance endpoint, AIPetHub uses that key once every 5 minutes to query `api.deepseek.com/user/balance` directly, without saving or forwarding it anywhere else. Remove Dafeiyu from the stage if you do not want balance polling.
+
+---
+
+## `§ 07` &middot; Controls, Source Build & Field Notes
+
+### Keyboard & Composer Shortcuts
+
+| Action | Shortcut / Gesture |
 |---|---|
-| 切换智能体 | ⌘1 ～ ⌘4，或点侧边栏的区域标题 |
-| 新建会话 | ⌘N；在某个项目里新建：区域标题右边的文件夹按钮 |
-| 增删智能体 | 角色卡片右上角齿轮 →「移除」；舞台最下面「添加 AI」 |
-| 引用文件 / 截图 | 把文件拖进窗口，或在输入框里粘贴截图；输入 `@` 查找文件，`/` 列出 CLI 的命令 |
-| 搜索会话 | ⌘F |
-| 调整字号 | ⌘+ / ⌘- / ⌘0 |
+| Switch active agent | `⌘1` – `⌘4`, or click the agent header in the left sidebar |
+| New session | `⌘N` (or click the folder-plus icon next to an agent to pick a project directory) |
+| Add / remove agents | Gear icon on any mascot card &rarr; Remove; `+` button at the bottom of the stage to add |
+| Attach files or screenshots | Drag files into the window, paste images from clipboard, or type `@` to fuzzy-find project files |
+| Run CLI slash commands | Type `/` in the input box |
+| Search session history | `⌘F` |
+| Adjust UI font size | `⌘+` / `⌘-` / `⌘0` |
 
-## 从源码构建
+### Build from Source
 
-需要 Xcode Command Line Tools（`xcode-select --install`），没有第三方依赖。
+Requires only **Xcode Command Line Tools** (`xcode-select --install`). Zero external Swift package dependencies.
 
 ```bash
 git clone https://github.com/YaowenHu2000/AIPetHub-public.git
 cd AIPetHub-public/ai-pet-hub
-./build.sh              # 构建到 build/AIPetHub.app
-./build.sh --install    # 安装到 /Applications 并启动
-tools/make-dmg.sh 1.0.0 # 打包安装包 build/AIPetHub-1.0.0.dmg
-tools/test.sh           # 离线测试（不需要 CLI 和网络）
+
+./build.sh              # Compile into build/AIPetHub.app
+./build.sh --install    # Copy to /Applications and launch
+tools/make-dmg.sh 1.0.0 # Build distributable build/AIPetHub-1.0.0.dmg
+tools/test.sh           # Run offline parser, Markdown, and UI logic tests (no CLI or network needed)
 ```
 
-装了 `cwebp`（`brew install webp`）时，打包会把角色素材转成 WebP，App 体积小很多。架构、目录结构和测试方法见 [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)。
+If `cwebp` (`brew install webp`) is installed, packaging converts PNG sprite sheets into WebP and shrinks the app bundle substantially. Internal process protocols, prewarming, and end-to-end test harnesses are documented in [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) (in Chinese).
 
-## 已知限制
+### Known Quirks & Limitations
 
-- Gemini 回答进行中不能插话（协议限制），补充的话会排队，这一轮结束后自动发出。
-- 在终端和 AIPetHub 里**同时**开着同一个会话时：Claude 会自动另开一个分支会话；Codex、Gemini 两边互相看不到对方的新内容。
-- DeepSeek 的接入基于 dsh 预览版的本机接口，dsh 升级后可能需要更新；暂不支持搜索 DeepSeek 会话的正文。
-- 在 AIPetHub 里给 DeepSeek 选的模型和思考强度，dsh 会记成它自己的默认值。
+- **App UI language:** Built-in interface labels and menus are currently in Chinese (`zh-CN`). Prompts, code, file paths, and agent replies work in any language.
+- **Gemini mid-turn messages:** `agy acp` does not support mid-turn injection; follow-ups typed while Gemini is answering wait in queue and send automatically once the turn finishes.
+- **Simultaneous edits in Terminal + AIPetHub:** If the exact same session is open and active in both places at once, Claude forks a new branch session automatically, whereas Codex and Gemini will not see each other's live turns until reload.
+- **DeepSeek (`dsh` preview):** Integration targets the local HTTP/WebSocket API of `dsh` preview (`0.1.0-rc.7`) and may need updates as `dsh` evolves. Full-text body search does not yet cover DeepSeek sessions, and changing DeepSeek's model or effort inside AIPetHub also updates `dsh`'s default in `~/.dsh/settings.yaml`.
 
-## 许可证
+---
 
-- **代码**：[GPL-3.0](LICENSE)
-- **角色美术**（角色图片、应用图标、截图）：[CC BY-NC-SA 4.0](ASSETS-LICENSE.md)——可以转载和改编，需署名、不可商用、改编后以相同许可发布。
-- 四位角色均为非官方同人形象，与 Anthropic、OpenAI、Google、DeepSeek 无关；各公司的名称和标志归其所有者。大肥鱼的形象参考了社区共创的 DeepSeek 鲸鱼娘，尤其是 @iamemily2050 的设定图，详见 [ASSETS-LICENSE.md](ASSETS-LICENSE.md)。
+## `§ 08` &middot; License & Colophon
 
-## 致谢
+- **Source Code:** [GPL-3.0](LICENSE) (includes Swift sources, frontend HTML/CSS/JS, and skeletal rig scripts `*.js`).
+- **Character Artwork & Visual Assets:** [CC BY-NC-SA 4.0](ASSETS-LICENSE.md) (sprites, layered rig textures, app icon, and poster illustrations). You may share and adapt the art with attribution to `AIPetHub (https://github.com/YaowenHu2000)` for non-commercial use under the same license.
+- **Disclaimer:** *Jiqimao*, *Claudina*, *Jipeiti*, and *Dafeiyu* are unofficial fan-made mascot designs and have no affiliation with Google, Anthropic, OpenAI, or DeepSeek. Product names and logos belong to their respective owners. *Dafeiyu* draws inspiration from the Chinese community's co-created DeepSeek whale-girl design, particularly `@iamemily2050`'s character sheet; all sprites were newly generated and hand-processed for this project (details in [ASSETS-LICENSE.md](ASSETS-LICENSE.md)).
+- **Bundled Open-Source Libraries:** [highlight.js](https://highlightjs.org/) (BSD-3-Clause) &middot; [KaTeX](https://katex.org/) (MIT) &middot; [three.js](https://threejs.org/) (MIT)
 
-[highlight.js](https://highlightjs.org/)（BSD-3-Clause）· [KaTeX](https://katex.org/)（MIT）· [three.js](https://threejs.org/)（MIT）
+<p align="center">
+  <img src="ai-pet-hub/web/sprites/deepseek/v2/sleep.png" width="92" alt="Dafeiyu sleeping"><br>
+  <sub><code>[POSTER END &middot; ALL PROCESSES IDLE &middot; zZZ]</code></sub>
+</p>

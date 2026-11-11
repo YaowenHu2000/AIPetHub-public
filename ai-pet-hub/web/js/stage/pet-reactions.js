@@ -152,22 +152,27 @@ Pet.prototype.syncFastForm = function (info) {
   if (BUSY_STATES.has(this.state)) this.startBusyLoop(this.state);   // 循环按新的快慢重新排
 };
 
+/** 三个阶段各自的图标：思考、查阅、施工。 */
+const phaseIcon = phase => ({ thinking: UI.think, reading: UI.file, working: UI.tool })[phase] || UI.think;
+
 Pet.prototype.renderStatus = function () {
   const st = S[this.id];
   const info = busyInfo(this.id);
   this.syncFastForm(info);
   let text = '空闲';
   let cls = '';
+  let icon = '';   // 状态胶囊开头的小图标（和聊天区工作步骤用的是同一套线条图标，不用 emoji 充当图标）
   if (info) {
     const meta = info.meta;
     const label = info.kind === 'text' ? '回答中' : meta.label;
-    text = `${info.fast ? '⚡ ' : ''}${meta.icon} ${label} ${elapsedSince(info.since)}${info.count > 1 ? ` · ${info.count} 个会话` : ''}`;
+    text = `${label} ${elapsedSince(info.since)}${info.count > 1 ? ` · ${info.count} 个会话` : ''}`;
+    icon = (info.fast ? UI.bolt : '') + phaseIcon(info.phase);
     cls = `busy phase-${info.phase}`;
     this.card.dataset.phase = info.phase;
     if (this.workBadgeEl) {
       this.workBadgeEl.hidden = false;
       this.workBadgeEl.dataset.phase = info.phase;
-      this.workIconEl.textContent = info.icon;
+      this.workIconEl.innerHTML = STEP_ICONS[info.kind] || phaseIcon(info.phase);
       this.workTextEl.textContent = info.title;
     }
   } else if (this.demoPhase) {
@@ -177,13 +182,14 @@ Pet.prototype.renderStatus = function () {
       reading: '翻阅检索代码资料',
       working: '飞速敲码施工中',
     };
-    text = `${this.fastForm ? '⚡ ' : ''}${meta.icon} ${meta.label} · 预览`;
+    text = `${meta.label} · 预览`;
+    icon = (this.fastForm ? UI.bolt : '') + phaseIcon(this.demoPhase);
     cls = `busy phase-${this.demoPhase}`;
     this.card.dataset.phase = this.demoPhase;
     if (this.workBadgeEl) {
       this.workBadgeEl.hidden = false;
       this.workBadgeEl.dataset.phase = this.demoPhase;
-      this.workIconEl.textContent = meta.icon;
+      this.workIconEl.innerHTML = phaseIcon(this.demoPhase);
       this.workTextEl.textContent = demoTitles[this.demoPhase] || meta.workLabel;
     }
   } else {
@@ -196,7 +202,11 @@ Pet.prototype.renderStatus = function () {
     else if (this.state === 'sleep') text = '睡觉中';
     else if (st.roam) text = '散步中';
   }
-  this.statusEl.textContent = text;
+  if (this.statusEl.dataset.shown !== icon + text) {   // 每半秒叫一次：没变就不重写（重写会打断图标的过渡）
+    this.statusEl.dataset.shown = icon + text;
+    this.statusEl.innerHTML = icon;
+    this.statusEl.appendChild(document.createTextNode(text));
+  }
   this.statusEl.className = `pet-status ${cls}`.trim();
   if (this.workBadgeEl && !this.workBadgeEl.hidden) this.centerOnFloor(this.workBadgeEl);
   this.card.querySelector('[data-act="roam"]').classList.toggle('on', st.roam && !this.demoPhase);

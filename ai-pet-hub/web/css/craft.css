@@ -1,0 +1,73 @@
+/* ===== 动效和细节的一套规矩（参考 Emil Kowalski 的 skills：emil-design-eng、apple-design、review-animations） =====
+   放在最后加载，盖掉前面各处零散的写法。规矩是这几条：
+   · 进出场用 ease-out（一上来就动，感觉跟手），在屏幕上挪动 / 变形用 ease-in-out，颜色用 ease；不用 ease-in。
+     浏览器自带的那几条曲线太软，用下面这三条更有力的。
+   · 小东西的出现和收起不超过 300ms，收回比出现快。
+   · 按钮的按压回弹、模型面板的弹出、聊天内容铺满宽度：这三样试过照这套规矩改（不回弹、更快、居中成一栏），
+     用下来还是原来的好，保留原样（feel.css、menus.js）。
+   · 一天要看上百次的（键盘切换、悬停）不加动效；难得一见的（第一次打开的引导页）可以多一点。
+   · 只动 transform 和 opacity。
+   · 系统开了「减弱动态效果 / 降低透明度 / 增强对比度」时跟着收。 */
+:root {
+  --ease-out: cubic-bezier(0.23, 1, 0.32, 1);
+  --ease-in-out: cubic-bezier(0.77, 0, 0.175, 1);
+  --ease-drawer: cubic-bezier(0.32, 0.72, 0, 1);
+}
+
+/* ---------- 小东西的出现和收起 ---------- */
+.work-head svg.chev, .step-caret svg { transition: transform 200ms var(--ease-out); }
+.pet-bubble { transition: opacity 180ms var(--ease-out), transform 200ms var(--ease-out); }
+.pet-bubble:not(.show) { transition: opacity 120ms ease, transform 120ms ease; }                       /* 收起比出现快 */
+.pet-work-badge { transition: opacity 180ms var(--ease-out), transform 200ms var(--ease-out), border-color 220ms ease, background 220ms ease; }
+.req-card { animation: req-in 220ms var(--ease-out); }
+#popover-sub:not([hidden]) { animation: popIn 160ms var(--ease-out); }
+#fork-hint { transition: opacity 180ms var(--ease-out), transform 180ms var(--ease-out); }
+@starting-style { #fork-hint:not([hidden]) { opacity: 0; transform: translateY(4px); } }
+svg.spin { animation-duration: 0.65s; }   /* 转得快一点，等的时候感觉短一点 */
+
+/* ---------- 滚动边缘：内容滚到顶栏下面时渐渐淡出，不是被一条线切断 ----------
+   做法是在聊天区顶上盖一条从底色到透明的渐变。不能给滚动区加遮罩（mask）：遮罩会让整块内容每次重画都重新合成，
+   回答进行中每秒更新一次计时，我发的那条气泡四周的光晕就跟着一明一暗地闪。 */
+#chat-stack::before {
+  content: ''; position: absolute; left: 0; right: 8px; top: 0; height: 20px; z-index: 2; pointer-events: none;
+  background: linear-gradient(to bottom, var(--bg-chat), transparent);
+}
+
+/* ---------- 第一次打开的引导页：难得一见，可以多一点——背景暗下来，卡片浮上来，几行依次出现 ---------- */
+#welcome { transition: opacity 240ms var(--ease-out); }
+#welcome .wl-card { transition: transform 320ms var(--ease-drawer), opacity 240ms var(--ease-out); }
+@starting-style {
+  #welcome:not([hidden]) { opacity: 0; }
+  #welcome:not([hidden]) .wl-card { opacity: 0; transform: translateY(14px) scale(0.975); }
+}
+.wl-agent, .wl-how, .wl-opt { animation: wl-in 320ms var(--ease-out) backwards; }
+.wl-agents > :nth-child(1) { animation-delay: 60ms; } .wl-agents > :nth-child(2) { animation-delay: 100ms; }
+.wl-agents > :nth-child(3) { animation-delay: 140ms; } .wl-agents > :nth-child(4) { animation-delay: 180ms; }
+.wl-agents > :nth-child(5) { animation-delay: 220ms; } .wl-agents > :nth-child(6) { animation-delay: 260ms; }
+.wl-agents > :nth-child(7) { animation-delay: 300ms; } .wl-agents > :nth-child(8) { animation-delay: 340ms; }
+.wl-perm > :nth-child(1) { animation-delay: 300ms; } .wl-perm > :nth-child(2) { animation-delay: 350ms; }
+@keyframes wl-in { from { opacity: 0; transform: translateY(8px); } }
+#welcome.settled .wl-agent, #welcome.settled .wl-how, #welcome.settled .wl-opt { animation: none; }   /* 只在打开时演一遍，点选项重画时不再演 */
+
+/* ---------- 跟着系统的辅助功能设置走 ---------- */
+@media (prefers-reduced-motion: reduce) {
+  /* 减弱动态效果：位移、缩放、流动的都停，只留淡入淡出和颜色变化 */
+  *, *::before, *::after { animation-duration: 0.01ms !important; animation-iteration-count: 1 !important; scroll-behavior: auto !important; }
+  .icon-btn:active, .card-gear:active, .mp-icon:active, #send-btn:active, .chip:active, .dock-btn:active, .mp-model:active, .confirm-btn:active,
+  .req-btn:active, .chg-btn:active, .pop-item:active, .jump-nav button:active { transform: none; }
+  .pet-bubble, .pet-work-badge, #fork-hint, #welcome .wl-card { transition: opacity 150ms ease; transform: none; }
+  .hist-list { scroll-snap-type: none; }
+}
+@media (prefers-reduced-transparency: reduce) {
+  /* 降低透明度：毛玻璃换成实底 */
+  #history-sidebar { background: var(--bg-sidebar); }
+  #resize-sidebar { background: linear-gradient(90deg, var(--bg-sidebar) 50%, var(--bg-chat) 50%); }
+  #popover:not(.scrolls), #popover-sub { --sq-fill: var(--bg-popover); }
+  #popover:not(.scrolls)::after, #popover-sub::after, .jump-nav, #welcome { -webkit-backdrop-filter: none; backdrop-filter: none; }
+  .jump-nav { background: var(--bg-popover); }
+  #welcome { background: rgba(8, 7, 16, 0.86); }
+}
+@media (prefers-contrast: more) {
+  :root { --border: rgba(255, 255, 255, 0.28); --border-strong: rgba(255, 255, 255, 0.5); --text-muted: rgba(241, 238, 251, 0.9); --text-faint: rgba(241, 238, 251, 0.74); }
+  #history-sidebar { background: var(--bg-sidebar); --text-muted: rgba(241, 238, 251, 0.9); --text-faint: rgba(241, 238, 251, 0.74); }
+}

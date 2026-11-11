@@ -83,10 +83,12 @@
 .files-card { --sq-line: var(--rim-soft); --sq-fill: rgba(255, 255, 255, 0.025); }
 .req-card { --sq-line: color-mix(in srgb, var(--accent) 55%, transparent); --sq-fill: color-mix(in srgb, var(--accent) 9%, transparent); }
 .agent-badge { --sq-line: var(--accent-strong); --sq-fill: var(--accent-soft); }
-/* 用户的气泡：底是这一位的主色，投下来的影子也带着这个颜色（气泡边上还有悬停时出来的「编辑」，所以不能直接裁） */
+/* 用户的气泡：底是这一位的主色，投下来的影子也带着这个颜色（气泡边上还有悬停时出来的「编辑」，所以不能直接裁）。
+   影子用 box-shadow，不用 filter: drop-shadow：滤镜会把整个气泡连同里面的东西当成一张图来算，
+   鼠标一经过、「编辑」淡入淡出，或者旁边的内容在更新，这张图就重算一遍，气泡和光晕跟着闪。影子很虚，形状差的那一点看不出来。 */
 .msg.user:not(.has-images), .msg.user .msg-text {
   --sq-fill: var(--accent);
-  --sq-shadow: drop-shadow(0 5px 11px color-mix(in srgb, var(--accent) 34%, transparent));
+  box-shadow: 0 5px 11px color-mix(in srgb, var(--accent) 34%, transparent);
 }
 .msg.user.queued { --sq-line: rgba(255, 255, 255, 0.5); }
 
