@@ -311,6 +311,7 @@ extension AppDelegate {
         let deadline = DispatchTime.now() + (hooks.toolTimeout ?? timeout)
         do { try cli.start(executable: executable, arguments: arguments, cwd: cwd, environment: environment ?? cliEnvironment()) }
         catch { return ("", error.localizedDescription, -1, false) }
+        hooks.toolStarted?()
         let result = cli.waitForExit(until: deadline) { terminateTree(cli.proc.processIdentifier) }
         return (result.out, result.err, result.timedOut ? -2 : cli.proc.terminationStatus, result.timedOut)
     }

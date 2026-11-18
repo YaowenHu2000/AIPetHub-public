@@ -161,12 +161,15 @@ extension AppDelegate {
     }
 
     /// 目录是 target 的全部会话（和列表一样，同一个会话 ID 只算最新的那份）。
-    func claudeIds(inWorkspace target: String) -> [String] {
+    /// onTask 收到其中别的工具派出去的（侧栏的「任务会话」），删除项目时网页据此跳过。
+    func claudeIds(inWorkspace target: String, onTask: (String) -> Void = { _ in }) -> [String] {
         var ids: [String] = []
         var seen = Set<String>()
         for f in claudeSessionFiles() where !seen.contains(f.cid) {
             seen.insert(f.cid)
-            if let cwd = claudeItem(f)?["cwd"] as? String, trimmedPath(cwd) == target { ids.append(f.cid) }
+            guard let item = claudeItem(f), let cwd = item["cwd"] as? String, trimmedPath(cwd) == target else { continue }
+            ids.append(f.cid)
+            if item["task"] as? Bool == true { onTask(f.cid) }
         }
         return ids
     }
@@ -256,17 +259,22 @@ extension AppDelegate {
         var turnStart: Date?
         var lastTime: Date?
         var interrupted = false   // 这一轮是被用户停下的（记录里有中断标记）
+        var apiError: String?     // 这一轮以 API 报错收尾（记录里是一条 isApiErrorMessage 的回答）
+        var pendingAutoCompact = false   // 自动压缩落在两轮之间：记到下一轮的工作过程里
         let iso = ISO8601DateFormatter()
         iso.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
         let userMark = Data("\"type\":\"user\"".utf8)
         let botMark = Data("\"type\":\"assistant\"".utf8)
         let queuedMark = Data("\"queued_command\"".utf8)   // 回答进行中补充的话：记录里是一条附件，不是普通的用户消息
+        let compactMark = Data("\"compact_boundary\"".utf8)   // 压缩：手动的是一条提示，自动的是那一轮里的一步（和实时一样）
+        func compactStep(_ t: TurnBuilder) { t.add(makeStep("tool", "压缩上下文", status: "ok")); pendingAutoCompact = false }
 
         func flush() {
             guard let t = turn else { return }
             let unfinished = t.steps.contains { $0["status"] as? String == "running" }
-            var bot = t.finish(finalText: nil, outcome: interrupted ? "interrupted" : (unfinished ? "incomplete" : "completed"))
-            interrupted = false
+            let outcome = apiError != nil ? "failed" : interrupted ? "interrupted" : (unfinished ? "incomplete" : "completed")
+            var bot = t.finish(finalText: nil, outcome: outcome, error: apiError)
+            interrupted = false; apiError = nil
             if let s = turnStart, let e = lastTime, e > s { bot["duration"] = e.timeIntervalSince(s) }
             if !trimmed(bot["text"] as? String).isEmpty || !((bot["steps"] as? [Any]) ?? []).isEmpty {
                 bot["role"] = "bot"
@@ -296,6 +304,16 @@ extension AppDelegate {
                 }
                 return true
             }
+            if line.range(of: compactMark) != nil, let obj = jsonObject(line), obj["subtype"] as? String == "compact_boundary",
+               (obj["isSidechain"] as? Bool) != true {
+                if (obj["compactMetadata"] as? [String: Any])?["trigger"] as? String == "auto" {
+                    if let t = turn { compactStep(t) } else { pendingAutoCompact = true }
+                } else {
+                    flush()
+                    messages.append(["role": "compact", "text": claudeCompactDoneNote])
+                }
+                return true
+            }
             let isUser = line.range(of: userMark) != nil
             guard isUser || line.range(of: botMark) != nil, let obj = jsonObject(line),
                   let type = obj["type"] as? String, (obj["isSidechain"] as? Bool) != true else { return true }
@@ -317,11 +335,21 @@ extension AppDelegate {
                     turn = TurnBuilder()
                     turnStart = ts
                     lastTime = ts
+                    if pendingAutoCompact, let t = turn { compactStep(t) }
                 } else if let t = turn {
-                    blocks.filter { $0["type"] as? String == "tool_result" }.forEach { claudeToolResult($0, turn: t, pending: &pending) }
-                    if let ts = ts { lastTime = ts }
+                    let results = blocks.filter { $0["type"] as? String == "tool_result" }
+                    results.forEach { claudeToolResult($0, turn: t, pending: &pending) }
+                    // 只有工具结果算这一轮的进展；/compact 命令行、压缩摘要、命令输出这些不能延长它的工作时长
+                    if !results.isEmpty, let ts = ts { lastTime = ts }
                 }
-            } else if type == "assistant", (obj["isApiErrorMessage"] as? Bool) != true {
+            } else if type == "assistant", (obj["isApiErrorMessage"] as? Bool) == true {
+                // API 报错：实时会显示错误和「重试」，重开也要还原成出错的一轮（以前整条跳过，只剩提问）
+                if turn == nil { turn = TurnBuilder(); turnStart = ts }
+                let said = trimmed(textBlocks((obj["message"] as? [String: Any])?["content"]))
+                apiError = said.isEmpty ? "这一轮出错了。" : said
+                if let ts = ts { lastTime = ts }
+            } else if type == "assistant" {
+                if turn == nil, pendingAutoCompact { turn = TurnBuilder(); turnStart = ts; if let t = turn { compactStep(t) } }
                 if lastUsage != nil, let message = obj["message"] as? [String: Any], message["usage"] is [String: Any],
                    message["model"] as? String != "<synthetic>" { lastAnswer = obj }
                 if turn == nil { turn = TurnBuilder(); turnStart = ts }

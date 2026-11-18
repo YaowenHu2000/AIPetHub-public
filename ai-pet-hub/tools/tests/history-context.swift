@@ -14,7 +14,9 @@ func testHistoryContext() {
             if name == "onConversationLoaded" { result = row["context"] as? [String: Any]; done.signal() }
         }
         app.loadConversation(agent: agent, cid: cid)
-        check(done.wait(timeout: .now() + 5) == .success, "打开历史及时返回")
+        // 回包一到就往下走；期限只防卡死。压缩记录要经 python 写的假 zstd 跑好几次，机器很忙时 5 秒会偶发来不及。
+        // 20 秒仍短于 App 给 zstd 的 30 秒超时，等到超时才回包的情况照样判失败
+        check(done.wait(timeout: .now() + 20) == .success, "打开历史及时返回")
         app.jsSink = nil
         return result
     }

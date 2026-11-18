@@ -102,11 +102,13 @@ func testAcpWarmResponses() {
             do { try warm.start(executable: path, arguments: [], cwd: NSTemporaryDirectory(), environment: ProcessInfo.processInfo.environment) }
             catch { check(false, "启动假预热 CLI：\(error)"); continue }
             warm.input?.send(d.acpInitialize())
-            check(ready.wait(timeout: .now() + 3) == .success, "预热 stage \(stage) 完成初始化")
+            check(ready.wait(timeout: .now() + 30) == .success, "预热 stage \(stage) 完成初始化")
             d.keepWarm("gemini", warm)
         }
+        // 期限只防卡死：往返做完 run() 就返回，不等满。假 CLI 每行都要起一次 sed，
+        // 机器满载时冷启动一轮能超过 4 秒，旧期限会把正常往返取消掉，误报成没走完。
         let timeout = DispatchWorkItem { d.cancel(agent: req.agent, reqId: req.reqId) }
-        DispatchQueue.global().asyncAfter(deadline: .now() + 4, execute: timeout)
+        DispatchQueue.global().asyncAfter(deadline: .now() + 30, execute: timeout)
         let result = withTestAsk(d, req.key) { GeminiLiveTurn(app: d, req: req, agy: path, fullModel: "model").run() }
         timeout.cancel()
         eq(result?.reply, "假 CLI 回答", "stage \(stage) 握手、配置、提问及 EOF 完整往返")

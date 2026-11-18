@@ -130,7 +130,10 @@ if [[ "${1:-}" == "--install" ]]; then
   rm -rf "/Applications/$APP_NAME.app"
   mv "$APP" "/Applications/$APP_NAME.app"
   "$LSREG" -u "$PWD/$APP" 2>/dev/null || true
-  open "/Applications/$APP_NAME.app"
+  # open 会把调用者的全部环境变量交给 App，App 再交给它起的每个 CLI。从 Claude 桌面版（reclaude 拉起）里的会话安装时，
+  # 带过去的有 reclaude 的本地代理（HTTP_PROXY=127.0.0.1:54082）、那个 Claude Code 会话自己的 CLAUDE_*、反重力的 ANTIGRAVITY_* 等；
+  # 2026-11-18 reclaude 重启的 55 秒里，App 里的 Codex / Gemini 跟着断网。用空环境打开，和从程序坞打开时一样。
+  env -i HOME="$HOME" USER="$USER" LOGNAME="$USER" TMPDIR="$TMPDIR" PATH=/usr/bin:/bin:/usr/sbin:/sbin open "/Applications/$APP_NAME.app"
   echo "已安装并打开：/Applications/$APP_NAME.app"
 else
   "$LSREG" -u "$PWD/$APP" 2>/dev/null || true

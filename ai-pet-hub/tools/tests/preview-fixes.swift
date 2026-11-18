@@ -13,7 +13,8 @@ private func runPreviewFixTests() -> Int {
         if !ok { failures += 1; print("✗ \(label)") }
     }
     func write(_ name: String, _ content: String) { try! content.write(toFile: dir + "/" + name, atomically: true, encoding: .utf8) }
-    func spin(_ seconds: Double = 5, _ condition: () -> Bool) -> Bool {
+    // 条件一成立就返回，期限只防卡死：机器忙（几个 agent 同时编译、测试）时，起一个假转换器就要好几秒
+    func spin(_ seconds: Double = 30, _ condition: () -> Bool) -> Bool {
         let end = Date().addingTimeInterval(seconds)
         while !condition(), Date() < end { RunLoop.current.run(until: Date().addingTimeInterval(0.01)) }
         return condition()
@@ -25,6 +26,16 @@ private func runPreviewFixTests() -> Int {
         _ = spin { lock.lock(); defer { lock.unlock() }; return result != nil }
         d.jsSink = nil
         return result ?? [:]
+    }
+    // 假转换器用 `echo pid > 文件` 记下子进程：文件先建出来（空的）才写进内容，所以等到读得出 pid 才算数。
+    // 等不到就记一条失败往下走，不用 try! 崩掉整个程序（那样后面的检查都没跑，结果也打不出来）。
+    func childPid(_ name: String, _ label: String) -> pid_t? {
+        var pid: pid_t?
+        check(spin(60) {
+            pid = (try? String(contentsOfFile: dir + "/" + name, encoding: .utf8)).flatMap { Int32($0.trimmingCharacters(in: .whitespacesAndNewlines)) }
+            return pid != nil
+        }, label)
+        return pid
     }
     func git(_ args: [String]) -> String {
         let result = d.runGit(args, in: dir)
@@ -217,31 +228,34 @@ private func runPreviewFixTests() -> Int {
     TestHooks.quickLookExecutable = converter
     for name in ["running.docx", "queued.docx", "latest.docx"] { write(name, name) }
     d.openDocumentPreview(dir + "/running.docx")
-    check(spin { fm.fileExists(atPath: dir + "/child") }, "N08 运行中转换启动")
-    let child = Int32((try! String(contentsOfFile: dir + "/child", encoding: .utf8)).trimmingCharacters(in: .whitespacesAndNewlines))!
+    let child = childPid("child", "N08 运行中转换启动")
     d.openDocumentPreview(dir + "/queued.docx")
     d.openDocumentPreview(dir + "/latest.docx")
-    check(spin(1) { kill(child, 0) != 0 }, "N08 取消运行中的转换子进程")
-    check(spin(8) { d.docPreviewPending == nil }, "N08 最新转换完成")
+    // running.docx 的子进程要睡 30 秒，10 秒内没了只能是被取消的
+    check(child.map { pid in spin(10) { kill(pid, 0) != 0 } } ?? false, "N08 取消运行中的转换子进程")
+    check(spin(60) { d.docPreviewPending == nil }, "N08 最新转换完成")
     let started = (try? String(contentsOfFile: dir + "/started", encoding: .utf8)) ?? ""
     check(!started.contains("queued.docx"), "N08 过期队列任务从未启动")
     // 独立转换入口超时，清理整个进程树，测试不启动 AppDelegate 来收尾。
     write("timeout.docx", "timeout")
     TestHooks.quickLookTimeout = 0.05
+    try? fm.removeItem(atPath: dir + "/child")   // 上面 latest.docx 记下的 pid 早已退出，留着它这条检查就成了空检查
+    // 等假转换器记下子进程的 pid 才开始算期限：这样「超时清理子进程」每次都有一个确定活着的子进程可查
+    TestHooks.quickLookStarted = { _ = childPid("child", "整理：超时子进程已启动") }
     let timeoutResult = makeDocumentPreview(dir + "/timeout.docx")
+    TestHooks.quickLookStarted = nil
     check(timeoutResult.file == nil && timeoutResult.error.contains("超时"), "整理：转换超时仍返回原错误")
-    let timeoutChild = Int32((try! String(contentsOfFile: dir + "/child", encoding: .utf8)).trimmingCharacters(in: .whitespacesAndNewlines))!
-    check(spin(4) { kill(timeoutChild, 0) != 0 }, "整理：超时清理子进程")
+    let timeoutChild = (try? String(contentsOfFile: dir + "/child", encoding: .utf8)).flatMap { Int32($0.trimmingCharacters(in: .whitespacesAndNewlines)) }
+    check(timeoutChild.map { pid in spin(10) { kill(pid, 0) != 0 } } ?? false, "整理：超时清理子进程")
     TestHooks.quickLookTimeout = 60
 
     try! installFakeCLI(at: converter, behavior: "preview-stubborn", parameters: [dir])
     write("stubborn.docx", "stubborn")
     d.openDocumentPreview(dir + "/stubborn.docx")
-    check(spin { fm.fileExists(atPath: dir + "/stubborn-child") }, "N08 顽固子进程启动")
-    let stubborn = Int32((try! String(contentsOfFile: dir + "/stubborn-child", encoding: .utf8)).trimmingCharacters(in: .whitespacesAndNewlines))!
-    _ = spin(0.1) { false }   // 让子进程装好 TERM handler
+    let stubborn = childPid("stubborn-child", "N08 顽固子进程启动")   // 假转换器装好 TERM handler 之后才写这个 pid
     d.cancelDocumentPreview()
-    check(spin(5) { kill(stubborn, 0) != 0 }, "N08 忽略 TERM 的子进程最终被 KILL 清理")
+    // 先 TERM、3 秒后 KILL；子进程自己永远不退出，期限放宽也分得出来
+    check(stubborn.map { pid in spin(30) { kill(pid, 0) != 0 } } ?? false, "N08 忽略 TERM 的子进程最终被 KILL 清理")
 
     // 10,000 个已跟踪文件 + 24 个 200 MB 稀疏未跟踪文件，测量实际入口。
     let perf = dir + "/perf"

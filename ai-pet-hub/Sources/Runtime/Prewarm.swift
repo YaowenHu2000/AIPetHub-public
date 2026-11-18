@@ -146,7 +146,7 @@ extension AppDelegate {
             guard waiting else { return false }
             if req.agent == "gpt", let setup = self.codexSetup(req) {
                 self.codexOpenThread(req, input, model: setup.model, effort: setup.effort, sandbox: setup.sandbox)
-            } else if req.agent == "gemini", self.geminiResumeBlock(req.conversationId) == nil {
+            } else if req.agent == "gemini", self.geminiResumeBlock(req.conversationId, fresh: false) == nil {   // 打字时每个按键都会到这里：复用 2 秒内的扫描结果，发送前会现查
                 self.acpOpenSession(req, input)
             } else { return false }
             return true

@@ -27,7 +27,7 @@ function setPaneVisible(on) {
 /** 打开文件（已打开就切过去）；diff 是这一轮回答里对它的改动。 */
 function openPreview({ path, base = '', diff = '' }) {
   const raw = cleanPath(path);
-  if (BROWSER_DOC_RE.test(raw)) { openBrowser(raw, base); return; }
+  if (BROWSER_DOC_RE.test(raw)) { openBrowser(raw, base, true); return; }
   let tab = pane.tabs.find(t => (t.raw === raw && t.base === base) || (raw.startsWith('/') && t.resolved === raw));
   const existed = !!tab;
   if (!tab) {
@@ -199,7 +199,7 @@ function renderPaneContent() {
   }
   if (!data) { body.innerHTML = '<div class="ed-note">正在读取…</div>'; return; }
   body.innerHTML = '';
-  if (data.image) { renderImage(body, data, tools); return; }
+  if (data.image) { renderImage(body, data); return; }
 
   const hasContent = typeof data.content === 'string';
   const marks = tab.diff && hasContent ? annotateFile(data.content, tab.diff) : null;
@@ -293,7 +293,7 @@ function renderCode(body, rows, path) {
   if (rows.length > MAX) body.insertAdjacentHTML('beforeend', `<div class="ed-note">只显示了前 ${MAX} 行</div>`);
 }
 
-function renderImage(body, data, tools) {
+function renderImage(body, data) {
   const wrapEl = document.createElement('div');
   wrapEl.className = 'ed-image';
   const img = document.createElement('img');
@@ -305,7 +305,6 @@ function renderImage(body, data, tools) {
   });
   wrapEl.append(img, info);
   body.appendChild(wrapEl);
-  tools.innerHTML = '';
 }
 
 function loadLocalImages(root, base) {

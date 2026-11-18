@@ -22,8 +22,9 @@ function openLink(url) {
 
 const browserTab = () => pane.tabs.find(t => t.kind === 'browser');
 
-/** 在内置浏览器里打开网址或本地文件（base 是相对路径的起点）；什么都不给就只打开并聚焦地址栏。 */
-function openBrowser(target = '', base = '') {
+/** 在内置浏览器里打开网址或本地文件（base 是相对路径的起点）；什么都不给就只打开并聚焦地址栏。
+ *  file：调用方确定是本地文件（回答里的文件标签、改动行），不做主机判断，en.lproj/、user.github.io/ 这类目录不会被当成网址。 */
+function openBrowser(target = '', base = '', file = false) {
   let tab = browserTab();
   if (!tab) {
     tab = { id: ++pane.seq, kind: 'browser', raw: '网页预览' };
@@ -34,16 +35,21 @@ function openBrowser(target = '', base = '') {
   setPaneVisible(true);
   renderPaneTabs();
   renderPaneBody();
-  if (target) navigateBrowser(target, base);
+  if (target) navigateBrowser(target, base, file);
   else pane.el.querySelector('.browser-url')?.focus();
 }
 
-function navigateBrowser(input, base = '') {
+function navigateBrowser(input, base = '', file = false) {
   let t = String(input || '').trim();
   if (!t) return;
   const at = { ...browserRect(), visible: true };
   if (/^https?:\/\//i.test(t)) { postNative('browserOpen', { url: t, ...at }); return; }
-  if (/^file:\/\//i.test(t) || t.startsWith('/') || t.startsWith('~/') || /\.(html?|svg)$/i.test(t) || BROWSER_DOC_RE.test(t)) {
+  // 第一段是明确的主机（localhost/IP、带端口、像域名且后面跟路径）就是网址，否则 localhost:5173/index.html、
+  // example.org/guide.pdf 会因为后缀被当成本地文件；像域名但「顶级域」是常见后缀的（a.md/、Foo.app/）仍按本地目录
+  const host = t.split('/')[0];
+  const isHost = !file && (/^(localhost|127\.0\.0\.1|0\.0\.0\.0|\[::1\])(:\d{1,5})?$/i.test(host) || /^[\w.-]+:\d{1,5}$/.test(host)
+    || (t.includes('/') && /^(?:[a-z0-9-]+\.)+[a-z]{2,}$/i.test(host) && !/\.(md|markdown|txt|json|js|ts|py|sh|html?|css|app)$/i.test(host)));
+  if (!isHost && (/^file:\/\//i.test(t) || t.startsWith('/') || t.startsWith('~/') || /\.(html?|svg)$/i.test(t) || BROWSER_DOC_RE.test(t))) {
     postNative('browserOpen', { path: t, base, ...at });
     return;
   }

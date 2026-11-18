@@ -16,6 +16,37 @@ func testClaudeHistory() {
     let (messages, cwd) = AppDelegate().claudeTurns(Data(lines.joined(separator: "\n").utf8))
     eq(cwd, "/w", "工作目录")
     eq(messages.map { str($0, "role") }, ["user", "bot"], "中途补充的话不拆成另一轮")
+    // API 报错的那一轮：记录里是一条带 isApiErrorMessage 的回答。重开时要还原成出错的一轮（带原文、能重试），不能整条消失
+    let failedLines = [
+        #"{"type":"user","timestamp":"2026-11-10T11:00:00.000Z","message":{"role":"user","content":"你好"}}"#,
+        #"{"type":"assistant","isApiErrorMessage":true,"timestamp":"2026-11-10T11:00:01.000Z","message":{"model":"<synthetic>","content":[{"type":"text","text":"API Error: 400 bad request"}]}}"#,
+    ]
+    let failed = AppDelegate().claudeTurns(Data(failedLines.joined(separator: "\n").utf8)).0
+    eq(failed.map { str($0, "role") }, ["user", "bot"], "RT API 报错的一轮重开后还在")
+    eq(failed.last.map { str($0, "outcome") }, "failed", "RT API 报错的一轮结局是出错")
+    check(((failed.last?["steps"] as? [[String: Any]]) ?? []).contains { (str($0, "detail")).contains("API Error: 400") }, "RT 出错步骤带着 CLI 的原始错误")
+    // 压缩：手动 /compact 重开后还原成和实时一样的提示；自动压缩是那一轮工作过程里的一步；
+    // /compact 命令行、摘要、命令输出这些行不能拿来延长上一轮的结束时间（以前 2 秒的回答重开显示 1 分 55 秒）
+    let compactLines = [
+        #"{"type":"user","timestamp":"2026-11-10T12:00:00.000Z","message":{"role":"user","content":"你好"}}"#,
+        #"{"type":"assistant","timestamp":"2026-11-10T12:00:02.000Z","message":{"content":[{"type":"text","text":"你好！"}]}}"#,
+        #"{"type":"system","subtype":"compact_boundary","timestamp":"2026-11-10T12:01:55.000Z","compactMetadata":{"trigger":"manual"}}"#,
+        #"{"type":"user","isCompactSummary":true,"isVisibleInTranscriptOnly":true,"timestamp":"2026-11-10T12:01:55.000Z","message":{"role":"user","content":"This session is being continued from a previous conversation"}}"#,
+        #"{"type":"user","isMeta":true,"timestamp":"2026-11-10T12:00:10.000Z","message":{"role":"user","content":"<local-command-caveat>x</local-command-caveat>"}}"#,
+        #"{"type":"user","timestamp":"2026-11-10T12:00:10.000Z","message":{"role":"user","content":"<command-name>/compact</command-name>"}}"#,
+        #"{"type":"user","timestamp":"2026-11-10T12:01:56.000Z","message":{"role":"user","content":"<local-command-stdout>Compacted </local-command-stdout>"}}"#,
+        #"{"type":"user","timestamp":"2026-11-10T12:02:00.000Z","message":{"role":"user","content":"接着说"}}"#,
+        #"{"type":"assistant","timestamp":"2026-11-10T12:02:01.000Z","message":{"content":[{"type":"tool_use","id":"t9","name":"Bash","input":{"command":"ls"}}]}}"#,
+        #"{"type":"system","subtype":"compact_boundary","timestamp":"2026-11-10T12:02:30.000Z","compactMetadata":{"trigger":"auto"}}"#,
+        #"{"type":"user","isCompactSummary":true,"timestamp":"2026-11-10T12:02:31.000Z","message":{"role":"user","content":"This session is being continued"}}"#,
+        #"{"type":"user","timestamp":"2026-11-10T12:02:40.000Z","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"t9","content":"a.txt"}]}}"#,
+        #"{"type":"assistant","timestamp":"2026-11-10T12:02:45.000Z","message":{"content":[{"type":"text","text":"好了"}]}}"#,
+    ]
+    let compacted = AppDelegate().claudeTurns(Data(compactLines.joined(separator: "\n").utf8)).0
+    eq(compacted.map { str($0, "role") }, ["user", "bot", "compact", "user", "bot"], "CP 手动压缩重开后有提示，位置和实时一样")
+    eq(compacted.first { str($0, "role") == "compact" }.map { str($0, "text") }, "前面的对话已经压缩成摘要，腾出了上下文空间。", "CP 提示文字和实时一致")
+    eq(compacted[1]["duration"] as? Double, 2, "CP 压缩相关的行不延长上一轮的工作时长")
+    check(((compacted.last?["steps"] as? [[String: Any]]) ?? []).contains { str($0, "title") == "压缩上下文" && str($0, "status") == "ok" }, "CP 自动压缩是那一轮工作过程里的一步")
     let steps = messages.last?["steps"] as? [[String: Any]] ?? []
     eq(steps.map { str($0, "kind") }, ["command", "user"], "补充的话是这一轮工作过程里的一步")
     eq(str(steps.last, "detail"), "顺便看看 lint", "补充的内容")

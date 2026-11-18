@@ -14,10 +14,19 @@ func testPreviewTimeoutAndQuit() {
     try! installFakeCLI(at: path, behavior: "hung-tree")
     try! fm.setAttributes([.posixPermissions: 0o755], ofItemAtPath: path)
     func pids() -> [Int32] { [".pid", ".child"].compactMap { Int32(trimmed((try? String(contentsOfFile: path + $0, encoding: .utf8)) ?? "")) } }
+    // 假 CLI 要先起 python 再 exec 成 sh、再起子进程；机器很忙时这要好几秒。卡在「已启动、还没开始等」的位置等两份 PID 都写好，
+    // 超时才落在进程树建好之后，被测的仍是「忽略 TERM 的根和子进程都被清理」。等不到就放行，由 verifyKilled 记失败。
+    var ready = Date()
+    func waitForTree() {
+        let end = Date().addingTimeInterval(20)
+        while Date() < end, pids().count < 2 { Thread.sleep(forTimeInterval: 0.01) }
+        ready = Date()
+    }
     func verifyKilled(_ label: String) {
         let ids = pids()
         check(ids.count == 2, "\(label)：记下根和子进程 PID")
-        let end = Date().addingTimeInterval(4)
+        // terminateTree 3 秒后才补 SIGKILL，机器忙时还会晚；死了就往下走，期限只防卡死（不清理时 sleep 要 120 秒）
+        let end = Date().addingTimeInterval(20)
         while Date() < end, ids.contains(where: { kill($0, 0) == 0 }) { Thread.sleep(forTimeInterval: 0.02) }
         check(ids.allSatisfy { kill($0, 0) != 0 }, "\(label)：忽略 TERM 的根和子进程都被清理")
         ids.filter { kill($0, 0) == 0 }.forEach { kill($0, SIGKILL) }
@@ -25,19 +34,21 @@ func testPreviewTimeoutAndQuit() {
     }
     let doc = dir + "/broken.docx"
     try! Data("bad".utf8).write(to: URL(fileURLWithPath: doc))
-    // 期限要留够假 CLI（python）启动并写下 PID 的时间：并行跑测试时机器很忙，0.2 秒、1 秒都会偶发来不及
-    TestHooks.quickLookExecutable = path; TestHooks.quickLookTimeout = 3
-    let began = Date(), result = makeDocumentPreview(doc)
+    // 期限从进程树建好时算。到期后若改成等进程退出，要多等 terminateTree 的 3 秒 SIGKILL，所以 3 秒的上限仍能分出两种结果
+    TestHooks.quickLookExecutable = path; TestHooks.quickLookTimeout = 0.5; TestHooks.quickLookStarted = waitForTree
+    let result = makeDocumentPreview(doc)
     check(result.file == nil && result.error.contains("超时"), "qlmanage：超时返回错误")
-    check(Date().timeIntervalSince(began) < 4, "qlmanage：到期限立即返回")
+    check(Date().timeIntervalSince(ready) < 3, "qlmanage：到期限立即返回")
     verifyKilled("qlmanage")
-    TestHooks.quickLookExecutable = nil; TestHooks.quickLookTimeout = 60
-    d.gitPath = path; d.hooks.toolTimeout = 1.5
+    TestHooks.quickLookExecutable = nil; TestHooks.quickLookTimeout = 60; TestHooks.quickLookStarted = nil
+    // runTool 的期限在启动前就开始算，等进程树时多半已过期：放行后立即超时，结束的正是这棵还活着的进程树
+    d.gitPath = path; d.hooks.toolTimeout = 0.5; d.hooks.toolStarted = waitForTree
     check(d.runGit(["status"], in: dir) == nil, "git：半截输出超时不能当成功")
     verifyKilled("git")
     d.hooks.cliExecutable = path
     check(d.readRollout(dir + "/bad.zst") == nil, "zstd：半截输出超时不能当成功")
     verifyKilled("zstd")
+    d.hooks.toolStarted = nil
     let staleReq = AskRequest(agent: "gemini", reqId: 32, prompt: "", model: "", effort: "", permissionMode: "", workspace: "", conversationId: "")
     let stale = CLIProcess(input: LiveInput())
     try! stale.start(executable:"/bin/cat", arguments:[], cwd:dir, environment:ProcessInfo.processInfo.environment)

@@ -187,6 +187,26 @@ func dshUserText(_ data: [String: Any]) -> String {
     trimmed((data["content"] as? [[String: Any]] ?? []).filter { $0["type"] as? String == "text" }.compactMap { $0["text"] as? String }.joined(separator: "\n"))
 }
 
+/// dsh 收下图片后只在事件里记附件编号（{type: image, attachment: {attachmentId: "sha256:…"}}），
+/// 图片本身按内容哈希存在 ~/.dsh/attachments/v1/objects/<前两位>/<哈希>。编号不对或文件不在时返回 nil。
+func dshAttachmentPath(_ id: String) -> String? {
+    guard id.hasPrefix("sha256:") else { return nil }
+    let hash = String(id.dropFirst(7))
+    guard hash.count == 64, hash.allSatisfy({ $0.isHexDigit && !$0.isUppercase }) else { return nil }
+    let root = TestHooks.dshAttachmentRoot ?? NSHomeDirectory() + "/.dsh/attachments/v1"
+    let path = "\(root)/objects/\(hash.prefix(2))/\(hash)"
+    return FileManager.default.fileExists(atPath: path) ? path : nil
+}
+
+/// 用户消息里的图片 → 和 Claude 一样的图片来源（内嵌数据 + 找原图用的附件编号），交给 attachChatImages 生成缩略图。
+func dshImageSources(_ data: [String: Any]) -> [[String: Any]] {
+    (data["content"] as? [[String: Any]] ?? []).compactMap { b in
+        guard b["type"] as? String == "image", let id = (b["attachment"] as? [String: Any])?["attachmentId"] as? String,
+              let path = dshAttachmentPath(id), let bytes = FileManager.default.contents(atPath: path) else { return nil }
+        return ["data": bytes.base64EncodedString(), "ref": id]
+    }
+}
+
 /// dsh 的回合边界也在历史事件中。分页窗口从末尾读取，因此不必等到最早一页。
 func dshLastTurn(_ rows: [[String: Any]]) -> HistoryTurnActivity? {
     var latest = 0.0
@@ -241,15 +261,20 @@ func dshTurns(_ rows: [[String: Any]]) -> [[String: Any]] {
             let source = data["source"] as? [String: Any] ?? [:]
             guard source["kind"] as? String == "user" else { continue }
             // 回答中途补充的那句（我们发的时候在调用编号上做了记号）：算在这一轮里，和当时看到的一样是一步「你补充说」
+            let images = dshImageSources(data)
             if let p = parser, (source["rpcId"] as? String ?? "").hasPrefix(dshSteerPrefix) {
-                p.turn.add(makeStep("user", "你补充说", detail: dshUserText(data)))
+                var step = makeStep("user", "你补充说", detail: dshUserText(data))
+                if !images.isEmpty { step["imageSources"] = images }
+                p.turn.add(step)
                 continue
             }
             // start 先于提问落盘。在第一步助手输出到来前，这个空解析器就是本轮的运行标题。
             let opening = parser.map { $0.started && $0.turn.isEmpty && $0.ended == nil && $0.failure.isEmpty } ?? false
             if !opening { flush() }
             let text = dshUserText(data)
-            if !text.isEmpty { out.append(["role": "user", "text": text]) }
+            if !text.isEmpty || !images.isEmpty {   // 只发了图片也算一句
+                out.append(images.isEmpty ? ["role": "user", "text": text] : ["role": "user", "text": text, "imageSources": images])
+            }
             startAt = time
             continue
         }

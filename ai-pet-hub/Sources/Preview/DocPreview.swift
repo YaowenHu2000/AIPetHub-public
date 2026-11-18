@@ -155,6 +155,7 @@ private func runQuickLook(_ path: String, into tmp: URL, task: DocumentPreviewTa
     do {
         guard try task.start(p, onExit: { done.signal() }) else { return .failure(PreviewFailure(message: "已取消预览")) }
     } catch { return .failure(PreviewFailure(message: "调用不了系统预览（qlmanage）")) }
+    TestHooks.quickLookStarted?()
     if done.wait(timeout: .now() + timeout) == .timedOut {
         task.cancel()
         return .failure(PreviewFailure(message: "生成预览超时（文件太大或格式异常）"))

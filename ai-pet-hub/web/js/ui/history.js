@@ -427,7 +427,9 @@ function openConversation(id, item) {
   st.loadedId = null;
   st.pendingTitle = '';
   st.unreadConvs.delete(item.id);
-  st.applyCwdOnLoad = true;
+  st.applyCwdOnLoad = true;   // 正文读回来时再按记录里的目录校一遍
+  // 列表里已经知道它的目录：当场换过去。等正文读回来才换的话，读的期间发出去会带着上一个项目的目录续接（astra 报告）
+  if (typeof item.cwd === 'string' && item.cwd) setWorkspace(id, wsKey(item.cwd), false);
   lsSet(`${id}_conv`, item.id);
   showEmpty(id, '正在加载历史会话…');
   renderHistory(id);

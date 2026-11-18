@@ -74,6 +74,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKSc
     var claudeModelsComplete = false                // 已经拿到过 Claude 完整的模型列表（见 noteClaudeInitialize）
     var historyLimits: [String: Int] = [:]          // 点过「显示更早的」的会话：会话 ID → 显示最近多少条
     var geminiResuming = Set<String>()   // 同一会话从检查到进程结束只能有一个发送者，由 procLock 保护
+    var geminiProbes: [String: (at: Date, value: Bool?)] = [:]   // 打字预热、输入框提示用的进程扫描结果，2 秒内复用（GeminiSessions.swift），由 procLock 保护
     let geminiQueue = DispatchQueue(label: "aipethub.gemini")
     var geminiCache: [String: (mtime: TimeInterval, item: [String: Any]?)] = [:]
     let claudeQueue = DispatchQueue(label: "aipethub.claude")

@@ -3,8 +3,8 @@ import CryptoKit
 import UniformTypeIdentifiers
 
 // 对话里的图片。
-// 用户消息带的图片有三种来源：Claude Code 记录里内嵌的 base64 图片块、Codex 记录里的本地图片路径（localImage），
-// 以及消息文字里写到的图片路径（在 AIPetHub 里粘贴截图，插进输入框的就是路径）。
+// 用户消息带的图片有四种来源：Claude Code 记录里内嵌的 base64 图片块、Codex 记录里的本地图片路径（localImage）、
+// dsh 附件目录里的图片（事件里只记附件编号），以及消息文字里写到的图片路径（在 AIPetHub 里粘贴截图，插进输入框的就是路径）。
 // 随历史发给网页的只是缩略图（长边最多 640 像素，小图原样）；点开时再按需读原图，不在别处另存副本。
 
 let chatImageExts: Set<String> = ["png", "jpg", "jpeg", "gif", "webp", "heic", "heif", "bmp", "tif", "tiff"]
@@ -341,6 +341,8 @@ extension AppDelegate {
             return claudeEmbeddedImage(cid: cid, id: id).flatMap(fullImageDataURL)
         case "gpt":
             return codexRolloutImages(cid: cid)[id].flatMap { Data(base64Encoded: $0, options: .ignoreUnknownCharacters) }.flatMap(fullImageDataURL)
+        case "deepseek":   // id 是 dsh 的附件编号（DeepSeekEvents.swift 的 dshImageSources）
+            return dshAttachmentPath(id).flatMap { FileManager.default.contents(atPath: $0) }.flatMap(fullImageDataURL)
         default:
             return nil
         }

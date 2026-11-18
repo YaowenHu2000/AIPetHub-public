@@ -81,13 +81,14 @@ extension AppDelegate {
         let target = trimmedPath(workspace)
         queue(for: agent).async { [self] in
             let ids: [String]
+            var tasks: [String] = []   // 侧栏归进「任务会话」的，网页删项目时跳过
             switch agent {
             case "gemini": ids = geminiIds(inWorkspace: target)
-            case "claude": ids = claudeIds(inWorkspace: target)
+            case "claude": ids = claudeIds(inWorkspace: target) { tasks.append($0) }
             case "deepseek": ids = deepseekIds(inWorkspace: target)
-            default: ids = codexIds(inWorkspace: target)
+            default: ids = codexIds(inWorkspace: target) { tasks.append($0) }
             }
-            sendToJS("onProjectConversations", ["agent": agent, "workspace": workspace, "ids": ids])
+            sendToJS("onProjectConversations", ["agent": agent, "workspace": workspace, "ids": ids, "taskIds": tasks])
         }
     }
 

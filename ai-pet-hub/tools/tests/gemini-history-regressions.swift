@@ -3,6 +3,7 @@ import Foundation
 import SQLite3
 
 func testGeminiHistoryRegressions() {
+    testGeminiProbeCache()
     testGeminiDesktopIndex()
     testGeminiDesktopHistory()
     print("· Gemini 工具结果状态与子会话步骤隔离")
@@ -331,4 +332,21 @@ func testGeminiDesktopIndex() {
     try! Data([0x08, 0x01]).write(to: URL(fileURLWithPath: root + "/jetbox_summaries_proto.pb"))
     check(!d.removeFromDesktopIndex(kept, root: root), "IDX 结构不认识时不改")
     eq(fm.contents(atPath: root + "/agyhub_summaries_proto.pb"), entry(1, kept, "留下") + entry(2, kept, "留下"), "IDX 不改时别的索引也不动")
+}
+
+
+/// 打字预热和输入框提示每个按键 / 每 8 秒都会问「反重力开没开、会话有没有别人占着」，一次扫描要 0.1–0.2 秒。
+/// 这两处 2 秒内复用上次结果；发送和删除前仍现查（反重力刚启动的一两秒里不能写它的会话）。
+func testGeminiProbeCache() {
+    print("· Gemini 进程扫描：打字时 2 秒内复用，发送前现查")
+    let d = AppDelegate()
+    var scans = 0, running = false
+    d.hooks.geminiDesktopRunning = { scans += 1; return running }
+    let cid = "desktop:probe-fixture"
+    for _ in 0..<10 { _ = d.geminiDesktopReadOnly(cid, fresh: false) }
+    eq(scans, 1, "PC 打字时连续 10 次检查只扫一次")
+    running = true
+    check(!d.geminiDesktopReadOnly(cid, fresh: false), "PC 2 秒内沿用上次结果（打字预热晚一两秒知道无妨）")
+    check(d.geminiDesktopReadOnly(cid), "PC 发送前现查，反重力刚启动也能拦住")
+    eq(scans, 2, "PC 现查才再扫一次")
 }

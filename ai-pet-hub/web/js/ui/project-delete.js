@@ -48,10 +48,19 @@ function renderProjectConfirm(box) {
 window.onProjectConversations = data => {
   const p = projectDelete;
   if (!p || !pop || pop.anchor !== p.anchor || data.agent !== p.id || data.workspace !== p.key) return;
-  p.ids = Array.isArray(data.ids) ? data.ids : [];
+  p.ids = projectDeleteIds(p.id, p.key, data);
   renderPopover();
   positionPopover();
 };
+
+/**
+ * 原生按目录给出这个项目的全部会话；侧栏已经归进「任务会话」的（派出去的、用户右键移过去的）不属于这个项目，
+ * 用和侧栏同一套规则（history.js 的 isTaskConversation）剔掉，确认框的数字和真正归档的就是同一批（astra 报告）。
+ */
+function projectDeleteIds(id, key, data) {
+  const auto = new Set(Array.isArray(data.taskIds) ? data.taskIds : []);
+  return (Array.isArray(data.ids) ? data.ids : []).filter(cid => !isTaskConversation(id, { id: cid, task: auto.has(cid), cwd: key }));
+}
 
 function confirmDeleteProject() {
   const p = projectDelete;

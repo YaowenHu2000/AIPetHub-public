@@ -322,7 +322,8 @@ exec '__REAL_GIT__' "$@"
     'preview-slow': r'''
 #!/bin/sh
 echo "$4" >> '__ROOT__/started'
-sleep 2 &
+# 要被取消的那个睡得比测试的期限长得多：没被取消就还活着，测试才分得出来，负载高时也不会靠自然结束蒙混过关
+case "$4" in *running.docx|*timeout.docx) sleep 30 & ;; *) sleep 2 & ;; esac
 echo $! > '__ROOT__/child'
 wait
 mkdir -p "$3/out.qlpreview"
@@ -330,8 +331,8 @@ echo '<html>done</html>' > "$3/out.qlpreview/Preview.html"
 ''',
     'preview-stubborn': r'''
 #!/bin/sh
-/bin/sh -c 'trap "" TERM; while :; do sleep 1; done' &
-echo $! > '__ROOT__/stubborn-child'
+# 装好忽略 TERM 之后才记下 pid：测试看到 pid 就能马上取消，不用猜要等多久
+/bin/sh -c 'trap "" TERM; echo $$ > "$0"; while :; do sleep 1; done' '__ROOT__/stubborn-child' &
 wait
 ''',
 }

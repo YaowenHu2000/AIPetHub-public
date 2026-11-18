@@ -126,7 +126,8 @@ extension AppDelegate {
     }
 
     /// 目录是 target 的全部未归档会话：数据库里的线程 + 只存在于 rollout 的会话。
-    func codexIds(inWorkspace target: String) -> [String] {
+    /// onTask 收到其中 `codex exec` 派出去的：侧栏把它们归进「任务会话」，删除项目时网页据此跳过。
+    func codexIds(inWorkspace target: String, onTask: (String) -> Void = { _ in }) -> [String] {
         var ids: [String] = [], indexed = Set<String>()
         let projectless = codexProjectlessIds()
         func matches(_ cid: String, _ cwd: String) -> Bool { (projectless.contains(cid) ? "" : trimmedPath(cwd)) == target }
@@ -134,11 +135,17 @@ extension AppDelegate {
             queryRows(db, "SELECT id, cwd, archived, source FROM threads") { s in
                 let cid = columnText(s, 0)
                 indexed.insert(cid)
-                if sqlite3_column_int(s, 2) == 0, !columnText(s, 3).hasPrefix("{"), matches(cid, columnText(s, 1)) { ids.append(cid) }
+                if sqlite3_column_int(s, 2) == 0, !columnText(s, 3).hasPrefix("{"), matches(cid, columnText(s, 1)) {
+                    ids.append(cid)
+                    if columnText(s, 3) == "exec" { onTask(cid) }
+                }
             }
         }
         for item in standaloneCodexRollouts(indexed: indexed) {
-            if let cid = item["id"] as? String, matches(cid, item["cwd"] as? String ?? "") { ids.append(cid) }
+            if let cid = item["id"] as? String, matches(cid, item["cwd"] as? String ?? "") {
+                ids.append(cid)
+                if item["task"] as? Bool == true { onTask(cid) }
+            }
         }
         return ids
     }

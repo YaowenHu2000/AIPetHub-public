@@ -103,7 +103,8 @@ func testSessionOwnership() {
         if fn == "onAgentModels" { models = (data["models"] as? [[String: Any]] ?? []).compactMap { $0["v"] as? String } }
     }
     d.loadUsage(agent: "gpt", force: true)
-    let end = Date().addingTimeInterval(4)
+    // 读完就往下走；期限只防卡死。机器很忙时假 CLI 光启动就可能超过几秒。
+    let end = Date().addingTimeInterval(30)
     repeat {
         RunLoop.current.run(until: Date().addingTimeInterval(0.02))
         d.procLock.lock(); let busy = d.usageLoading.contains("gpt"); d.procLock.unlock()
@@ -139,11 +140,13 @@ func testTypingResume() {
         let process = (agent == "gpt" ? d.warmCodex(req) : d.warmGemini(req))!
         process.warmKey = d.warmKey(req); d.keepWarm(agent, process)
         d.prewarm(req)
-        let deadline = Date().addingTimeInterval(2)
+        // 接上就往下走；期限只防卡死。机器很忙时假 CLI 起来、答完 initialize 和 resume 可能要好几秒，
+        // 没等到 stage 3 时还没有基线快照，下面「改动也丢弃」会退回 8 秒宽限而误判。
+        let deadline = Date().addingTimeInterval(30)
         while process.withWarmLock({ process.stage < 3 }) && Date() < deadline { Thread.sleep(forTimeInterval:0.01) }
         eq(process.withWarmLock { process.stage }, 3, "\(agent) 打字复用答完后的进程，并提前接上旧会话")
         if agent == "gemini" {
-            check(commands.wait(timeout: .now() + 1) == .success, "打字预热收到的斜杠命令在发送前就发布")
+            check(commands.wait(timeout: .now() + 30) == .success, "打字预热收到的斜杠命令在发送前就发布")
         }
         try! Data("change".utf8).write(to: URL(fileURLWithPath: agent == "gemini" ? file + "-wal" : file))
         let taken = d.takeWarm(req)
@@ -153,6 +156,7 @@ func testTypingResume() {
     }
     // 进入真正的打字续接回调，等它在预热锁内查完状态后再检查 ACP 阶段。
     d.hooks.geminiCliDir = root + "/antigravity-cli"
+    d.hooks.geminiProbeTTL = 0   // 这里测的是续接本身，状态在测试里瞬间切换；扫描结果的复用另由 testGeminiProbeCache 测
     let desk = AskRequest(agent: "gemini", reqId: 85, prompt: "test", model: "model", effort: "low",
                           permissionMode: "default", workspace: root, conversationId: "desktop:session", browserTools: false)
     let desktopDB = URL(fileURLWithPath: d.geminiConversationDb(desk.conversationId))
@@ -163,14 +167,14 @@ func testTypingResume() {
         d.hooks.geminiDesktopRunning = { queried.signal(); return running }
         let process = d.warmGemini(desk)!
         process.warmKey = d.warmKey(desk); d.keepWarm("gemini", process); d.prewarm(desk)
-        check(queried.wait(timeout: .now() + 2) == .success, "打字续接前查询桌面进程状态")
+        check(queried.wait(timeout: .now() + 30) == .success, "打字续接前查询桌面进程状态")
         if running == false {
-            check(commands.wait(timeout: .now() + 2) == .success, "桌面退出后打字预热照常接入")
+            check(commands.wait(timeout: .now() + 30) == .success, "桌面退出后打字预热照常接入")
         } else {
             eq(process.withWarmLock { process.stage }, 1, "桌面仍可能在运行时预热只完成握手")
             d.hooks.geminiDesktopRunning = { false }
             d.prewarm(desk)
-            check(commands.wait(timeout: .now() + 2) == .success, "退出桌面后继续打字，同一预热进程可以续接")
+            check(commands.wait(timeout: .now() + 30) == .success, "退出桌面后继续打字，同一预热进程可以续接")
         }
         d.dropWarm(); _ = process.waitForExit()
     }
@@ -180,7 +184,7 @@ func testTypingResume() {
     // 第一个 agy 已成功预热；此时外部客户端才打开同一个库。文件内容完全不动，只有发送前的持库检查能拦住。
     let warm = d.warmGemini(req)!
     warm.warmKey = d.warmKey(req); d.keepWarm("gemini", warm); d.prewarm(req)
-    check(commands.wait(timeout: .now() + 3) == .success, "第二次打字预热已接入会话")
+    check(commands.wait(timeout: .now() + 30) == .success, "第二次打字预热已接入会话")
     let holder = Process(), ready = Pipe(), release = Pipe(), other = root + "/agy"
     try! fm.copyItem(atPath: CommandLine.arguments[0], toPath: other)
     holder.executableURL = URL(fileURLWithPath: other)
@@ -189,7 +193,8 @@ func testTypingResume() {
     try! holder.run()
     eq(ready.fileHandleForReading.availableData, Data("ready".utf8), "预热后外部 agy 已打开同一库")
     let watchdog = DispatchWorkItem { d.cancel(agent: req.agent, reqId: req.reqId) }
-    DispatchQueue.global().asyncAfter(deadline: .now() + 4, execute: watchdog)
+    // 只防卡死：拦住时立即返回；看门狗太早取消会让忙机器上正常的拦截也拿不到「其他客户端」的答复。
+    DispatchQueue.global().asyncAfter(deadline: .now() + 30, execute: watchdog)
     let blocked = withTestAsk(d, req.key) { d.runGemini(req) }
     watchdog.cancel()
     release.fileHandleForWriting.closeFile(); holder.waitUntilExit()
@@ -199,9 +204,18 @@ func testTypingResume() {
 
     d.hooks.warmTypingIdle = 1
     let idle = d.warmGemini(req)!
-    idle.warmKey = d.warmKey(req); d.keepWarm("gemini", idle); d.prewarm(req)
-    check(commands.wait(timeout: .now() + 3) == .success, "停止打字前已接上会话")
-    let expired = idle.waitForExit(until: .now() + 4) { terminateTree(idle.proc.processIdentifier) }
+    idle.warmKey = d.warmKey(req); d.keepWarm("gemini", idle)
+    // 闲置期限只有 1 秒，从第一次打字算起。机器很忙时接上会话本身就可能超过 1 秒，进程会在接上前被闲置回收。
+    // 所以接上之前一直「在打字」（同一预热进程只刷新打字时间，不会再发 resume），接上后才停手，
+    // 要证明的仍是：停止打字后，已接上会话的预热进程自行退出并从缓存移除。
+    var attached = false
+    let attachBy = Date().addingTimeInterval(30)
+    while !attached && idle.proc.isRunning && Date() < attachBy {
+        d.prewarm(req)
+        attached = commands.wait(timeout: .now() + 0.05) == .success
+    }
+    check(attached, "停止打字前已接上会话")
+    let expired = idle.waitForExit(until: .now() + 30) { terminateTree(idle.proc.processIdentifier) }
     check(!expired.timedOut && d.takeWarm(req) == nil, "打字闲置后预热进程自行退出并从缓存移除")
 
 }

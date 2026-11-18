@@ -48,7 +48,7 @@ extension AppDelegate {
             var files = (result.turn?["files"] as? [[String: Any]]) ?? []
             if let turn = result.turn {
                 payload["steps"] = turn["steps"] ?? []
-                if req.agent == "gpt" { payload["outcome"] = turn["outcome"] }
+                if let outcome = responseOutcome(agent: req.agent, turn: turn) { payload["outcome"] = outcome }
             }
             if let before = before {
                 // 命令改的文件补进改动卡片；改文件工具已经报过的不重复（路径统一成绝对、解开符号链接再比）。
@@ -101,4 +101,10 @@ extension AppDelegate {
         }
         return turn
     }
+}
+
+/// 这一轮的结局（completed / failed / interrupted / incomplete）交给网页，它据此显示「重试」、处理排队的话。
+/// Codex 和 Claude 的后端能明确判断失败（意外退出、写锁冲突、CLI 报错）；正文只剩半句时，网页单靠开头的 ⚠️ 猜不出来。
+func responseOutcome(agent: String, turn: [String: Any]?) -> Any? {
+    ["gpt", "claude"].contains(agent) ? turn?["outcome"] : nil
 }

@@ -303,6 +303,8 @@ function renderOneMessage(id, m, ex, cwd) {
   if (m.role === 'user') {
     const el = appendMessage(id, 'user', m.text || '', m.images);
     el._historySig = messageSignature(m);
+    // 后面那一轮若停下或出错，「重试」用这句的原文；记录里内嵌的图片没有文件路径，只能带上有路径的
+    el._retry = { text: m.text || '', images: (m.images || []).map(im => im.path).filter(Boolean) };
     return el;
   }
   // CLI 的记录里没有「命令改的文件」（那是回答前后比 git 得来的）：用当时记下的补上
@@ -310,6 +312,11 @@ function renderOneMessage(id, m, ex, cwd) {
   S[id].msgEl.appendChild(turn);
   if (ex) decorateTurn(turn, id, ex);
   turn._historySig = messageSignature(m);
+  // 重开会话：停下或出错的那一轮和实时时一样有「重试」（native-callbacks.js 实时那条路），问的是它前面那句
+  if ((m.outcome === 'interrupted' || m.outcome === 'failed') && !turn.querySelector('.answer-copy.retry')) {
+    const ask = [...S[id].msgEl.querySelectorAll('.msg.user')].at(-1)?._retry;
+    if (ask) addRetry(turn, id, ask.text, ask.images);
+  }
   return turn;
 }
 

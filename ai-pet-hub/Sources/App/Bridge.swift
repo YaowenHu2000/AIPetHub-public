@@ -29,6 +29,15 @@ extension AppDelegate {
     /// 和哪一位无关的动作：窗口、文件、内置浏览器、剪贴板。返回 false = 不是这一类。
     private func handleAppAction(_ action: String, _ body: [String: Any]) -> Bool {
         switch action {
+        case "pickAttachments":   // 📎：选要附上的文件（可多选）
+            let panel = NSOpenPanel()
+            panel.canChooseFiles = true; panel.canChooseDirectories = false; panel.allowsMultipleSelection = true
+            panel.prompt = "附上"
+            panel.beginSheetModal(for: window) { [weak self] response in
+                guard response == .OK, !panel.urls.isEmpty else { return }
+                self?.sendToJS("onFilesDropped", ["paths": panel.urls.map(\.path)])
+            }
+            return true
         case "startWindowDrag":
             beginWindowDrag()
             return true

@@ -30,8 +30,7 @@ function autosize() {
 function send() {
   const id = active;
   const st = S[id];
-  const text = els.input.value.trim();
-  const images = takeAttachments(id);   // 输入框上面附的图片（composer.js）
+  const { text, images } = attachmentsForSend(els.input.value.trim(), takeAttachments(id));   // 附的图片和文件（composer.js）
   if (!text && !images.length) return;
   setDraft(id, '');
   els.input.value = '';
@@ -90,6 +89,7 @@ function startRun(id, text, images = []) {
   updateSendUI();
   pets[id].setBusy(true);
 
+  noteSent();
   postNative('askAgent', {
     agent: id,
     reqId: run.reqId,

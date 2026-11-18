@@ -4,6 +4,16 @@ import Cocoa
 import SQLite3
 
 func testHelpers() {
+    // 这一轮的结局要交给网页，它据此显示「重试」：Claude 中途崩了、正文只有半句时，只靠正文开头的 ⚠️ 猜不出来（astra 报告）
+    eq(responseOutcome(agent: "claude", turn: ["outcome": "failed"]) as? String, "failed", "Claude 的失败结局交给网页")
+    eq(responseOutcome(agent: "gpt", turn: ["outcome": "interrupted"]) as? String, "interrupted", "Codex 的结局照旧交给网页")
+    // 粘贴：访达里复制的文件从剪贴板取路径（Bridge / AppViews 的 ⌘V）；只有文字或图片数据时不当文件
+    let board = NSPasteboard(name: NSPasteboard.Name("aipethub-test-\(UUID().uuidString)"))
+    board.clearContents(); board.writeObjects([URL(fileURLWithPath: "/tmp/资料 包.zip") as NSURL, URL(fileURLWithPath: "/tmp/b.txt") as NSURL])
+    eq(pastedFilePaths(board), ["/tmp/资料 包.zip", "/tmp/b.txt"], "粘贴访达复制的文件取到路径")
+    board.clearContents(); board.setString("只是一段文字", forType: .string)
+    eq(pastedFilePaths(board), [], "剪贴板只有文字时不当文件")
+    board.releaseGlobally()
     print("· 工具函数")
     eq(lineCount(""), 0, "空串行数")
     eq(lineCount("a\nb"), 2, "两行")
@@ -346,6 +356,38 @@ func testDsh() {
     let st = dshTurns(steered)
     eq(st.map { str($0, "role") }, ["user", "bot"], "补充的话不拆成另一轮")
     eq(((st.last?["steps"] as? [[String: Any]]) ?? []).contains { str($0, "kind") == "user" && str($0, "detail") == "顺便看看 lint" }, true, "补充的话是这一轮里的一步")
+    // 带图片的提问：dsh 只在事件里记附件编号，图片本身在附件目录；重开历史要有缩略图、能点开原图
+    let fm = FileManager.default
+    let attachRoot = NSTemporaryDirectory() + "aipethub-dsh-attachments-" + UUID().uuidString
+    defer { try? fm.removeItem(atPath: attachRoot); TestHooks.dshAttachmentRoot = nil }
+    TestHooks.dshAttachmentRoot = attachRoot
+    let png = Data(base64Encoded: "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+jRZkAAAAASUVORK5CYII=")!
+    let sha = String(repeating: "ab", count: 32)
+    try! fm.createDirectory(atPath: "\(attachRoot)/objects/ab", withIntermediateDirectories: true)
+    try! png.write(to: URL(fileURLWithPath: "\(attachRoot)/objects/ab/\(sha)"))
+    let imageBlock: [String: Any] = ["type": "image", "attachment": ["attachmentId": "sha256:\(sha)", "mediaType": "image/png", "bytes": png.count, "width": 1, "height": 1]]
+    func dshUser(_ content: [[String: Any]], rpc: String? = nil) -> [String: Any] {
+        var source: [String: Any] = ["kind": "user"]
+        source["rpcId"] = rpc
+        return ["event": ["type": "user/message", "seq": 1, "time": 1794398190000, "data": ["role": "user", "source": source, "content": content]]]
+    }
+    var pictured = rows.filter { (($0["event"] as? [String: Any])?["type"] as? String) != "user/message" }
+    pictured.insert(dshUser([imageBlock, ["type": "text", "text": "请看这张图片。"]]), at: 0)
+    pictured.insert(dshUser([imageBlock], rpc: "aph-steer-s2"), at: pictured.count / 2)
+    var withImages = dshTurns(pictured)
+    eq(withImages.map { str($0, "role") }, ["user", "bot"], "DS01 带图片的提问仍是一问一答")
+    eq(str(withImages.first, "text"), "请看这张图片。", "DS01 图片块不混进提问文字")
+    eq((withImages.first?["imageSources"] as? [[String: Any]])?.compactMap { $0["ref"] as? String }, ["sha256:\(sha)"], "DS01 提问带上图片来源（附件编号）")
+    let dsAsked = AppDelegate()
+    dsAsked.jsSink = { _, _ in }
+    dsAsked.attachChatImages(&withImages, payload: ["agent": "deepseek", "conversationId": "session-fixture", "cwd": "/tmp"])
+    let dsThumb = (withImages.first?["images"] as? [[String: Any]])?.first
+    check((dsThumb?["src"] as? String ?? "").hasPrefix("data:image/"), "DS01 重开历史有缩略图")
+    check(withImages.first?["imageSources"] == nil, "DS01 原始数据不随消息发到页面")
+    let dsSteer = ((withImages.last?["steps"] as? [[String: Any]]) ?? []).first { str($0, "kind") == "user" }
+    eq((dsSteer?["images"] as? [[String: Any]])?.count, 1, "DS01 中途补充的纯图也有缩略图")
+    let dsFull = dsThumb.flatMap { dsAsked.fullChatImage(["ref": $0["ref"] ?? [:]]) }
+    check((dsFull ?? "").hasPrefix("data:image/"), "DS01 点开能看原图")
     // 出错
     let bad = DshParser(turn: TurnBuilder())
     bad.feed(json(#"{"type":"turn/end","seq":15,"data":{"turn":1,"reason":{"kind":"error","error":{"message":"Authentication Fails","code":"AUTH","status":401}}}}"#))

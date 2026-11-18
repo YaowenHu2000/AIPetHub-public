@@ -104,7 +104,8 @@ window.onAgentSteer = data => {
   const item = run?.queue?.find(q => q.sid === data.steerId);
   if (!item) return;
   if (data.state === 'consumed') run.steered = true;
-  if (item.jump) return;   // 已经点了「立即发送」：这一轮正在停，这句话等它停下后重新发，不管 CLI 那边轮没轮到
+  // 已经点了「立即发送」：这一轮正在停，这句话等它停下后重新发——除非 CLI 停下前已经收下并答了（见 answeredBeforeStop）
+  if (item.jump) { if (data.state === 'consumed') item.consumed = true; return; }
   if (data.state === 'consumed') {
     // CLI 收下了这句话，但它手头有一条命令还在跑（Codex 会这样）：跑完才轮得到。气泡先留着，可以点「立即发送」打断
     if (commandRunning(run)) { item.held = true; setQueuedState(item, 'sent'); return; }
@@ -118,14 +119,15 @@ window.onAgentSteer = data => {
  * 在 onAgentResponse 的最后调用。
  */
 function flushQueue(id, run, data) {
-  (run.queue || []).filter(q => q.held && !q.jump).forEach(q => dropQueued(run, q));   // CLI 已经收下的：不用再发
+  const jump = (run.queue || []).some(q => q.jump);   // 点了「立即发送」：这一轮是为了插队才停的，接着发
+  const steps = Array.isArray(data.steps) ? data.steps : run.live?.steps;
+  (run.queue || []).filter(q => (q.held && !q.jump) || answeredBeforeStop(q, steps)).forEach(q => dropQueued(run, q));   // CLI 已经收下的：不用再发
   const left = run.queue || [];
   if (!left.length) return;
   left.forEach(item => item.el.remove());
   run.queue = [];
   const text = left.map(q => q.text).join('\n\n');   // 发不了时放回输入框用
   const here = id === active && (viewKey(id) === run.view || viewKey(id) === data.conversationId);
-  const jump = left.some(q => q.jump);   // 点了「立即发送」：这一轮是为了插队才停的，接着发
   if (queueAction({ cancelled: !!data.cancelled, failed: data.outcome === 'failed' || /^⚠️/.test((data.reply || '').trim()), here, busy: viewBusy(id), jump }) === 'restore') {
     restoreDraft(id, text);   // 没法接着发（停止了 / 出错了 / 已经切到别的会话）：放回输入框，不丢
     const imgs = left.flatMap(q => q.images || []);
@@ -135,6 +137,17 @@ function flushQueue(id, run, data) {
   // 一句一句发：先发第一句（连它带的图片），其余的接着排在它后面（能送进去的会送进去，送不进去的等它答完再发下一句）
   startRun(id, left[0].text, left[0].images || []);
   left.slice(1).forEach(q => queueMessage(id, q.text, q.images || []));
+}
+
+/**
+ * 点了「立即发送」，CLI 却在停下之前收下了这句（consumed）并已经接着答了：工作过程里这句后面还有内容。
+ * 这时再发一遍就会同一句答两遍（astra 报告）；收下了但还没来得及答的，照常重发。
+ */
+function answeredBeforeStop(item, steps) {
+  if (!item.consumed) return false;
+  const list = (steps || []).filter(Boolean);
+  const at = list.map(s => s.kind === 'user' && (s.detail || '') === item.text).lastIndexOf(true);
+  return at >= 0 && list.slice(at + 1).some(s => s.kind !== 'user');
 }
 
 // ===== 审批 / 提问 / 计划 =====

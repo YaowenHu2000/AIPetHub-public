@@ -24,6 +24,7 @@ func testHistoryActivity() {
     for id in ["desktop", "project"] {
         sql(db, "INSERT INTO threads VALUES ('\(id)','title','question','\(dir)',1,0,'cli','')")
     }
+    sql(db, "INSERT INTO threads VALUES ('job','title','question','\(dir)',1,0,'exec','')")
     try! Data(#"{"projectless-thread-ids":["desktop"]}"#.utf8).write(to: URL(fileURLWithPath: root + "/.codex-global-state.json"))
     let cid = UUID().uuidString, path = sessions + "/rollout-fixture-" + cid + ".jsonl"
     let meta = #"{"type":"session_meta","payload":{"id":"CID","cwd":"/work","source":"cli"}}"#.replacingOccurrences(of: "CID", with: cid) + "\n"
@@ -82,9 +83,15 @@ func testHistoryActivity() {
     let done = DispatchSemaphore(value: 0)
     var items: [[String: Any]] = [], projectless: [String] = []
     d.jsSink = { fn, data in if fn == "onConversationsListed" { items = data["items"] as? [[String: Any]] ?? []; projectless = data["projectlessIds"] as? [String] ?? []; done.signal() } }
-    d.listCodex(); check(done.wait(timeout: .now() + 5) == .success, "侧栏读取完成")
+    // 侧栏要起一次假 zstd 子进程，机器忙时启动就要好几秒；回调一到就往下走，期限只防卡死，
+    // 所以放到产品自己给 zstd 的 30 秒之后。
+    d.listCodex(); check(done.wait(timeout: .now() + 60) == .success, "侧栏读取完成")
     eq(items.first { str($0, "id") == cid }?["title"] as? String, "标题", "仅有 .jsonl.zst 的主会话进入侧栏")
     eq(d.codexIds(inWorkspace: "/work"), [cid], "仅有压缩文件的主会话进入项目清单")
+    // 删除项目时，侧栏归进「任务会话」的不能跟着归档：清单里标出哪些是 codex exec 派出去的
+    var execTasks: [String] = []
+    eq(d.codexIds(inWorkspace: dir) { execTasks.append($0) }.sorted(), ["job", "project"], "项目清单含同目录的任务会话")
+    eq(execTasks, ["job"], "项目清单标出 codex exec 派出去的任务会话")
     let desktop = items.first { str($0, "id") == "desktop" }, project = items.first { str($0, "id") == "project" }
     eq(projectless, ["desktop"], "归组采用桌面端单独标记的 ID")
     eq(desktop?["cwd"] as? String, dir, "归组不改真实 cwd")

@@ -42,9 +42,99 @@ try {
   const moveIn = [...els.popover.querySelectorAll('.pop-item')].find(n => n.textContent.includes('移到任务会话'));
   moveIn?.click();
   check('T 右键移到任务会话并记住', !!moveIn && S[id].taskOverrides.real === true && groupKeyOf(id, S[id].conversations[0]) === TASK_GROUP, S[id].taskOverrides);
+  const delIds = projectDeleteIds(id, '/fixture/proj', { ids: ['real', 'plain', 'job'], taskIds: ['job'] });
+  check('T 删除项目不带走任务会话（派出去的、右键移过去的）', delIds.join() === 'plain', delIds);
+  // 点开别的项目的历史会话：工作目录当场换成那条会话的，不等正文读回来（读的期间发出去会带着上一个项目的目录续接）
+  const savedWs = S[id].workspace; S[id].workspace = '/fixture/proj-a';
+  openConversation(id, { id: 'cwd-switch', title: '乙项目的会话', cwd: '/fixture/proj-b', timestamp: 6 });
+  check('W 点开历史会话时工作目录立即跟过去', S[id].workspace === '/fixture/proj-b', S[id].workspace);
+  setWorkspace(id, savedWs, false); S[id].conversationId = ''; S[id].loadedId = ''; S[id].applyCwdOnLoad = false;
+  // 预热去重只管打字期间：发送时原生已经取走了预热的进程，答完后同样设置的下一次预热不能被「60 秒内预热过」跳过
+  const warms = () => requests.filter(r => r.action === 'prewarmAgent' && r.agent === id).length;
+  warmSig = ''; prewarm(id); const w1 = warms(); prewarm(id);
+  check('P 同样设置 60 秒内不重复预热', warms() === w1, warms() - w1);
+  noteSent(); prewarm(id);
+  check('P 发送后下一次预热照常发出', warms() === w1 + 1, warms() - w1);
+  // 文件附件：拖进来的 zip 和图片都成卡片，不往输入框插路径；发送时图片单独交给模型，其他文件的路径附在话后面
+  const savedAttach = S[id].attach, savedInput = els.input.value;
+  S[id].attach = []; els.input.value = '看看这个';
+  window.onFilesDropped({ paths: ['/tmp/资料 包.zip', '/tmp/red.png'] });
+  check('A 拖进的 zip 和图片都成附件卡片', document.querySelectorAll('.attach-chip').length === 2 && els.input.value === '看看这个', { chips: document.querySelectorAll('.attach-chip').length, input: els.input.value });
+  const out = attachmentsForSend('看看这个', ['/tmp/资料 包.zip', '/tmp/red.png']);
+  check('A 发送时图片单独给模型，文件路径附在话后', out.images.join() === '/tmp/red.png' && out.text === '看看这个\n\n附件：\n/tmp/资料 包.zip', out);
+  check('A 只有文件没有话时也能发', attachmentsForSend('', ['/tmp/a.zip']).text === '附件：\n/tmp/a.zip');
+  check('A 输入框旁有选文件按钮', !!document.getElementById('attach-btn'));
+  S[id].attach = savedAttach; els.input.value = savedInput; renderAttachments();
+  // 重开会话：结局是已中断或出错的那一轮也要有「重试」（和实时时一样），正常完成的没有
+  renderMessages(id, [{role:'user',text:'数到 400'}, {role:'bot',text:'1 2 3',outcome:'interrupted',steps:[]},
+    {role:'user',text:'你好'}, {role:'bot',text:'',outcome:'failed',steps:[{kind:'error',title:'出错',status:'error',detail:'API Error: 400'}]},
+    {role:'user',text:'再来'}, {role:'bot',text:'好的',outcome:'completed',steps:[]}], '');
+  const turnsShown = [...S[id].msgEl.querySelectorAll('.msg.bot.turn')];
+  check('RT 重开后已中断和出错的轮次有重试，完成的没有', turnsShown.map(t => !!t.querySelector('.answer-copy.retry')).join() === 'true,true,false',
+    turnsShown.map(t => !!t.querySelector('.answer-copy.retry')));
+  // 点「立即发送」后 CLI 在停下前已经收下并答了这句补充：这一轮结束后不再重发（不然同一句答两遍）；收下了还没答的照常重发
+  const jumpRun = { reqId: 'jump-req', agent: id, view: 'jump-view', nodes: [], queue: [], live: { steps: [] } };
+  const jumpEl = document.createElement('div'); jumpEl.innerHTML = '<span class="queued-state"></span>';
+  const jumpItem = { sid: 'sq-jump', text: '改答 2+3', images: [], state: 'sent', jump: true, el: jumpEl, run: jumpRun };
+  jumpRun.queue.push(jumpItem); S[id].runs.set(jumpRun.reqId, jumpRun);
+  window.onAgentSteer({ agent: id, reqId: jumpRun.reqId, steerId: jumpItem.sid, state: 'consumed' });
+  const beforeJump = requests.length, inputBeforeJump = els.input.value;
+  flushQueue(id, jumpRun, { cancelled: true, steps: [{ kind: 'command', title: 'cat gate' }, { kind: 'user', detail: '改答 2+3' }, { kind: 'text', detail: '5' }] });
+  check('S 立即发送的补充停下前已答过，不再发一遍', !requests.slice(beforeJump).some(r => r.action === 'askAgent') && !jumpRun.queue.length && els.input.value === inputBeforeJump,
+    { sent: requests.slice(beforeJump).map(r => r.action), queue: jumpRun.queue.length, input: els.input.value });
+  check('S 收下了还没来得及答的照常重发', !answeredBeforeStop({ ...jumpItem, consumed: true }, [{ kind: 'user', detail: '改答 2+3' }]));
+  S[id].runs.delete(jumpRun.reqId);
+  // 附件跟草稿一起留到重开 App；一次附超过 8 个时只对真正附上的报成功，多出来的明说没附上
+  const atSay = pets[id].say, atSaid = []; pets[id].say = text => { atSaid.push(text); };
+  const atChips = () => document.querySelectorAll('.attach-chip').length;
+  S[id].attach = []; renderAttachments();
+  window.onFilesDropped({ paths: ['/tmp/at-a.zip', '/tmp/at-b.zip'] });
+  S[id].attach = []; renderAttachments();   // 重新载入界面：内存里的附件没了，只剩本地存下的
+  if (typeof loadAttachments === 'function') loadAttachments(id);
+  renderAttachments();
+  check('AT 重新载入后附件卡片还在', atChips() === 2 && (S[id].attach || []).map(a => a.path).join() === '/tmp/at-a.zip,/tmp/at-b.zip', { chips: atChips(), saved: lsGet(`${id}_attach`) });
+  document.querySelector('.attach-chip .attach-x')?.click();
+  check('AT 移除附件后存下的也跟着少', lsJson(`${id}_attach`, []).join() === '/tmp/at-b.zip', lsGet(`${id}_attach`));
+  takeAttachments(id);
+  check('AT 发送取走附件后存下的清空', !lsJson(`${id}_attach`, []).length, lsGet(`${id}_attach`));
+  const atNine = Array.from({ length: 9 }, (_, i) => `/tmp/at-${i}.zip`);
+  window.onFilesDropped({ paths: atNine });
+  check('AT 一次附 9 个：卡片 8 张，提示说附上 8 个、1 个没附上', atChips() === 8 && /附上了 8 个文件/.test(atSaid.at(-1)) && /1 个没附上/.test(atSaid.at(-1)), { chips: atChips(), said: atSaid.at(-1) });
+  window.onFilesDropped({ paths: ['/tmp/at-extra.zip'] });
+  check('AT 已满 8 个再加一个不报成功', atChips() === 8 && !/附上了/.test(atSaid.at(-1)) && /1 个没附上/.test(atSaid.at(-1)), { chips: atChips(), said: atSaid.at(-1) });
+  pets[id].say = atSay; takeAttachments(id);
+  // 地址栏：带主机或端口的输入即使以 .html/.pdf 结尾也是网址；真正的相对路径仍按本地文件
+  const opened = input => { const at = requests.length; navigateBrowser(input, '/fixture/ws'); return requests.slice(at).find(r => r.action === 'browserOpen') || {}; };
+  const asURL = { 'localhost:5173/index.html': 'http://localhost:5173/index.html', '127.0.0.1:8080/a.pdf': 'http://127.0.0.1:8080/a.pdf',
+    'example.org/guide.pdf': 'https://example.org/guide.pdf', 'localhost:5173': 'http://localhost:5173' };
+  const asPath = ['index.html', 'docs/a.pdf', './x.html', '/abs/path.html', 'src/page.html', 'readme.md/x.html'];
+  const wrongURL = Object.entries(asURL).filter(([t, u]) => opened(t).url !== u).map(([t]) => [t, opened(t)]);
+  const wrongPath = asPath.filter(t => opened(t).path !== t).map(t => [t, opened(t)]);
+  check('BR 带主机的地址栏输入按网址打开', wrongURL.length === 0, wrongURL);
+  check('BR 相对和绝对路径仍按本地文件打开', wrongPath.length === 0, wrongPath);
+  // 回答里的文件标签、改动行点开的文档一定是本地文件：目录名像域名（en.lproj、user.github.io）也不能当网址
+  const previewed = path => { const at = requests.length; openPreview({ path, base: '/fixture/ws' }); return requests.slice(at).find(r => r.action === 'browserOpen') || {}; };
+  const docPaths = ['en.lproj/Guide.pdf', 'user.github.io/cv.pdf', 'Foo.bundle/a.docx', 'Docs.docc/slides.pptx'];
+  const wrongDoc = docPaths.filter(p => previewed(p).path !== p).map(p => [p, previewed(p)]);
+  closePreview();
+  check('BR 文件标签打开的文档不按域名判成网址', wrongDoc.length === 0, wrongDoc);
+  showEmpty(id);
   S[id].taskOverrides = savedOverrides; S[id].groupState = savedGroupState;
   S[id].conversations = savedConversations; S[id].conversationId = savedConversationId; S[id].loadedId = savedLoadedId;
   renderHistory(id); showEmpty(id);
+  // SV：SVG 图片显示出来以后，工具栏里仍能切到内置浏览器看；PNG 不出现这个按钮。
+  {
+    const oldRead = readLocalFile, pixel = 'data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+jRZkAAAAASUVORK5CYII=';
+    readLocalFile = async path => ({path, image: pixel, size: 68});
+    const globe = () => [...pane.el.querySelectorAll('.ed-bar .ed-tool')].some(b => b.title === '在内置浏览器中预览');
+    closePreview(); openPreview({path:'/sv-fixture/icon.svg',base:''});
+    await until(() => activeTab()?.data && pane.el.querySelector('.ed-image img'), 2000, 'SVG 预览显示图片');
+    check('SV SVG 图片显示后仍有内置浏览器预览按钮', globe(), pane.el.querySelector('.ed-bar')?.innerHTML);
+    openPreview({path:'/sv-fixture/icon.png',base:''});
+    await until(() => activeTab()?.resolved === '/sv-fixture/icon.png' && pane.el.querySelector('.ed-image img'), 2000, 'PNG 预览显示图片');
+    check('SV PNG 预览没有内置浏览器预览按钮', !globe(), pane.el.querySelector('.ed-bar')?.innerHTML);
+    readLocalFile = oldRead; closePreview();
+  }
   // 服务端仍有未取到的旧页时，即使已知 omitted 为零，也要保留同一个加载入口。
   const paged = {agent:id,conversationId:'history-pages-fixture',cwd:'',messages:[{role:'user',text:'最近的一句'}],limit:300,omitted:0,hasMore:true};
   S[id].conversationId = paged.conversationId;

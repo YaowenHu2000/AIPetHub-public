@@ -31,17 +31,36 @@ private func antigravityRunning() -> Bool? {
 }
 
 extension AppDelegate {
-    func geminiDesktopReadOnly(_ cid: String) -> Bool {
-        guard cid.hasPrefix("desktop:") else { return false }
-        return (hooks.geminiDesktopRunning ?? antigravityRunning)() != false
+    /// 一次扫描要 0.1–0.2 秒（遍历全部进程；持库检查还要查每个进程打开的文件）。打字预热每个按键都会问、输入框提示每 8 秒问一次，
+    /// 每次都扫会一直抢 CPU，在桌面版会话里打字发卡（用户 2026-11-18 碰到）。这些地方传 fresh: false，2 秒内复用上次结果；
+    /// 发送、删除前用默认的现查：反重力刚启动的那一两秒里不能写它的会话。
+    private func geminiProbe(_ key: String, fresh: Bool, _ scan: () -> Bool?) -> Bool? {
+        if !fresh {
+            procLock.lock(); let cached = geminiProbes[key]; procLock.unlock()
+            if let c = cached, Date().timeIntervalSince(c.at) < (hooks.geminiProbeTTL ?? 2) { return c.value }
+        }
+        let value = scan()
+        procLock.lock(); geminiProbes[key] = (Date(), value); procLock.unlock()
+        return value
     }
 
-    func geminiDesktopSendBlock(_ cid: String) -> String? {
-        geminiDesktopReadOnly(cid) ? desktopSendWarning : nil
+    func geminiDesktopReadOnly(_ cid: String, fresh: Bool = true) -> Bool {
+        guard cid.hasPrefix("desktop:") else { return false }
+        return geminiProbe("desktop-running", fresh: fresh) { (hooks.geminiDesktopRunning ?? antigravityRunning)() } != false
+    }
+
+    func geminiDesktopSendBlock(_ cid: String, fresh: Bool = true) -> String? {
+        geminiDesktopReadOnly(cid, fresh: fresh) ? desktopSendWarning : nil
     }
 
     /// nil 表示系统未能检查。App 读历史等普通 SQLite 读者可以共存。
-    func geminiSessionHeld(_ cid: String, includingOwn: Bool = false, databasePath: String? = nil) -> Bool? {
+    func geminiSessionHeld(_ cid: String, includingOwn: Bool = false, databasePath: String? = nil, fresh: Bool = true) -> Bool? {
+        geminiProbe("held:\(cid):\(includingOwn):\(databasePath ?? "")", fresh: fresh) {
+            geminiSessionHeldScan(cid, includingOwn: includingOwn, databasePath: databasePath)
+        }
+    }
+
+    private func geminiSessionHeldScan(_ cid: String, includingOwn: Bool, databasePath: String?) -> Bool? {
         guard !cid.isEmpty, validConversationId(cid, agent: "gemini") else { return false }
         let db = databasePath ?? geminiConversationDb(cid)
         for path in [db, db + "-wal"] where fm.fileExists(atPath: path) {
@@ -78,12 +97,12 @@ extension AppDelegate {
         return false
     }
 
-    func geminiResumeBlock(_ cid: String) -> String? {
-        if let reason = geminiDesktopSendBlock(cid) { return reason }
+    func geminiResumeBlock(_ cid: String, fresh: Bool = true) -> String? {
+        if let reason = geminiDesktopSendBlock(cid, fresh: fresh) { return reason }
         if geminiStore(cid).desktop && !fm.fileExists(atPath: geminiConversationDb(cid)) {
             return "⚠️ 找不到这个 Gemini 桌面会话的数据库。"
         }
-        switch geminiSessionHeld(cid) {
+        switch geminiSessionHeld(cid, fresh: fresh) {
         case true: return "⚠️ 这个 Gemini 会话正在其他客户端打开。请先在那里关闭会话，再重试发送。"
         case false: return nil
         default: return "⚠️ 无法确认这个 Gemini 会话是否由其他客户端持有，请稍后重试。"

@@ -18,6 +18,11 @@ final class BrowserWebView: WKWebView {
     override var mouseDownCanMoveWindow: Bool { false }
 }
 
+/// 剪贴板里访达复制的文件路径（只认文件 URL；文字、截图数据不算）。⌘V 时用（MainMenu.swift 的 pasteOrAttach）。
+func pastedFilePaths(_ board: NSPasteboard) -> [String] {
+    (board.readObjects(forClasses: [NSURL.self], options: [.urlReadingFileURLsOnly: true]) as? [URL] ?? []).map(\.path)
+}
+
 final class HubWebView: WKWebView {
     /// 从访达拖进来的文件交给网页插入路径；不交给 WebKit，否则它会直接打开文件、把整个界面换掉。
     var onFileDrop: (([String]) -> Void)?

@@ -32,6 +32,8 @@ function prewarm(id, typing = false) {
   warmAt = Date.now();
   postNative('prewarmAgent', req);
 }
+/** 发出了一句：原生会取走预热好的进程（Prewarm.swift 的 takeWarm），去重记号作废，答完后的下一次预热要照常发。 */
+function noteSent() { warmSig = ''; }
 
 // ===== 用户消息上的「编辑」：把这句话放回输入框，改了再发 =====
 function addEditButton(div, id, text) {
@@ -206,7 +208,7 @@ els.input.addEventListener('blur', () => setTimeout(closeSuggest, 150));
 // ===== 内置浏览器工具的开关（权限菜单里；三位共用） =====
 const browserToolsOn = () => lsGet('browser_tools', 'on') !== 'off';
 
-// ===== 图片附件：粘贴的截图、拖进来的图片附在输入框上面，发送时作为真正的图片交给模型 =====
+// ===== 附件：粘贴的截图、拖进来 / 粘贴 / 📎 选的文件附在输入框上面。图片发送时作为真正的图片交给模型，其他文件把路径附在话后面 =====
 const ATTACH_IMAGE_RE = /\.(png|jpe?g|gif|webp|heic|heif|bmp|tiff?)$/i;
 let lastPastedThumb = '';
 
@@ -231,14 +233,26 @@ function renderAttachments() {
     chip.className = 'attach-chip';
     chip.title = a.path;
     chip.innerHTML = (a.thumb ? '<img class="attach-thumb" alt="">' : `<span class="attach-icon">${UI.file}</span>`)
-      + '<span class="attach-name"></span><button class="attach-x" title="不发这张"></button>';
+      + '<span class="attach-name"></span><button class="attach-x" title="不发这个"></button>';
     if (a.thumb) chip.querySelector('img').src = a.thumb;
     chip.querySelector('.attach-name').textContent = baseName(a.path);
     chip.querySelector('.attach-x').innerHTML = UI.close;
-    chip.querySelector('.attach-x').addEventListener('click', () => { list.splice(i, 1); renderAttachments(); updateSendUI(); });
+    chip.querySelector('.attach-x').addEventListener('click', () => { list.splice(i, 1); saveAttachments(active); renderAttachments(); updateSendUI(); });
     row.appendChild(chip);
   });
 }
+
+// 附件路径跟草稿一样存在本地：不发送就重开 App，话和附件都还在。
+// 粘贴截图的缩略图是整张图的 data URL，太大不存，重开后那张显示成文件图标。
+function saveAttachments(id) {
+  const paths = (S[id].attach || []).map(a => a.path);
+  lsSet(`${id}_attach`, paths.length ? JSON.stringify(paths) : '');
+}
+function loadAttachments(id) {
+  const paths = lsJson(`${id}_attach`, []);
+  S[id].attach = Array.isArray(paths) ? paths.filter(p => typeof p === 'string' && p).slice(0, 8).map(path => ({ path, thumb: '' })) : [];
+}
+ALL_AGENT_IDS.forEach(loadAttachments);
 
 function addAttachments(id, paths, pasted) {
   const st = S[id];
@@ -246,14 +260,29 @@ function addAttachments(id, paths, pasted) {
   paths.forEach(p => { if (!st.attach.some(a => a.path === p)) st.attach.push({ path: p, thumb: pasted ? lastPastedThumb : '' }); });
   lastPastedThumb = '';
   st.attach = st.attach.slice(0, 8);
+  saveAttachments(id);
   if (id === active) { renderAttachments(); els.input.focus(); }
-  pets[id].say(pasted ? '截图附上了，发送时一起给它 📎' : `附上了 ${paths.length} 张图片 📎`, 2000);
+  // 最多 8 个：只对真正在附件栏里的报「附上了」，被上限挤掉的明说，免得以为都会发出去
+  const uniq = [...new Set(paths)], kept = uniq.filter(p => st.attach.some(a => a.path === p)), missed = uniq.length - kept.length;
+  const pics = kept.filter(p => ATTACH_IMAGE_RE.test(p)).length, files = kept.length - pics;
+  const ok = !kept.length ? '' : pasted && !files ? '截图附上了，发送时一起给它' : `附上了 ${[pics && pics + ' 张图片', files && files + ' 个文件'].filter(Boolean).join('、')}`;
+  const over = missed ? `有 ${missed} 个没附上（最多 8 个）` : '';
+  pets[id].say([ok, over].filter(Boolean).join('，') + (ok ? ' 📎' : ''), missed ? 3000 : 2000);
 }
 
-/** 发送时取走附着的图片（路径）。 */
+/** 发送前把附件分开：图片作为真正的图片交给模型；其他文件把完整路径附在话后面（每个一行），CLI 按路径自己读。 */
+function attachmentsForSend(text, paths) {
+  const images = paths.filter(p => ATTACH_IMAGE_RE.test(p)), files = paths.filter(p => !ATTACH_IMAGE_RE.test(p));
+  if (!files.length) return { text, images };
+  const block = '附件：\n' + files.join('\n');
+  return { text: text ? text + '\n\n' + block : block, images };
+}
+
+/** 发送时取走附着的图片和文件（路径）。 */
 function takeAttachments(id) {
   const list = (S[id].attach || []).map(a => a.path);
   S[id].attach = [];
+  saveAttachments(id);
   if (id === active) renderAttachments();
   return list;
 }
@@ -336,3 +365,8 @@ function browsePrompts(id, dir) {
 // 切到另一位时，附件栏跟着换成那一位的
 const baseRenderComposer = renderComposer;
 renderComposer = function () { closeSuggest(); baseRenderComposer(); renderAttachments(); };
+
+// 📎：系统的选文件窗口，可以多选（Bridge.swift 的 pickAttachments），选好的走 onFilesDropped
+const attachBtn = document.getElementById('attach-btn');
+attachBtn.innerHTML = UI.clip;
+attachBtn.addEventListener('click', () => postNative('pickAttachments'));

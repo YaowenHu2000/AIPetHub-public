@@ -7,7 +7,9 @@ func testLiveInitialization() {
     let fm = FileManager.default
     try! fm.createDirectory(atPath: root, withIntermediateDirectories: true)
     defer { try? fm.removeItem(atPath: root) }
-    func wait(_ condition: () -> Bool, timeout: Double = 5) -> Bool {
+    // 等的都是假 CLI（Python）真的起来、握手、退出这类会发生的事，条件一成立就往下走，期限只防卡死。
+    // 机器很忙时光是起一个 Python 就可能要好几秒，所以期限给足；正常情况下用时不变。
+    func wait(_ condition: () -> Bool, timeout: Double = 30) -> Bool {
         let end = Date().addingTimeInterval(timeout)
         while !condition(), Date() < end { Thread.sleep(forTimeInterval: 0.01) }
         return condition()
@@ -47,7 +49,8 @@ func testLiveInitialization() {
         }
         inspect(app, req, snapshot, methods, current, ended)
         if !ended() { app.cancel(agent: agent, reqId: req.reqId) }
-        check(done.wait(timeout: .now() + 7) == .success, "\(agent)/\(mode) 本次进程完整收尾")
+        // 前面的检查失败时才会走到上面的停止：交互式进程先请它自己停，4 秒后才强制结束，期限要比这段长出余量。
+        check(done.wait(timeout: .now() + 30) == .success, "\(agent)/\(mode) 本次进程完整收尾")
         let records = ((try? String(contentsOfFile: path + ".log", encoding: .utf8)) ?? "").split(separator: "\n").compactMap { app.jsonObject(String($0)) }
         let pids = Set(records.compactMap { ($0["pid"] as? NSNumber)?.int32Value })
         check(wait { pids.allSatisfy { kill($0, 0) != 0 } }, "\(agent)/\(mode) 没有遗留本次假 CLI")

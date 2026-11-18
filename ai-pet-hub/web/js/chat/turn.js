@@ -204,31 +204,11 @@ document.addEventListener('click', e => {
   }
 }, true);
 
-// 从访达拖进窗口的文件：把路径插到输入框（含空格的路径加引号），CLI 可以直接读
+// 拖进来、⌘V 粘贴（访达里复制的文件）、📎 选的文件：都附在输入框上面（composer.js）。
+// 图片发送时作为真正的图片交给模型，其他文件把路径附在话后面，CLI 自己去读（用户 2026-11-18 要能传 zip 这类文件）。
 window.onFilesDropped = data => {
-  let paths = Array.isArray(data.paths) ? data.paths : [];
-  // 图片不插路径：附在输入框上面，发送时作为真正的图片交给模型（composer.js）
-  const imgs = paths.filter(p => ATTACH_IMAGE_RE.test(p));
-  if (imgs.length) {
-    addAttachments(active, imgs, data.pasted);
-    paths = paths.filter(p => !ATTACH_IMAGE_RE.test(p));
-  }
-  if (!paths.length) return;
-  const text = paths.map(p => (/\s/.test(p) ? `"${p}"` : p)).join(' ');
-  const el = els.input;
-  const focused = document.activeElement === el;
-  const a = focused ? el.selectionStart : el.value.length;
-  const b = focused ? el.selectionEnd : el.value.length;
-  const before = el.value.slice(0, a);
-  const after = el.value.slice(b);
-  const lead = before && !/\s$/.test(before) ? ' ' : '';
-  const tail = after && !/^\s/.test(after) ? ' ' : '';
-  el.value = before + lead + text + tail + after;
-  setDraft(active, el.value);
-  el.selectionStart = el.selectionEnd = (before + lead + text).length;
-  el.focus();
-  autosize();
-  pets[active].say(data.pasted ? '截图已存成文件，路径放进输入框了 📎' : paths.length > 1 ? `已添加 ${paths.length} 个文件路径 📎` : '已添加文件路径 📎', 2000);
+  const paths = Array.isArray(data.paths) ? data.paths.filter(p => typeof p === 'string' && p) : [];
+  if (paths.length) addAttachments(active, paths, data.pasted);
 };
 
 // 粘贴截图（只有图片、没有文字时）：交给原生存成文件，再把路径插进输入框；有文字就照常粘贴文字

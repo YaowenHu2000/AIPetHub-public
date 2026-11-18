@@ -16,9 +16,11 @@ struct TestHooks {
     // 文档预览的转换不经过 AppDelegate，所以这两个是全局的
     static var quickLookExecutable: String?        // 冒充 qlmanage
     static var quickLookTimeout: TimeInterval?     // 把 60 秒的转换期限调短
+    static var quickLookStarted: (() -> Void)?     // 转换已启动、期限还没开始算：等假转换器把进程树建好，机器再忙也不会还没起来就超时
     static var chatThumbnailRequested: (() -> Void)?  // 证明搜索只检查图片标签，不走缩略图
     static var conversationSearchDiskRoot: URL?       // 跨进程性能测量也只能指定临时缓存目录
     static var conversationSearchDiskWillWrite: ((String) -> Void)?  // 卡住后台写盘，验证搜索不等待它
+    static var dshAttachmentRoot: String?             // dsh 图片附件目录换成临时目录（解析历史不经过 AppDelegate），不读真实的 ~/.dsh
 
     static var defaultConversationSearchDiskRoot: URL {
         if let root = conversationSearchDiskRoot { return root }
@@ -44,10 +46,12 @@ struct TestHooks {
     var codexProjectionRead: (() -> Void)?         // 卡在条目和投影游标之间，验证两者属于同一 SQLite 读取快照
     var codexEnvironment: [String: String]?       // 用临时 CODEX_HOME 隔离真实历史，默认沿用 App 的环境
     // 离线、窗口测试和随后的会话清理可以共用临时 Gemini 目录，避免读取真实桌面历史。
+    var geminiProbeTTL: TimeInterval?              // Gemini 进程扫描结果复用多久（默认 2 秒）；测续接逻辑的测试设 0，每次现查
     var geminiCliDir: String? = (selfTest || UITest.active) ? ProcessInfo.processInfo.environment["AIPETHUB_TEST_GEMINI_CLI_DIR"] : nil
     var geminiDesktopRunning: (() -> Bool?)?       // 模拟当前用户的桌面进程查询，返回 nil 表示查询失败
     var cliExecutable: String?                     // 冒充 claude / codex / agy / zstd 的假 CLI
     var toolTimeout: TimeInterval?                 // 把辅助命令（runTool）的期限调短
+    var toolStarted: (() -> Void)?                 // 辅助命令已启动、还没开始等：卡在这里期限照走，放开时已过期就立即结束整棵树
     var terminationReply: NSApplication.ModalResponse?   // 退出确认框：不弹窗，直接当作点了哪个按钮
     var browserJobLifetime: TimeInterval?          // 浏览器工具的结果没人领时多久释放（平时 60 秒）
     var usageStore: (([String: Any]) -> Void)?     // 用量本来要写进 UserDefaults 的那份，交给测试看

@@ -50,8 +50,8 @@ extension AppDelegate {
         DispatchQueue.global(qos: .utility).async {
             let live: (status: String, name: String)?
             if agent == "claude" { live = self.claudeLiveElsewhere(cid) }
-            else if self.geminiDesktopReadOnly(cid) { live = ("readOnly", "Antigravity") }
-            else { live = self.geminiSessionHeld(cid) == true ? ("idle", "agy") : nil }
+            else if self.geminiDesktopReadOnly(cid, fresh: false) { live = ("readOnly", "Antigravity") }
+            else { live = self.geminiSessionHeld(cid, fresh: false) == true ? ("idle", "agy") : nil }
             DispatchQueue.main.async {
                 self.sendToJS("onSessionLive", ["agent": agent, "conversationId": cid, "live": live != nil,
                                                 "status": live?.status ?? "", "name": live?.name ?? ""])

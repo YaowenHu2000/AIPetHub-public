@@ -2,6 +2,17 @@
 import Cocoa
 
 extension AppDelegate {
+    /// ⌘V：剪贴板里是访达复制的文件、焦点又在主界面的网页里时，当附件交给网页（和拖进来一样）；
+    /// 否则（文字、截图、内置浏览器里）照常交给系统粘贴。
+    @objc func pasteOrAttach(_ sender: Any?) {
+        let files = pastedFilePaths(.general)
+        if !files.isEmpty, let responder = window.firstResponder as? NSView, responder === webView || responder.isDescendant(of: webView) {
+            sendToJS("onFilesDropped", ["paths": files])
+            return
+        }
+        NSApp.sendAction(#selector(NSText.paste(_:)), to: nil, from: sender)
+    }
+
     func setupMainMenu() {
         let main = NSMenu()
 
@@ -26,7 +37,7 @@ extension AppDelegate {
         edit.addItem(.separator())
         edit.addItem(withTitle: "剪切", action: #selector(NSText.cut(_:)), keyEquivalent: "x")
         edit.addItem(withTitle: "拷贝", action: #selector(NSText.copy(_:)), keyEquivalent: "c")
-        edit.addItem(withTitle: "粘贴", action: #selector(NSText.paste(_:)), keyEquivalent: "v")
+        edit.addItem(withTitle: "粘贴", action: #selector(pasteOrAttach(_:)), keyEquivalent: "v").target = self
         edit.addItem(withTitle: "全选", action: #selector(NSText.selectAll(_:)), keyEquivalent: "a")
         editItem.submenu = edit
 

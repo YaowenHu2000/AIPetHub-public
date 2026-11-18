@@ -319,7 +319,7 @@ Each mascot on the right-hand stage reacts in real time to the live event stream
 | Full-text history search | <kbd>⌘F</kbd> (reopens the sidebar if hidden and streams visible-text matches across all agents) |
 | Send / insert newline | <kbd>Enter</kbd> to send &middot; <kbd>Shift</kbd>+<kbd>Enter</kbd> for a newline |
 | Browse sent prompts | <kbd>↑</kbd> / <kbd>↓</kbd> when the input box is empty |
-| Attach files or images | Drag files into the window, paste screenshots from clipboard, or type <kbd>@</kbd> to fuzzy-find workspace files |
+| Attach files or images | Drag files into the window, copy them in Finder and paste with <kbd>⌘</kbd><kbd>V</kbd>, or click 📎; paste screenshots from the clipboard; type <kbd>@</kbd> to fuzzy-find workspace files. Images go to the model as images, other files (zip, PDF, code…) are passed by path for the CLI to read |
 | Run CLI slash commands | Type <kbd>/</kbd> in the input box |
 | Add / remove agents | Gear icon on any mascot card &rarr; **Remove** &middot; `+` button at the bottom of the stage to add |
 | Adjust UI font size | <kbd>⌘+</kbd> / <kbd>⌘-</kbd> / <kbd>⌘0</kbd> |

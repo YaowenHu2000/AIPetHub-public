@@ -166,9 +166,9 @@ final class ClaudeStreamParser {
                 let ok = r == "success"
                 if turn.step("compact") == nil { turn.add(makeStep("tool", "压缩上下文", status: ok ? "ok" : "error"), key: "compact") }
                 else { turn.update("compact", ["status": ok ? "ok" : "error"]) }
-                compactNote = ok ? "前面的对话已经压缩成摘要，腾出了上下文空间。" : claudeCompactProblem(obj["compact_error"] as? String ?? "")
+                compactNote = ok ? claudeCompactDoneNote : claudeCompactProblem(obj["compact_error"] as? String ?? "")
             } else if sub == "compact_boundary", compactNote == nil {
-                compactNote = "前面的对话已经压缩成摘要，腾出了上下文空间。"
+                compactNote = claudeCompactDoneNote
             }
         default:
             break
@@ -211,6 +211,9 @@ final class ClaudeStreamParser {
         else { turn.update(key, ["detail": text, "status": status]) }
     }
 }
+
+/// 压缩成功后给人看的一句话：实时（这里）和重开历史（ClaudeHistory.swift）共用，两边显示的一样。
+let claudeCompactDoneNote = "前面的对话已经压缩成摘要，腾出了上下文空间。"
 
 /// /compact 没压成的原因 → 给人看的一句话。
 func claudeCompactProblem(_ error: String) -> String {

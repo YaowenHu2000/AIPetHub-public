@@ -124,7 +124,10 @@ def run():
         executable = os.environ.get('AIPETHUB_TEST_APP') or str(ROOT / 'build/AIPetHub.app/Contents/MacOS/AIPetHub')
         if executable.endswith('.app'):
             executable += '/Contents/MacOS/AIPetHub'
-        env = dict(os.environ, AIPETHUB_UITEST_REAL=os.environ.get('REAL', ''))
+        # 测试窗口和从程序坞打开的 App 一样，不带上发起测试的那个会话的代理和会话变量（见 build.sh 的安装一节）
+        host = ('HTTP_PROXY', 'HTTPS_PROXY', 'http_proxy', 'https_proxy', 'NODE_EXTRA_CA_CERTS', 'CLAUDECODE', 'CLAUDE_CONFIG_DIR')
+        env = {k: v for k, v in os.environ.items() if k not in host and not k.startswith(('RECLAUDE_', 'CLAUDE_CODE_', 'CLAUDE_AGENT_SDK_', 'ANTHROPIC_', 'ANTIGRAVITY_', 'AGY_'))}
+        env['AIPETHUB_UITEST_REAL'] = os.environ.get('REAL', '')
         with (directory / 'app.log').open('w') as log:
             app = subprocess.Popen([executable, '--uitest', str(directory / 'run.js'), str(directory / 'raw-result.json')], stdout=log, stderr=subprocess.STDOUT, env=env)
             owned.add(app.pid)
