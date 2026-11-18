@@ -187,6 +187,23 @@ func dshUserText(_ data: [String: Any]) -> String {
     trimmed((data["content"] as? [[String: Any]] ?? []).filter { $0["type"] as? String == "text" }.compactMap { $0["text"] as? String }.joined(separator: "\n"))
 }
 
+/// dsh 的回合边界也在历史事件中。分页窗口从末尾读取，因此不必等到最早一页。
+func dshLastTurn(_ rows: [[String: Any]]) -> HistoryTurnActivity? {
+    var latest = 0.0
+    for row in rows.reversed() {
+        guard let event = row["event"] as? [String: Any] else { continue }
+        let at = ((event["time"] as? NSNumber)?.doubleValue ?? 0) / 1000
+        switch event["type"] as? String {
+        case "turn/end": return HistoryTurnActivity(running: false, startedAt: 0, updatedAt: at)
+        case "turn/start": return HistoryTurnActivity(running: true, startedAt: at, updatedAt: max(at, latest))
+        case "user/message", "assistant/chunk", "assistant/message", "tool/call", "tool/result":
+            latest = max(latest, at)
+        default: continue
+        }
+    }
+    return nil
+}
+
 /// 历史会话的全部事件（[{ event, view }]，从早到晚）→ 一问一答的回合，结构和另外几位的一样。
 /// 用户自己发的话（source.kind == "user"）开一轮；插件塞进去的上下文说明、工具结果也是 user 角色，不算。
 func dshTurns(_ rows: [[String: Any]]) -> [[String: Any]] {
@@ -195,7 +212,16 @@ func dshTurns(_ rows: [[String: Any]]) -> [[String: Any]] {
     var startAt: Double?, endAt: Double?
     func flush() {
         guard let p = parser else { return }
-        var bot = p.turn.finish(finalText: p.response)
+        // turn/start 会早于本轮 user/message；这段开场和纯元数据都不是上一轮未完成的回答。
+        if p.turn.isEmpty && p.ended == nil && p.failure.isEmpty && !p.started {
+            parser = nil; startAt = nil; endAt = nil
+            return
+        }
+        let kind = p.ended?.kind
+        let outcome = kind == "completed" ? "completed" : (kind == "aborted" ? "interrupted" : (kind == "error" || !p.failure.isEmpty ? "failed" : "incomplete"))
+        let message = trimmed(p.ended?.message)
+        let error = outcome == "failed" ? dshReadableError(message.isEmpty ? p.failure : message, code: p.ended?.code ?? "") : nil
+        var bot = p.turn.finish(finalText: p.response, outcome: outcome, error: error)
         if trimmed(bot["text"] as? String).isEmpty, let e = p.ended, e.kind == "error" { bot["text"] = "⚠️ " + dshReadableError(e.message, code: e.code) }
         if let s = startAt, let e = endAt, e > s { bot["duration"] = (e - s) / 1000 }
         if !trimmed(bot["text"] as? String).isEmpty || !((bot["steps"] as? [Any]) ?? []).isEmpty {
@@ -210,6 +236,7 @@ func dshTurns(_ rows: [[String: Any]]) -> [[String: Any]] {
         guard let event = row["event"] as? [String: Any] else { continue }
         let data = event["data"] as? [String: Any] ?? [:]
         let time = (event["time"] as? NSNumber)?.doubleValue
+        if event["type"] as? String == "turn/start", parser?.ended != nil { flush() }
         if event["type"] as? String == "user/message" {
             let source = data["source"] as? [String: Any] ?? [:]
             guard source["kind"] as? String == "user" else { continue }
@@ -218,7 +245,9 @@ func dshTurns(_ rows: [[String: Any]]) -> [[String: Any]] {
                 p.turn.add(makeStep("user", "你补充说", detail: dshUserText(data)))
                 continue
             }
-            flush()
+            // start 先于提问落盘。在第一步助手输出到来前，这个空解析器就是本轮的运行标题。
+            let opening = parser.map { $0.started && $0.turn.isEmpty && $0.ended == nil && $0.failure.isEmpty } ?? false
+            if !opening { flush() }
             let text = dshUserText(data)
             if !text.isEmpty { out.append(["role": "user", "text": text]) }
             startAt = time

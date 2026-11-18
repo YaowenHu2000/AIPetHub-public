@@ -5,20 +5,39 @@
 // ---------- 改动：把 diff 逐段定位回当前文件，得到每一行的着色 ----------
 function parseHunks(diff) {
   const hunks = [];
-  let cur = null;
+  let cur = null, oldLeft = 0, newLeft = 0;
   for (const raw of (diff || '').split('\n')) {
     const line = raw.replace(/\r$/, '');
-    if (line.startsWith('@@')) {
-      const m = line.match(/^@@ -\d+(?:,\d+)? \+(\d+)/);
-      cur = { newStart: m ? Number(m[1]) : null, lines: [] };
-      hunks.push(cur);
-      continue;
+    if (line === '' || line.startsWith('\\ No newline at end of file')) continue;
+    // hunk 的行数没消费完以前，+++ / --- 的后两位也只是正文。
+    const inside = oldLeft > 0 || newLeft > 0;
+    if (!inside || (cur?.newStart === null && line.startsWith('@@'))) {
+      const m = line.match(/^@@ -\d+(?:,(\d+))? \+(\d+)(?:,(\d+))? @@/);
+      if (m) {
+        oldLeft = m[1] === undefined ? 1 : Number(m[1]);
+        newLeft = m[3] === undefined ? 1 : Number(m[3]);
+        cur = { newStart: Number(m[2]), lines: [] };
+        hunks.push(cur);
+        continue;
+      }
+      if (line.startsWith('@@')) {
+        // CLI 的内容替换只有裸 @@，没有行号；仍按它分段，逐段定位。
+        oldLeft = newLeft = Infinity;
+        cur = { newStart: null, lines: [] };
+        hunks.push(cur);
+        continue;
+      }
+      if (line.startsWith('+++') || line.startsWith('---') || line.startsWith('diff ')) { cur = null; continue; }
+      if (cur && cur.newStart !== null) continue;
     }
-    if (line.startsWith('+++') || line.startsWith('---') || line.startsWith('\\')) continue;
-    if (!cur) { cur = { newStart: null, lines: [] }; hunks.push(cur); }
     const t = line[0];
-    if (t === '+' || t === '-' || t === ' ') cur.lines.push({ t, s: line.slice(1) });
-    else if (line === '' && cur.newStart !== null) cur.lines.push({ t: ' ', s: '' });
+    if (t !== '+' && t !== '-' && t !== ' ') continue;
+    if (!cur) { cur = { newStart: null, lines: [] }; hunks.push(cur); }
+    cur.lines.push({ t, s: line.slice(1) });
+    if (inside) {
+      if (t !== '+') oldLeft--;
+      if (t !== '-') newLeft--;
+    }
   }
   return hunks.filter(h => h.lines.length);
 }

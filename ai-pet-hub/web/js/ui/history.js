@@ -1,95 +1,6 @@
 'use strict';
 
-// 左栏：三位的历史会话（按工作空间分组）、搜索、删除会话和项目、打开会话、新对话。
-
-// ===== 删除项目：先统计这个工作空间里的全部会话（列表只显示最近 50 条），确认后一起删除 =====
-let projectDelete = null;   // { id, key, anchor, ids }
-
-function askDeleteProject(id, key) {
-  projectDelete = { id, key, anchor: pop.anchor, ids: null };
-  pop.render = renderProjectConfirm;
-  pop.cls = 'confirm';
-  renderPopover();
-  positionPopover();
-  if (hasBridge()) postNative('projectConversations', { agent: id, workspace: key });
-  else window.onProjectConversations({ agent: id, workspace: key, ids: (S[id].conversations || []).filter(c => wsKey(c.cwd) === key).map(c => c.id) });
-}
-
-function renderProjectConfirm(box) {
-  const p = projectDelete;
-  const c = AGENTS[p.id];
-  const wrap = document.createElement('div');
-  wrap.className = 'confirm-box';
-  const title = document.createElement('div');
-  title.className = 'confirm-title';
-  title.textContent = `删除项目「${baseName(p.key)}」？`;
-  const text = document.createElement('div');
-  text.className = 'confirm-text';
-  const where = p.id === 'gpt' ? '会归档，可以在 Codex 中恢复' : '会移到废纸篓，可以从废纸篓恢复';
-  text.textContent = p.ids === null ? '正在统计这个项目里的会话…'
-    : p.ids.length ? `${c.name}在这里的 ${p.ids.length} 个会话${where}。文件夹本身不会删除。`
-      : '这里没有会话，只会从列表中去掉。文件夹本身不会删除。';
-  const actions = document.createElement('div');
-  actions.className = 'confirm-actions';
-  const cancel = document.createElement('button');
-  cancel.className = 'confirm-btn';
-  cancel.textContent = '取消';
-  cancel.addEventListener('click', e => { e.stopPropagation(); closePopover(); });
-  const ok = document.createElement('button');
-  ok.className = 'confirm-btn danger';
-  ok.textContent = '删除';
-  ok.disabled = p.ids === null;
-  ok.addEventListener('click', e => { e.stopPropagation(); confirmDeleteProject(); });
-  actions.append(cancel, ok);
-  wrap.append(title, text, actions);
-  box.appendChild(wrap);
-}
-
-window.onProjectConversations = data => {
-  const p = projectDelete;
-  if (!p || !pop || pop.anchor !== p.anchor || data.agent !== p.id || data.workspace !== p.key) return;
-  p.ids = Array.isArray(data.ids) ? data.ids : [];
-  renderPopover();
-  positionPopover();
-};
-
-function confirmDeleteProject() {
-  const p = projectDelete;
-  closePopover();
-  if (!p || p.ids === null) return;
-  const st = S[p.id];
-  // 正在回答的会话在这个项目里时先不删
-  if ([...st.runs.values()].some(r => p.ids.includes(r.view) || (r.view.startsWith('new:') && wsKey(r.workspace) === p.key))) {
-    pets[p.id].say('正在回答这个项目里的会话，先等等～', 2200);
-    return;
-  }
-  if (!p.ids.length) { forgetWorkspace(p.id, p.key); pets[p.id].say(`已删除项目「${baseName(p.key)}」🗑️`, 1800); return; }
-  projectDelete = { ...p, deleting: true };
-  if (hasBridge()) postNative('deleteConversations', { agent: p.id, conversationIds: p.ids });
-  else window.onConversationsDeleted({ agent: p.id, deleted: p.ids, failed: [] });
-}
-
-window.onConversationsDeleted = data => {
-  const id = data.agent;
-  const st = S[id];
-  if (!st) return;
-  const deleted = Array.isArray(data.deleted) ? data.deleted : [];
-  const failed = Array.isArray(data.failed) ? data.failed : [];
-  if (st.conversations) st.conversations = st.conversations.filter(c => !deleted.includes(c.id));
-  if (deleted.includes(st.conversationId)) {
-    st.conversationId = '';
-    st.loadedId = '';
-    lsSet(`${id}_conv`, '');
-    showEmpty(id);
-  }
-  const p = projectDelete;
-  if (p && p.deleting && p.id === id) {
-    projectDelete = null;
-    forgetWorkspace(id, p.key);
-    pets[id].say(failed.length ? `有 ${failed.length} 个会话没删掉…` : `已删除项目「${baseName(p.key)}」（${deleted.length} 个会话）🗑️`, 2200);
-  } else renderHistory(id);
-  if (id === active) renderHeader();
-};
+// 左栏：三位的历史会话（按工作空间分组）、搜索、删除会话、打开会话、新对话（删除整个项目在 project-delete.js）。
 
 function openPetSettings(id, anchor) {
   openPopover(anchor, () => {
@@ -174,17 +85,29 @@ function buildHistorySection(id) {
   return sec;
 }
 
+// 「任务会话」：别的智能体或脚本派出去的一次性会话（codex exec、别的工具起的 claude -p，原生在列表项上标 task），
+// 以及工作目录在系统临时文件夹里的，统一收进历史栏最底下这一组，不和真实项目混在一起。只改分组，续聊仍在原目录。
+// 用户可以在会话上右键手动移进移出（taskOverrides，记在本机）。
+const TASK_GROUP = '\u0001tasks';
+const isTempPath = p => /^(\/private)?\/(tmp|var\/folders)\//.test(p || '');
+function isTaskConversation(id, it) {
+  const o = S[id].taskOverrides?.[it.id];
+  return o != null ? !!o : (!!it.task || isTempPath(it.cwd));
+}
+const groupKeyOf = (id, it) => isTaskConversation(id, it) ? TASK_GROUP : (S[id].projectlessIds?.has(it.id) ? '' : wsKey(it.cwd));
+
 /** filtered：搜索时只按搜到的会话分组，不加入空的工作空间和「新对话」那一组。 */
 function buildGroups(id, items = S[id].conversations, filtered = false) {
   const st = S[id];
   const map = new Map();
   items.forEach(it => {
-    const key = wsKey(it.cwd);
+    const key = groupKeyOf(id, it);
     if (!map.has(key)) map.set(key, []);
     map.get(key).push(it);
   });
   const groups = [...map.entries()].map(([key, list]) => ({ key, list, latest: Math.max(...list.map(i => i.timestamp || 0)) }));
-  if (filtered) return groups.sort((a, b) => (a.key === '') - (b.key === '') || b.latest - a.latest);
+  const order = (a, b) => (a.key === TASK_GROUP) - (b.key === TASK_GROUP) || (a.key === '') - (b.key === '') || b.latest - a.latest;
+  if (filtered) return groups.sort(order);
   // 用 📁 打开、还没有会话的工作空间
   st.addedWs.forEach(w => {
     if (map.has(w.path)) return;
@@ -199,12 +122,12 @@ function buildGroups(id, items = S[id].conversations, filtered = false) {
     map.set(k, []);
     groups.push({ key: k, list: [], latest: Date.now() / 1000 });
   });
-  return groups.sort((a, b) => (a.key === '') - (b.key === '') || b.latest - a.latest);   // 未绑定的放最后
+  return groups.sort(order);   // 未绑定的放在项目后面，任务会话放最后
 }
 
 function isCollapsed(id, key, index) {
   const state = S[id].groupState;
-  return Object.prototype.hasOwnProperty.call(state, key) ? state[key] === 1 : index >= 3;
+  return Object.prototype.hasOwnProperty.call(state, key) ? state[key] === 1 : (key === TASK_GROUP || index >= 3);   // 任务会话默认折叠
 }
 
 function renderAllHistory() { AGENT_IDS.forEach(renderHistory); }
@@ -226,6 +149,9 @@ window.onConversationsSearched = data => {
   if (!st || data.query !== histQuery) return;   // 已经改了搜索词
   st.bodyQuery = data.query;
   st.bodyHits = new Set(data.ids || []);
+  st.bodyItems = Array.isArray(data.items) ? data.items : [];
+  st.bodyUnavailable = data.unavailable || '';
+  st.bodyComplete = data.complete !== false;
   renderHistory(data.agent);
 };
 document.querySelector('.search-clear').addEventListener('click', e => {
@@ -248,12 +174,30 @@ function renderHistory(id) {
   list.innerHTML = '';
   if (st.conversations === null) { list.innerHTML = '<div class="hist-empty">正在读取历史会话…</div>'; return; }
   const q = histQuery;
-  const all = [...liveItems(id), ...st.conversations];   // 刚建好、列表里还没有的正在回答的会话放在最前
+  const listed = [...liveItems(id), ...st.conversations];
+  const listedIds = new Set(listed.map(it => it.id));
+  const extra = st.bodyQuery === q ? (st.bodyItems || []).filter(it => !listedIds.has(it.id)) : [];
+  const all = [...listed, ...extra];   // 刚建好、列表里还没有的正在回答的会话放在最前
   // 标题、工作空间里有，或者正文里有（原生在会话记录里找，结果稍后到：onConversationsSearched）
   const inBody = st.bodyQuery === q ? st.bodyHits : null;
   const items = q ? all.filter(it => (it.title || '').toLowerCase().includes(q) || wsKey(it.cwd).toLowerCase().includes(q) || inBody?.has(it.id)) : all;
   const groups = buildGroups(id, items, !!q);
-  if (!groups.length) { list.innerHTML = `<div class="hist-empty">${q ? '没有匹配的会话' : '暂无历史会话'}</div>`; return; }
+  const searchStatus = q.length >= 2 && st.bodyQuery === q
+    ? (st.bodyUnavailable || (!st.bodyComplete ? '正在搜索正文…' : '')) : '';
+  if (searchStatus) {
+    const note = elSpan('hist-empty', searchStatus);
+    note.dataset.k = 'search-status';
+    list.appendChild(note);
+  }
+  if (!groups.length) {
+    if (!searchStatus) list.innerHTML = `<div class="hist-empty">${q ? '没有匹配的会话' : '暂无历史会话'}</div>`;
+    return;
+  }
+
+  // 不同路径的最后一级同名（如两个 …/ai-pet-hub）时往上多显示一级，否则看起来像同一个项目被拆成两组
+  const nameCount = new Map();
+  groups.forEach(g => { if (g.key && g.key !== TASK_GROUP) nameCount.set(baseName(g.key), (nameCount.get(baseName(g.key)) || 0) + 1); });
+  const groupName = key => nameCount.get(baseName(key)) > 1 ? `${baseName(key.replace(/\/+[^/]*\/*$/, '') || '/')}/${baseName(key)}` : baseName(key);
 
   groups.forEach((g, index) => {
     const pendingHere = !q && showsNewChat(id) && g.key === wsKey(st.workspace);   // 「新对话」在这一组
@@ -262,15 +206,17 @@ function renderHistory(id) {
     const head = document.createElement('div');
     head.className = 'grp-head' + (collapsed && hasActive ? ' has-active' : '');
     head.dataset.k = `g:${g.key}`;   // 每一行一个记号：展开 / 折叠时靠它认出「这还是原来那一行」（renderHistorySmooth）
-    head.title = g.key ? prettyPath(g.key) : '未绑定工作空间的会话（在主目录运行）';
+    const isTasks = g.key === TASK_GROUP;
+    head.title = isTasks ? '别的智能体或脚本派出去的一次性会话、临时文件夹里的会话（右键会话可移进移出）'
+      : g.key ? prettyPath(g.key) : '未绑定工作空间的会话（在主目录运行）';
     const icon = document.createElement('span');
     icon.className = 'grp-icon';
     icon.innerHTML = collapsed ? UI.folder : UI.folderOpen;
-    const name = elSpan('grp-name', g.key ? baseName(g.key) : '未绑定工作空间');
+    const name = elSpan('grp-name', isTasks ? '任务会话' : g.key ? groupName(g.key) : '未绑定工作空间');
     const count = elSpan('grp-count', g.list.length ? String(g.list.length) : '');
     head.append(icon, name, count);
     // 悬停显示「⋮」「＋」（参考反重力 Projects）
-    if (g.key) {
+    if (g.key && !isTasks) {
       const more = document.createElement('button');
       more.className = 'icon-btn grp-btn grp-more';
       more.innerHTML = UI.more;
@@ -283,7 +229,7 @@ function renderHistory(id) {
     add.innerHTML = UI.plus;
     add.title = g.key ? `在「${baseName(g.key)}」里开启新对话` : '开启不绑定工作空间的新对话';
     add.addEventListener('click', e => { e.stopPropagation(); startChatIn(id, g.key); });
-    head.appendChild(add);
+    if (!isTasks) head.appendChild(add);   // 任务会话不是一个目录，不在这里开新对话
     head.addEventListener('click', () => {
       st.groupState[g.key] = collapsed ? 0 : 1;
       lsSet(`${id}_groups`, JSON.stringify(st.groupState));
@@ -453,6 +399,20 @@ function conversationRow(id, item) {
     postNative('deleteConversation', { agent: id, conversationId: item.id });
   });
   row.addEventListener('click', () => openConversation(id, item));
+  row.addEventListener('contextmenu', e => {   // 右键：手动移进 / 移出「任务会话」
+    e.preventDefault();
+    const inTasks = isTaskConversation(id, item);
+    openPopover(row, () => [{ items: [{
+      name: inTasks ? '移出任务会话' : '移到任务会话',
+      desc: inTasks ? '放回它所在的项目' : '归进历史栏底部的「任务会话」',
+      onPick: () => {
+        const auto = !!item.task || isTempPath(item.cwd);
+        if (!inTasks === auto) delete st.taskOverrides[item.id]; else st.taskOverrides[item.id] = !inTasks;
+        lsSet(`${id}_task_overrides`, JSON.stringify(st.taskOverrides));
+        renderHistory(id);
+      },
+    }] }], { placement: 'bottom' });
+  });
   row.append(title, time, del);
   return row;
 }
@@ -460,8 +420,10 @@ function conversationRow(id, item) {
 function openConversation(id, item) {
   if (id !== active) setActive(id, false);
   const st = S[id];
-  if (st.conversationId === item.id && st.loadedId === item.id) return;
+  const searching = st.bodyQuery === histQuery && st.bodyHits?.has(item.id);
+  if (st.conversationId === item.id && st.loadedId === item.id && !searching) return;
   st.conversationId = item.id;
+  st.loadedSig = '';
   st.loadedId = null;
   st.pendingTitle = '';
   st.unreadConvs.delete(item.id);
@@ -471,7 +433,9 @@ function openConversation(id, item) {
   renderHistory(id);
   renderHeader();
   updateSendUI();
-  postNative('loadConversation', { agent: id, conversationId: item.id });
+  const hit = st.bodyQuery === histQuery && st.bodyHits?.has(item.id)
+    ? st.bodyItems?.find(it => it.id === item.id) : null;
+  postNative('loadConversation', { agent: id, conversationId: item.id, ...(hit ? { limit: hit.searchLimit } : {}) });
   pets[id].touch();
   pets[id].syncBusyState();
   pets[id].say('已切换历史会话 📜', 1600);

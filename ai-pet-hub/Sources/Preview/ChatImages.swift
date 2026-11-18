@@ -115,6 +115,7 @@ func chatImageData(_ data: Data, maxPixels: Int?) -> [String: Any]? {
 
 /// 内嵌的 base64 图片 → 缩略图。
 func chatThumbnail(base64: String) -> [String: Any]? {
+    TestHooks.chatThumbnailRequested?()
     let key = "b:" + SHA256.hash(data: Data(base64.utf8)).map { String(format: "%02x", $0) }.joined()
     if let hit = thumbCache.get(key) { return hit }
     guard let data = Data(base64Encoded: base64, options: .ignoreUnknownCharacters),
@@ -125,6 +126,8 @@ func chatThumbnail(base64: String) -> [String: Any]? {
 
 /// 本机图片文件 → 缩略图；不是图片或读不到时返回 nil。
 func chatThumbnail(path: String) -> [String: Any]? {
+    TestHooks.chatThumbnailRequested?()
+    let path = (path as NSString).resolvingSymlinksInPath
     guard chatImageExts.contains((path as NSString).pathExtension.lowercased()),
           let attrs = try? FileManager.default.attributesOfItem(atPath: path),
           attrs[.type] as? FileAttributeType == .typeRegular,
@@ -135,6 +138,29 @@ func chatThumbnail(path: String) -> [String: Any]? {
           let thumb = chatImageData(data, maxPixels: thumbMaxPixels) else { return nil }
     thumbCache.set(key, thumb)
     return thumb
+}
+
+/// 搜索只需判断图片是否可读；不缩放、不检查透明像素，也不编码 data URL。
+private func chatImageLabel(_ data: Data) -> [String: Any]? {
+    guard let source = CGImageSourceCreateWithData(data as CFData, [kCGImageSourceShouldCache: false] as CFDictionary),
+          CGImageSourceGetCount(source) > 0,
+          let props = CGImageSourceCopyPropertiesAtIndex(source, 0, nil) as? [CFString: Any],
+          let w = (props[kCGImagePropertyPixelWidth] as? NSNumber)?.intValue, w > 0,
+          let h = (props[kCGImagePropertyPixelHeight] as? NSNumber)?.intValue, h > 0 else { return nil }
+    if webMime(source) != nil, max(w, h) <= thumbMaxPixels, data.count <= 200_000 { return [:] }
+    // 只有尺寸头、像素数据已损坏的文件也可能报出宽高；沿用解码条件，但不生成缩略图。
+    guard CGImageSourceCreateImageAtIndex(source, 0, [kCGImageSourceShouldCache: false] as CFDictionary) != nil else { return nil }
+    return [:]
+}
+
+private func chatImageLabel(path: String) -> [String: Any]? {
+    let target = (path as NSString).resolvingSymlinksInPath
+    guard chatImageExts.contains((target as NSString).pathExtension.lowercased()),
+          let attrs = try? FileManager.default.attributesOfItem(atPath: target),
+          attrs[.type] as? FileAttributeType == .typeRegular,
+          let size = (attrs[.size] as? NSNumber)?.intValue, size > 0, size <= 80_000_000,
+          let data = try? Data(contentsOf: URL(fileURLWithPath: target), options: .alwaysMapped) else { return nil }
+    return chatImageLabel(data)
 }
 
 /// 原图给查看器：太大的（超过 12 MB）缩到长边 4096，免得一次给网页几十 MB。
@@ -196,14 +222,17 @@ func stripCodexAttachmentHeader(_ text: String, images: [[String: Any]]) -> Stri
 }
 
 extension AppDelegate {
-    /// Claude Code 记录里用户亲手附上的图片（消息内容里的 image 块）；工具结果、元信息里的图片不算。
+    /// 普通提问和 queued_command 补充都保存原内容块序号，点原图时才能回到同一块。
     func claudeImageSources(_ obj: [String: Any]) -> [[String: Any]] {
-        guard obj["type"] as? String == "user" else { return [] }
+        let attachment = obj["attachment"] as? [String: Any] ?? [:]
+        let queued = obj["type"] as? String == "attachment" && attachment["type"] as? String == "queued_command"
+        guard obj["type"] as? String == "user" || queued else { return [] }
         for flag in ["isSidechain", "isMeta", "isApiErrorMessage", "isCompactSummary"] where (obj[flag] as? Bool) == true {
             return []
         }
-        if let kind = (obj["origin"] as? [String: Any])?["kind"] as? String, kind != "human" { return [] }
-        guard let blocks = (obj["message"] as? [String: Any])?["content"] as? [[String: Any]] else { return [] }
+        let origin = (queued ? attachment : obj)["origin"] as? [String: Any]
+        if let kind = origin?["kind"] as? String, kind != "human" { return [] }
+        guard let blocks = (queued ? attachment["prompt"] : (obj["message"] as? [String: Any])?["content"]) as? [[String: Any]] else { return [] }
         let uuid = obj["uuid"] as? String ?? ""
         return blocks.enumerated().compactMap { i, b in
             guard b["type"] as? String == "image", let data = (b["source"] as? [String: Any])?["data"] as? String else { return nil }
@@ -211,16 +240,16 @@ extension AppDelegate {
         }
     }
 
-    /// 发给网页前给用户消息配上图片（只处理要显示的那几百条）；解析时记下的原始数据（imageSources）不发出去。
+    /// 普通提问和「你补充说」走同一缩略图 / 原图机制；原始数据（imageSources）不发出去。
     /// ref 是「去哪找原图」：{agent, conversationId, id}，id 在 Claude 是「行 uuid#块序号」，在 Codex 是附图原来的路径。
-    func attachChatImages(_ messages: inout [[String: Any]], payload: [String: Any]) {
+    func attachChatImages(_ messages: inout [[String: Any]], payload: [String: Any], labelsOnly: Bool = false) {
         let base = payload["cwd"] as? String ?? ""
         let agent = payload["agent"] as? String ?? ""
         let cid = payload["conversationId"] as? String ?? ""
         var rollout: [String: String]?   // Codex：有附图文件不在了才去读 rollout
-        for i in messages.indices where messages[i]["role"] as? String == "user" {
-            let sources = messages[i].removeValue(forKey: "imageSources") as? [[String: Any]] ?? []
-            var images = chatImages(sources: sources, text: messages[i]["text"] as? String ?? "", base: base) { path in
+        func attach(_ message: inout [String: Any], textKey: String) {
+            let sources = message.removeValue(forKey: "imageSources") as? [[String: Any]] ?? []
+            var images = chatImages(sources: sources, text: message[textKey] as? String ?? "", base: base, labelsOnly: labelsOnly) { path in
                 guard agent == "gpt" else { return nil }
                 if rollout == nil { rollout = codexRolloutImages(cid: cid) }
                 return rollout?[path]
@@ -229,30 +258,44 @@ extension AppDelegate {
                 guard let id = images[k]["ref"] as? String else { continue }
                 images[k]["ref"] = ["agent": agent, "conversationId": cid, "id": id]
             }
-            if !images.isEmpty { messages[i]["images"] = images }
+            if !images.isEmpty { message["images"] = images }
+        }
+        for i in messages.indices {
+            if messages[i]["role"] as? String == "user" { attach(&messages[i], textKey: "text") }
+            if var steps = messages[i]["steps"] as? [[String: Any]] {
+                for j in steps.indices where steps[j]["kind"] as? String == "user" { attach(&steps[j], textKey: "detail") }
+                messages[i]["steps"] = steps
+            }
         }
     }
 
     /// 一条用户消息的图片：附件在前，然后是文字里写到的（同一个文件只出现一次）。
     /// 每张是 {src, w, h, path?, ref?, name?, match?}；附件文件不在了、也找不回来时是 {missing, path}。
     /// recover：附件文件不在了时，按原路径从会话记录里找回图片（base64）。
-    func chatImages(sources: [[String: Any]], text: String, base: String,
+    func chatImages(sources: [[String: Any]], text: String, base: String, labelsOnly: Bool = false,
                     recover: (String) -> String? = { _ in nil }) -> [[String: Any]] {
+        func local(_ path: String) -> [String: Any]? {
+            labelsOnly ? chatImageLabel(path: path) : chatThumbnail(path: path)
+        }
+        func embedded(_ base64: String) -> [String: Any]? {
+            if !labelsOnly { return chatThumbnail(base64: base64) }
+            return Data(base64Encoded: base64, options: .ignoreUnknownCharacters).flatMap(chatImageLabel)
+        }
         var out: [[String: Any]] = []
         var shown: [String: Int] = [:]   // 路径 → 在 out 里的位置
         for s in sources where out.count < maxImagesPerMessage {
             if let b64 = s["data"] as? String {
-                guard var t = chatThumbnail(base64: b64) else { continue }
+                guard var t = embedded(b64) else { continue }
                 if let ref = s["ref"] { t["ref"] = ref }
                 out.append(t)
             } else if let raw = s["path"] as? String {
                 let path = resolvePath(raw, base: base)
                 guard shown[path] == nil else { continue }
                 shown[path] = out.count
-                if var t = chatThumbnail(path: path) {
+                if var t = local(path) {
                     t["path"] = path
                     out.append(t)
-                } else if let b64 = recover(raw), var t = chatThumbnail(base64: b64) {
+                } else if let b64 = recover(raw), var t = embedded(b64) {
                     t["ref"] = raw
                     t["name"] = fileBaseName(raw)
                     out.append(t)
@@ -267,7 +310,7 @@ extension AppDelegate {
                 if out[k]["match"] == nil, isAttachmentPath(path) { out[k]["match"] = match }
                 continue
             }
-            guard out.count < maxImagesPerMessage, var t = chatThumbnail(path: path) else { continue }
+            guard out.count < maxImagesPerMessage, var t = local(path) else { continue }
             t["path"] = path
             if isAttachmentPath(path) { t["match"] = match }
             shown[path] = out.count
@@ -317,7 +360,7 @@ extension AppDelegate {
             let lineStart = data[..<r.lowerBound].lastIndex(of: 0x0A).map { $0 + 1 } ?? data.startIndex
             let lineEnd = data[r.upperBound...].firstIndex(of: 0x0A) ?? data.endIndex
             if let obj = jsonObject(data[lineStart..<lineEnd]), obj["uuid"] as? String == uuid,
-               let blocks = (obj["message"] as? [String: Any])?["content"] as? [[String: Any]], blocks.indices.contains(index),
+               let blocks = ((obj["message"] as? [String: Any])?["content"] ?? (obj["attachment"] as? [String: Any])?["prompt"]) as? [[String: Any]], blocks.indices.contains(index),
                let b64 = (blocks[index]["source"] as? [String: Any])?["data"] as? String {
                 return Data(base64Encoded: b64, options: .ignoreUnknownCharacters)
             }
@@ -341,8 +384,10 @@ extension AppDelegate {
         if let c = cached, c.stamp == stamp { return c.images }
 
         var images: [String: String] = [:]
-        for line in (readRollout(path) ?? "").split(separator: "\n") where line.contains("\"input_image\"") {
-            guard let obj = jsonObject(line), obj["type"] as? String == "response_item",
+        let marker = Data("\"input_image\"".utf8)
+        for line in (readRollout(path) ?? "").utf8.split(separator: 0x0A) {
+            let data = Data(line)
+            guard data.range(of: marker) != nil, let obj = jsonObject(data), obj["type"] as? String == "response_item",
                   let item = obj["payload"] as? [String: Any], item["role"] as? String == "user",
                   let blocks = item["content"] as? [[String: Any]] else { continue }
             var pendingPath: String?

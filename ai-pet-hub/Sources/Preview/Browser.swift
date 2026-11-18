@@ -1,14 +1,57 @@
 // 内置浏览器：预览本地网页、开发服务器、文档预览（DocPreview.swift 负责转换）。
 import Cocoa
 import WebKit
+import PDFKit
+
+// 状态跟随 App 实例，不把全 App 共用的浏览器改成多个浏览器。
+private var browserNavigationKey: UInt8 = 0
+private var browserGenerationKey: UInt8 = 0
+final class BrowserNavigationState {
+    var generation = 0
+    var navigation: WKNavigation? {
+        didSet {
+            if let navigation = navigation { objc_setAssociatedObject(navigation, &browserGenerationKey, generation, .OBJC_ASSOCIATION_RETAIN_NONATOMIC) }
+        }
+    }
+    var finished = false
+    var documentTask: DocumentPreviewTask?
+    func begin() {
+        generation += 1
+        navigation = nil
+        finished = false
+    }
+}
 
 extension AppDelegate {
+    var browserNavigation: BrowserNavigationState {
+        if let state = objc_getAssociatedObject(self, &browserNavigationKey) as? BrowserNavigationState { return state }
+        let state = BrowserNavigationState()
+        objc_setAssociatedObject(self, &browserNavigationKey, state, .OBJC_ASSOCIATION_RETAIN_NONATOMIC)
+        return state
+    }
+
+    func webView(_ webView: WKWebView, didStartProvisionalNavigation navigation: WKNavigation!) {
+        guard webView === browser else { return }
+        if navigation !== browserNavigation.navigation {
+            // 已被取代的导航也可能迟到 didStart；不能反过来把新的请求作废。
+            if let navigation = navigation, objc_getAssociatedObject(navigation, &browserGenerationKey) != nil { return }
+            cancelDocumentPreview()
+            browserNavigation.begin()
+            browserNavigation.navigation = navigation
+        }
+    }
+
+    func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {
+        guard webView === browser, navigation === browserNavigation.navigation else { return }
+        browserNavigation.finished = true
+    }
+
     // MARK: - 内置浏览器
 
     func browserView() -> WKWebView {
         if let b = browser { return b }
         let cfg = WKWebViewConfiguration()
-        cfg.websiteDataStore = .default()   // 独立保存登录状态、localStorage，和 App 界面分开
+        cfg.websiteDataStore = (TestHooks.selfTest || UITest.active) ? .nonPersistent() : .default()   // 测试不改平时浏览器的登录状态
         cfg.applicationNameForUserAgent = "Version/18.0 Safari/605.1.15"   // 让网站当成 Safari，不给降级页面
         // 记下控制台输出，智能体用 browser_console 读（BrowserTools.swift）
         cfg.userContentController.addUserScript(WKUserScript(source: browserConsoleHook, injectionTime: .atDocumentStart, forMainFrameOnly: true))
@@ -56,25 +99,57 @@ extension AppDelegate {
         guard webView === browser else { return }
         browserSimulating = nil
         if navigation !== browserErrorNav { browserFailedURL = ""; browserErrorNav = nil }
+        notePDF(webView)
         sendBrowserState()
+    }
+
+    /// WebKit 显示 PDF 是按原始大小、居中放的：面板宽了两边一大片空白、字很小，而且它的缩放从外面控制不住
+    /// （面板一改宽度，同样的缩放值出来的大小就不一样）。所以本地 PDF 换成系统的 PDFKit 来显示，盖在浏览器上面：
+    /// 页面始终占满面板宽度，面板拉宽拉窄跟着变，文字照样能选中复制。
+    /// 下面的浏览器照常载入这个 PDF，地址栏、前进后退、刷新、智能体的浏览器工具都不受影响。
+    func notePDF(_ b: WKWebView) {
+        var doc: PDFDocument?
+        if browserErrorNav == nil, let u = b.url, u.isFileURL, u.pathExtension.lowercased() == "pdf" { doc = PDFDocument(url: u) }
+        guard let doc = doc else { browserPDF?.removeFromSuperview(); browserPDF = nil; return }
+        let pv = browserPDF ?? {
+            let v = PDFView(frame: b.frame)
+            v.displayMode = .singlePageContinuous
+            v.displaysPageBreaks = true
+            v.backgroundColor = NSColor(red: 0.165, green: 0.157, blue: 0.22, alpha: 1)   // 和 Word 文档预览的底色一样
+            container.addSubview(v, positioned: .above, relativeTo: b)
+            browserPDF = v
+            return v
+        }()
+        pv.document = doc
+        pv.autoScales = true   // 适应宽度
+        syncPDF()
+    }
+
+    /// PDF 那一层跟着浏览器的位置和显示 / 隐藏走。
+    func syncPDF() {
+        guard let b = browser, let pv = browserPDF else { return }
+        pv.frame = b.frame
+        pv.isHidden = b.isHidden
     }
 
     /// 按网页给的位置（CSS 像素，预览面板里的占位区域）摆放内置浏览器；visible 为 false 就藏起来。
     func placeBrowser(_ body: [String: Any]) {
         guard let b = browser else { return }
         let num = { (k: String) in (body[k] as? NSNumber)?.doubleValue ?? 0 }
-        guard body["visible"] as? Bool == true, num("w") > 20, num("h") > 20 else { b.isHidden = true; return }
+        guard body["visible"] as? Bool == true, num("w") > 20, num("h") > 20 else { b.isHidden = true; syncPDF(); return }
         let z = Double(webView.pageZoom)
         b.frame = NSRect(x: num("x") * z, y: num("y") * z, width: num("w") * z, height: num("h") * z)
         b.isHidden = false
+        syncPDF()
     }
 
     func openInBrowser(_ body: [String: Any]) {
         let b = browserView()
         browserFailedURL = ""
         cancelDocumentPreview()
+        browserNavigation.begin()
         if let raw = body["url"] as? String, let url = URL(string: raw), ["http", "https"].contains(url.scheme?.lowercased() ?? "") {
-            b.load(URLRequest(url: url))
+            browserNavigation.navigation = b.load(URLRequest(url: url))
         } else if let raw = body["path"] as? String {
             // 本地网页：允许读取所在工作空间（引用 ../css 之类也能加载），不在工作空间里就只允许它所在的文件夹
             let base = body["base"] as? String ?? ""
@@ -83,7 +158,7 @@ extension AppDelegate {
             let url = URL(fileURLWithPath: path)
             let ws = validWorkspace(base).map { trimmedPath($0) }
             let root = ws.flatMap { path.hasPrefix($0 + "/") ? URL(fileURLWithPath: $0, isDirectory: true) : nil } ?? url.deletingLastPathComponent()
-            b.loadFileURL(url, allowingReadAccessTo: root)
+            browserNavigation.navigation = b.loadFileURL(url, allowingReadAccessTo: root)
         }
         placeBrowser(body)
     }
@@ -91,21 +166,24 @@ extension AppDelegate {
     func browserCommand(_ cmd: String) {
         guard let b = browser else { return }
         let failed = URL(string: browserFailedURL)
+        let pending = docPreviewPending
         switch cmd {
-        case "back": cancelDocumentPreview(); b.goBack()
-        case "forward": cancelDocumentPreview(); b.goForward()
+        case "back": cancelDocumentPreview(); browserNavigation.begin(); browserNavigation.navigation = b.goBack()
+        case "forward": cancelDocumentPreview(); browserNavigation.begin(); browserNavigation.navigation = b.goForward()
         case "reload":
-            if let origin = documentPreviewOrigin(b.url) ?? docPreviewPending {
+            cancelDocumentPreview(); browserNavigation.begin()
+            if let origin = documentPreviewOrigin(b.url) ?? pending {
                 openDocumentPreview(origin)   // 原文件改过就重新生成
             } else if let u = failed, u.isFileURL, isPreviewDocument(u.path) {
                 openDocumentPreview(u.path)
             } else if let u = failed, b.url == u {
-                b.reload()   // 错误页占着这个网址：真的重新请求，成功就替换掉错误页
+                browserNavigation.navigation = b.reload()   // 错误页占着这个网址：真的重新请求，成功就替换掉错误页
             } else if let u = failed {
                 browserFailedURL = ""
-                if u.isFileURL { b.loadFileURL(u, allowingReadAccessTo: u.deletingLastPathComponent()) } else { b.load(URLRequest(url: u)) }
-            } else { b.reload() }
+                if u.isFileURL { browserNavigation.navigation = b.loadFileURL(u, allowingReadAccessTo: u.deletingLastPathComponent()) } else { browserNavigation.navigation = b.load(URLRequest(url: u)) }
+            } else { browserNavigation.navigation = b.reload() }
         case "stop":
+            browserNavigation.begin()
             // 生成预览中：不再显示它，留在原来的页面
             if docPreviewPending != nil { cancelDocumentPreview(); sendBrowserState() } else { b.stopLoading() }
         case "external":
@@ -124,19 +202,23 @@ extension AppDelegate {
     func openDocumentPreview(_ path: String) {
         let b = browserView()
         browserFailedURL = ""
-        docPreviewToken += 1
+        cancelDocumentPreview()
+        browserNavigation.begin()
+        let task = DocumentPreviewTask()
+        browserNavigation.documentTask = task
         let token = docPreviewToken
         docPreviewPending = path
         docPreviewSlow = false
         sendBrowserState()
         docPreviewQueue.async { [weak self] in
-            let result = makeDocumentPreview(path)
+            guard !task.isCancelled else { return }
+            let result = makeDocumentPreview(path, task: task)
             DispatchQueue.main.async {
                 guard let self = self, token == self.docPreviewToken else { return }   // 期间又打开了别的
                 self.docPreviewPending = nil
                 self.docPreviewSlow = false
                 if let file = result.file {
-                    b.loadFileURL(file, allowingReadAccessTo: file.deletingLastPathComponent())
+                    self.browserNavigation.navigation = b.loadFileURL(file, allowingReadAccessTo: file.deletingLastPathComponent())
                 } else {
                     self.showBrowserError(failing: URL(fileURLWithPath: path).absoluteString, title: "无法预览这个文件",
                                           detail: result.error, hint: "可以点右上角「用默认应用打开」。", tabTitle: "无法预览")
@@ -152,6 +234,8 @@ extension AppDelegate {
     }
 
     func cancelDocumentPreview() {
+        browserNavigation.documentTask?.cancel()
+        browserNavigation.documentTask = nil
         docPreviewToken += 1
         docPreviewPending = nil
         docPreviewSlow = false
@@ -178,11 +262,13 @@ extension AppDelegate {
                 browserErrorNav = b.loadHTMLString(page, baseURL: nil)
             }
         }
+        browserNavigation.navigation = browserErrorNav
+        browserNavigation.finished = true
         sendBrowserState()
     }
 
     func webView(_ webView: WKWebView, didFailProvisionalNavigation navigation: WKNavigation!, withError error: Error) {
-        guard webView === browser else { return }
+        guard webView === browser, navigation === browserNavigation.navigation else { return }
         let ns = error as NSError
         if ns.code == NSURLErrorCancelled { return }   // 被新的跳转打断，不算失败
         if ns.domain == "WebKitErrorDomain", ns.code == 102 { return }   // 「帧加载被中断」：交给系统打开了（下载、文档），不算失败
@@ -204,7 +290,10 @@ extension AppDelegate {
     /// 网页里的 target="_blank" 链接：在同一个内置浏览器里打开。
     func webView(_ webView: WKWebView, createWebViewWith configuration: WKWebViewConfiguration,
                  for navigationAction: WKNavigationAction, windowFeatures: WKWindowFeatures) -> WKWebView? {
-        if webView === browser, let url = navigationAction.request.url { webView.load(URLRequest(url: url)) }
+        if webView === browser, let url = navigationAction.request.url {
+            cancelDocumentPreview(); browserNavigation.begin()
+            browserNavigation.navigation = webView.load(URLRequest(url: url))
+        }
         return nil
     }
 

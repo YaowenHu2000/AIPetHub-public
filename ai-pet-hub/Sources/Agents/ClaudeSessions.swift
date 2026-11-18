@@ -14,7 +14,7 @@ extension AppDelegate {
         procLock.unlock()
         var sessions = cached?.sessions ?? []
         if cached == nil || Date().timeIntervalSince(cached!.at) > 4 {
-            let res = runOnce(cmd.executable, cmd.prefix + ["agents", "--json"], cwd: home, timeout: 8)
+            let res = runTool(cmd.executable, cmd.prefix + ["agents", "--json"], cwd: home, timeout: 8)
             guard let start = res.out.firstIndex(of: "["), let data = String(res.out[start...]).data(using: .utf8),
                   let list = (try? JSONSerialization.jsonObject(with: data)) as? [[String: Any]] else { return nil }
             let mine = ownDescendants()
@@ -31,7 +31,7 @@ extension AppDelegate {
 
     /// 这个 App 起的所有进程（子进程、孙进程……）的进程号。
     private func ownDescendants() -> Set<Int32> {
-        let res = runOnce("/bin/ps", ["-axo", "pid=,ppid="], cwd: home, timeout: 5)
+        let res = runTool("/bin/ps", ["-axo", "pid=,ppid="], cwd: home, timeout: 5)
         var children: [Int32: [Int32]] = [:]
         for line in res.out.split(separator: "\n") {
             let cols = line.split(separator: " ").compactMap { Int32($0) }
@@ -46,9 +46,12 @@ extension AppDelegate {
 
     /// 网页问：打开着的这个会话是不是在别处开着（输入框上面要不要提示「在这里发会另开一个分支」）。
     func checkSessionLive(agent: String, cid: String) {
-        guard agent == "claude", !cid.isEmpty else { return }
+        guard ["claude", "gemini"].contains(agent), validConversationId(cid, agent: agent) else { return }
         DispatchQueue.global(qos: .utility).async {
-            let live = self.claudeLiveElsewhere(cid)
+            let live: (status: String, name: String)?
+            if agent == "claude" { live = self.claudeLiveElsewhere(cid) }
+            else if self.geminiDesktopReadOnly(cid) { live = ("readOnly", "Antigravity") }
+            else { live = self.geminiSessionHeld(cid) == true ? ("idle", "agy") : nil }
             DispatchQueue.main.async {
                 self.sendToJS("onSessionLive", ["agent": agent, "conversationId": cid, "live": live != nil,
                                                 "status": live?.status ?? "", "name": live?.name ?? ""])

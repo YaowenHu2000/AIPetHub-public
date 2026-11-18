@@ -81,45 +81,48 @@ extension AppDelegate {
     /// 不说的话，后来打开它不知道有、后来关掉它还会去调。新会话不用说（开头它自己会看到）。
     func codexBrowserNote(threadId: String, isNew: Bool, on: Bool) -> String? {
         let key = "codexBrowserTools"
-        var states = UserDefaults.standard.dictionary(forKey: key) as? [String: Bool] ?? [:]
+        var states = hooks.codexBrowserStates ?? UserDefaults.standard.dictionary(forKey: key) as? [String: Bool] ?? [:]
         let before = states[threadId]
         guard before != on else { return nil }
         if states.count > 400 { states.removeAll() }   // 只是个小本子，记太多就清掉重记
         states[threadId] = on
-        UserDefaults.standard.set(states, forKey: key)
+        if hooks.codexBrowserStates != nil { hooks.codexBrowserStates = states } else { UserDefaults.standard.set(states, forKey: key) }
         if isNew || (before == nil && !on) { return nil }
         return on
             ? "\(codexNoteMarker) 从这一句起可以用内置浏览器的工具（MCP 服务 aipethub_browser：browser_open、browser_screenshot、browser_console、browser_text、browser_eval）。工具列表里没有直接列出的话，在 exec 里用 tools.mcp__aipethub_browser__browser_open({url}) 这样调用。这段是应用自动加的，不用回应。"
             : "\(codexNoteMarker) 内置浏览器的工具（aipethub_browser）从这一句起关掉了，不要再调用。这段是应用自动加的，不用回应。"
     }
 
-    /// 预热：起好 app-server、做完 initialize；接着的是已有会话就连会话也接上（新会话等真发话时再建，免得留下空会话）。
+    /// 答完后只握手和查模型，用户开始打字才提前接入旧线程。
     func warmCodex(_ req: AskRequest) -> CLIProcess? {
         guard let setup = codexSetup(req) else { return nil }
         let cli = CLIProcess(input: LiveInput())
         cli.warmFilter = { [weak self, weak cli] line in
             guard let self = self, let cli = cli, let obj = self.jsonObject(line), obj["method"] == nil,
                   let id = (obj["id"] as? NSNumber)?.intValue else { return false }
+            if id == 1, cli.stage > 0 { return true }
+            if id == 2, cli.stage == 2 { return self.warmResumeReply(cli, req: req, result: obj["result"] as? [String: Any]) }
             if id == 8 {   // 模型列表：预热时就告诉网页，不用等到真发话
                 self.noteCodexModels(obj["result"] as? [String: Any] ?? [:])
                 return true
             }
             guard id == 1, obj["error"] == nil, let input = cli.input else { return false }
             self.codexInitialized(input)
-            if req.conversationId.isEmpty { cli.stage = 1 }
-            else { self.codexOpenThread(req, input, model: setup.model, effort: setup.effort, sandbox: setup.sandbox); cli.stage = 2 }
+            cli.stage = 1
+            cli.resumeWhenReady()
             return true
         }
         guard (try? cli.start(executable: setup.codex, arguments: ["app-server"], cwd: validWorkspace(req.workspace) ?? home,
-                              environment: cliEnvironment())) != nil else { return nil }
+                              environment: cliEnvironment())) != nil else { cli.input?.abandon(); return nil }
         cli.input?.send(codexInitialize)
         return cli
     }
 }
 
 /// 一次交互式回答。流程：initialize(1) → thread/start 或 thread/resume(2) → turn/start(3) → 一路通知 → turn/completed。
-/// 预热过的进程可能已经做完前一两步（CLIProcess.stage：1 = initialize 做完，2 = 会话也在接了）。
+/// 预热进程的 stage 为 1 时，initialize 已完成。
 final class CodexLiveTurn: LiveTurn {
+    override var waitsForInitialization: Bool { true }
     private let codex: String
     private let model: String
     private let effort: String
@@ -127,18 +130,84 @@ final class CodexLiveTurn: LiveTurn {
     private lazy var parser = CodexAppParser(turn: builder)
     private var nextId = 10
     private var calls: [Int: String] = [:]        // 我们发出的请求：id → 用途
-    private var steers: [(id: String, text: String)] = []
+    private var steers: [(id: String, text: String, images: [String])] = []
     private var userSeen = 0
     private var failure: String?                   // 开场就失败（接不上会话等）
     private var gotResponse = false
     private var openRetries = 0                    // 会话被上一个进程占着时重接了几次
+    private let retryQuietInterval: TimeInterval
+    private let retryPollInterval: TimeInterval
+    private let retryReader: (String, Date, pid_t?) -> CodexRetryRecord?
+    private let retryQueue = DispatchQueue(label: "aipethub.codex-retry", qos: .utility)
+    private var retryTimer: DispatchSourceTimer?
+    private var retryGeneration = 0
+    private var retrySince = Date()
+    private var lastEventUptime = 0.0
+    private var lastRetryID: Int64?
+    private var retryFinished = false
 
-    init(app: AppDelegate, req: AskRequest, codex: String, model: String, effort: String, sandbox: String) {
+    init(app: AppDelegate, req: AskRequest, codex: String, model: String, effort: String, sandbox: String,
+         retryQuietInterval: TimeInterval = 20, retryPollInterval: TimeInterval = 10,
+         retryReader: ((String, Date, pid_t?) -> CodexRetryRecord?)? = nil) {
         self.codex = codex
         self.model = model
         self.effort = effort
         self.sandbox = sandbox
+        self.retryQuietInterval = retryQuietInterval
+        self.retryPollInterval = retryPollInterval
+        self.retryReader = retryReader ?? { app.codexLatestRetry(threadId: $0, since: $1, processID: $2) }
         super.init(app: app, req: req)
+    }
+
+    deinit { retryTimer?.cancel() }
+
+    /// 只在已开始的回合里计静默时间。正常事件流只推迟 timer，不读日志。
+    private func retryEventReceived() {
+        retryGeneration += 1
+        retrySince = Date()  // 恢复事件之后不再展示恢复之前的旧重试。
+        lastEventUptime = ProcessInfo.processInfo.systemUptime
+        guard !retryFinished, !stopping, parser.status == nil,
+              !parser.threadId.isEmpty, !parser.turnId.isEmpty else {
+            retryTimer?.cancel(); retryTimer = nil
+            return
+        }
+        if retryTimer == nil {
+            let timer = DispatchSource.makeTimerSource(queue: retryQueue)
+            let read = retryReader
+            timer.setEventHandler { [weak self] in
+                guard let snapshot = self?.retrySnapshot() else { return }
+                // 不持有这一轮的锁或 self；查询期间的停止、事件恢复都能立即生效。
+                let record = read(snapshot.thread, snapshot.since, snapshot.pid)
+                self?.locked {
+                    guard let self = self, !self.retryFinished, !self.stopping,
+                          self.retryGeneration == snapshot.generation,
+                          let record = record, record.id != self.lastRetryID else { return }
+                    self.lastRetryID = record.id
+                    self.parser.noteRetry(record)
+                }
+            }
+            timer.schedule(deadline: .now() + retryQuietInterval, repeating: retryPollInterval)
+            retryTimer = timer
+            timer.resume()
+        } else {
+            retryTimer?.schedule(deadline: .now() + retryQuietInterval, repeating: retryPollInterval)
+        }
+    }
+
+    private func retrySnapshot() -> (thread: String, since: Date, pid: pid_t?, generation: Int)? {
+        locked {
+            guard !retryFinished, !stopping, parser.status == nil, retryTimer != nil,
+                  ProcessInfo.processInfo.systemUptime - lastEventUptime >= retryQuietInterval else { return nil }
+            return (parser.threadId, retrySince, app.runningPid(req.key), retryGeneration)
+        }
+    }
+
+    private func stopRetryChecks() {
+        locked {
+            retryFinished = true
+            retryGeneration += 1
+            retryTimer?.cancel(); retryTimer = nil
+        }
     }
 
     /// 返回 nil：这个版本的 codex 没有 app-server、或者它接不上这个会话，调用方退回 `codex exec`。
@@ -146,13 +215,17 @@ final class CodexLiveTurn: LiveTurn {
         parser.onUserMessage = { [weak self] _ in self?.userMessageSeen() }
         if warm == nil { input.send(app.codexInitialize) }
         let res = run(executable: codex, arguments: ["app-server"], cwd: app.validWorkspace(req.workspace) ?? app.home)
+        stopRetryChecks()  // 进程退出（包括启动失败）也必须收掉；在 builder.finish 之前完成。
+        if res.warmDied {
+            return AgentReply(reply: app.fallbackReply(res, cli: "Codex"), conversationId: req.conversationId)
+        }
         if let e = res.launchError {
             return AgentReply(reply: "⚠️ 无法启动 codex：\(e)", conversationId: req.conversationId)
         }
         // app-server 用不了（老版本没有这个子命令），或者接不上这个会话：还什么都没做，退回 codex exec
-        let (failed, answered) = locked { (failure, gotResponse) }
-        if !res.cancelled, !answered || failed != nil {
-            fputs("AIPetHub：Codex 交互式没成（\(failed ?? "app-server 没有答复")），退回 codex exec\n", stderr)
+        let (failed, answered, submitted, timedOut) = locked { (failure, gotResponse, initialPromptSubmitted, initializationTimedOut) }
+        if !res.cancelled, !submitted, timedOut || !answered || failed != nil {
+            fputs("AIPetHub：Codex 交互式没成（\(failed ?? (timedOut ? "初始化阶段 300 秒没有推进" : "app-server 没有答复"))），退回 codex exec\n", stderr)
             return nil
         }
         return reply(res)
@@ -160,7 +233,11 @@ final class CodexLiveTurn: LiveTurn {
 
     private func reply(_ res: CLIResult) -> AgentReply {
         let convId = parser.threadId.isEmpty ? req.conversationId : parser.threadId
-        var built = builder.finish(finalText: parser.lastAgentMessage)
+        let failedExit = parser.status == nil && !res.cancelled
+        let outcome = res.cancelled ? "interrupted" : (parser.status ?? "failed")
+        let error = failedExit ? "⚠️ Codex 出错（退出码 \(res.status)）：\n" + (trimmed(res.err).isEmpty ? "进程在本轮完成前退出了。" : String(trimmed(res.err).suffix(1500)))
+            : parser.errors.joined(separator: "\n")
+        var built = builder.finish(finalText: parser.lastAgentMessage, outcome: outcome, error: res.cancelled ? nil : error)
         var reply = built["text"] as? String ?? ""
         if res.cancelled { return AgentReply(reply: reply, conversationId: convId, cancelled: true, turn: built) }
         if reply.isEmpty && !parser.errors.isEmpty { reply = "⚠️ Codex 出错：\n" + parser.errors.joined(separator: "\n") }
@@ -185,7 +262,7 @@ final class CodexLiveTurn: LiveTurn {
 
     override func steer(_ text: String, images: [String], id: String) -> Bool {
         guard !parser.threadId.isEmpty, !parser.turnId.isEmpty, parser.status == nil else { return false }
-        locked { steers.append((id, text)) }
+        locked { steers.append((id, text, images)) }
         guard call("turn/steer", ["threadId": parser.threadId, "expectedTurnId": parser.turnId, "input": userInput(text, images: images)], tag: "steer:\(id)") else {
             locked { steers.removeAll { $0.id == id } }
             return false
@@ -196,6 +273,7 @@ final class CodexLiveTurn: LiveTurn {
 
     override func interrupt() {
         markStopping()
+        stopRetryChecks()
         if parser.threadId.isEmpty || parser.turnId.isEmpty { input.close(); return }   // 回合还没开始：直接收
         call("turn/interrupt", ["threadId": parser.threadId, "turnId": parser.turnId], tag: "interrupt")
     }
@@ -222,15 +300,18 @@ final class CodexLiveTurn: LiveTurn {
 
     // MARK: app-server 发来的
 
-    /// 预热已经做完 initialize：新会话这时才建（已有会话预热时就接上了，答复还在路上或者存着）。
+    /// 打字时已发出的 resume 由同一条答复继续推进，不能重新发送。
     override func adopted() {
         guard let w = warm, w.stage >= 1 else { return }
         locked { gotResponse = true }
+        initializationProgress("initialize")
         if w.stage == 1 { app.codexOpenThread(req, input, model: model, effort: effort, sandbox: sandbox) }
     }
 
     override func handle(line: String) {
+        guard !initializationTimedOut else { return }
         guard let obj = app.jsonObject(line) else { return }
+        defer { retryEventReceived() }
         if let method = obj["method"] as? String {
             let params = obj["params"] as? [String: Any] ?? [:]
             if let rpcId = obj["id"] { handleRequest(rpcId, method, params) } else { handleNotification(method, params) }
@@ -251,19 +332,13 @@ final class CodexLiveTurn: LiveTurn {
            let last = usage["last"] as? [String: Any], let max = (usage["modelContextWindow"] as? NSNumber)?.intValue, max > 0 {
             // 这个会话的上下文用了多少：最近一次请求带进去的加上它答出来的
             let n: (String) -> Int = { (last[$0] as? NSNumber)?.intValue ?? 0 }
-            let used = n("totalTokens") > 0 ? n("totalTokens") : n("inputTokens") + n("outputTokens")
-            // 明细：它只按「带进去的（其中多少是缓存里已有的）/ 答出来的」分，不分是什么内容
-            let cached = min(n("cachedInputTokens"), n("inputTokens"))
-            let parts: [[String: Any]] = [
-                ["id": "cached_input", "name": "Cached input", "tokens": cached],
-                ["id": "new_input", "name": "New input", "tokens": n("inputTokens") - cached],
-                ["id": "output", "name": "Output", "tokens": n("outputTokens")],
-            ].filter { ($0["tokens"] as? Int ?? 0) > 0 }
+            let (used, parts) = codexContextTokens(total: n("totalTokens"), input: n("inputTokens"),
+                                                   cachedInput: n("cachedInputTokens"), output: n("outputTokens"))
             app.noteContext(agent: "gpt", conversationId: params["threadId"] as? String ?? parser.threadId, used: used, max: max, parts: parts)
         }
         parser.notify(method, params)
         noteConversation(parser.threadId)
-        if method == "turn/completed" { input.close() }   // 答完了：关掉输入，它自己退出
+        if method == "turn/completed" { stopRetryChecks(); input.close() }   // 答完了：关掉输入，它自己退出
     }
 
     /// 它要我们答复的请求：审批（命令 / 改文件）、提问；别的一律说不支持。
@@ -311,6 +386,7 @@ final class CodexLiveTurn: LiveTurn {
         switch id {
         case 1:   // initialize
             if let e = error { fail(e); return }
+            guard initializationProgress("initialize") else { return }
             app.codexInitialized(input)
             app.codexOpenThread(req, input, model: model, effort: effort, sandbox: sandbox)
         case 2:   // thread/start 或 thread/resume
@@ -319,13 +395,17 @@ final class CodexLiveTurn: LiveTurn {
                 openRetries += 1
                 DispatchQueue.global().asyncAfter(deadline: .now() + 0.4) { [weak self] in
                     guard let self = self else { return }
-                    self.locked { self.app.codexOpenThread(self.req, self.input, model: self.model, effort: self.effort, sandbox: self.sandbox) }
+                    self.locked {
+                        guard !self.stopping, !self.initializationTimedOut, !self.initialPromptSubmitted else { return }
+                        self.app.codexOpenThread(self.req, self.input, model: self.model, effort: self.effort, sandbox: self.sandbox)
+                    }
                 }
                 return
             }
             guard error == nil, let tid = (result["thread"] as? [String: Any])?["id"] as? String, !tid.isEmpty else {
                 fail(error ?? "没有拿到会话"); return
             }
+            guard initializationProgress("thread") else { return }
             parser.threadId = tid
             noteConversation(tid)
             startTurn(threadId: tid)
@@ -356,7 +436,7 @@ final class CodexLiveTurn: LiveTurn {
     private func startTurn(threadId: String) {
         let words = trimmed(req.prompt)
         if words == "/compact" {
-            input.send(["id": 3, "method": "thread/compact/start", "params": ["threadId": threadId]])
+            if !submitInitialPrompt({ input.send(["id": 3, "method": "thread/compact/start", "params": ["threadId": threadId]]) }) { input.close() }
             return
         }
         var items: [[String: Any]]
@@ -371,17 +451,19 @@ final class CodexLiveTurn: LiveTurn {
         if let note = app.codexBrowserNote(threadId: threadId, isNew: req.conversationId.isEmpty, on: app.browserMCP(req) != nil) {
             items.append(["type": "text", "text": note, "text_elements": [Any]()])
         }
-        input.send(["id": 3, "method": "turn/start", "params": ["threadId": threadId, "input": items]])
+        guard submitInitialPrompt({ input.send(["id": 3, "method": "turn/start", "params": ["threadId": threadId, "input": items]]) }) else {
+            input.close(); return
+        }
         // 顺便问一下它有哪些技能（输入框里打 / 时列出来）
         input.send(["id": 9, "method": "skills/list", "params": ["cwds": [app.validWorkspace(req.workspace) ?? app.home]]])
     }
 
     /// 用户的话轮到了：第一条是提问本身；之后每来一条，就是轮到了一句中途补充的话。
     private func userMessageSeen() {
-        let steer: (id: String, text: String)? = locked {
+        let steer: (id: String, text: String, images: [String])? = locked {
             userSeen += 1
             return userSeen > 1 && !steers.isEmpty ? steers.removeFirst() : nil
         }
-        if let s = steer { noteSteerConsumed(s.id, text: s.text) }
+        if let s = steer { noteSteerConsumed(s.id, text: s.text, images: s.images) }
     }
 }

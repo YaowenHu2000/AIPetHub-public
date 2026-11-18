@@ -32,6 +32,33 @@ function syncPlan(shownIsUser, messages) {
   return messages.length - shownIsUser.length;
 }
 
+/** 正文等长改写、步骤状态/输出变化也算更新，不能只比较数量。 */
+function messageSignature(m) {
+  return stableStringify([m.role, m.text || '', m.steps || [], m.files || [], m.duration || 0, m.images || []]);
+}
+
+/** 和 JSON.stringify 一样，但对象的字段按名字排序：同样的内容不管字段先后都得到同一串。
+ *  原生发来的同一条消息，字段的先后每次都可能不同；拿它判断「内容变没变」不能受这个影响。 */
+function stableStringify(v) {
+  if (Array.isArray(v)) return '[' + v.map(stableStringify).join(',') + ']';
+  if (v && typeof v === 'object') return '{' + Object.keys(v).sort().map(k => JSON.stringify(k) + ':' + stableStringify(v[k])).join(',') + '}';
+  return JSON.stringify(v) ?? 'null';
+}
+
+/** 只核对本轮开始时的历史位置；记录尚未写入或图片身份缺失时不猜旧的同句。 */
+function liveHistoryCut(run, messages, omitted = 0) {
+  if (!Number.isInteger(run.historyStart)) return -1;
+  const at = run.historyStart - omitted;
+  const m = messages[at];
+  if (!m || m.role !== 'user') return -1;
+  const images = run.images || [];
+  const paths = (m.images || []).map(im => im.path || im.ref?.id).filter(Boolean);
+  if (images.length && ((m.images || []).length !== images.length || !images.every(path => paths.includes(path)))) return -1;
+  const text = (m.text || '').trim();
+  if (text !== run.prompt && !(images.length && !run.text && !text)) return -1;
+  return at;
+}
+
 /** 这句话是不是「压缩上下文」的命令（各家叫 /compact 或 /compress）。它不是一轮对话：界面上显示成一条提示，不显示成一问一答。 */
 function isCompactCommand(text) {
   return /^\/(compact|compress)$/.test((text || '').trim());

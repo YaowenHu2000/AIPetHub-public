@@ -4,7 +4,8 @@ import Cocoa
 extension AppDelegate {
     func ask(_ req: AskRequest) {
         // 收到就登记（在派到后台之前），这样紧接着的停止也能记下
-        procLock.lock(); activeAsks.insert(req.key); procLock.unlock()
+        procLock.lock(); asks[req.key] = AskState(); procLock.unlock()
+        hooks.askReceived?(req)
         DispatchQueue.global(qos: .userInitiated).async { [weak self] in
             guard let self = self else { return }
             // 回答期间不做 App Nap（窗口在后台也要及时读取 CLI 输出），也不让系统闲置睡眠（长任务不会被打断；屏幕可以照常熄灭）
@@ -13,8 +14,7 @@ extension AppDelegate {
             defer { ProcessInfo.processInfo.endActivity(activity) }
             defer {
                 self.procLock.lock()
-                self.activeAsks.remove(req.key)
-                self.cancelledAgents.remove(req.key)
+                self.asks[req.key] = nil
                 self.procLock.unlock()
             }
             let workspace = self.validWorkspace(req.workspace)
@@ -46,7 +46,10 @@ extension AppDelegate {
                 "cwd": self.validWorkspace(req.workspace) ?? self.home
             ]
             var files = (result.turn?["files"] as? [[String: Any]]) ?? []
-            if let turn = result.turn { payload["steps"] = turn["steps"] ?? [] }
+            if let turn = result.turn {
+                payload["steps"] = turn["steps"] ?? []
+                if req.agent == "gpt" { payload["outcome"] = turn["outcome"] }
+            }
             if let before = before {
                 // 命令改的文件补进改动卡片；改文件工具已经报过的不重复（路径统一成绝对、解开符号链接再比）。
                 // 工具报了但没带 diff 的（Codex 实时事件就是这样），用 git 的 diff 补上。
@@ -65,6 +68,9 @@ extension AppDelegate {
                 files += fromGit.values.sorted { ($0["path"] as? String ?? "") < ($1["path"] as? String ?? "") }
             }
             payload["files"] = files
+            // 回答已经完整出来、只剩整理改动的这一小段里才点的停止来不及了：这一轮照常算答完（和以前一样），
+            // 不把一个做完了的回答标成「已停止」。
+            self.hooks.askFinishing?(req)
             self.sendToJS("onAgentResponse", payload)
             if !result.cancelled { self.noteReplyArrived(agent: req.agent, text: result.reply) }
         }

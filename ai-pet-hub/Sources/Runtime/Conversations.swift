@@ -11,12 +11,12 @@ extension AppDelegate {
         }
     }
 
-    func loadConversation(agent: String, cid: String) {
+    func loadConversation(agent: String, cid: String, reqId: Int? = nil) {
         switch agent {
-        case "gemini": loadGemini(cid: cid)
-        case "claude": loadClaude(cid: cid)
-        case "deepseek": loadDeepSeek(cid: cid)
-        default: loadCodex(cid: cid)
+        case "gemini": loadGemini(cid: cid, reqId: reqId)
+        case "claude": loadClaude(cid: cid, reqId: reqId)
+        case "deepseek": loadDeepSeek(cid: cid, reqId: reqId)
+        default: loadCodex(cid: cid, reqId: reqId)
         }
     }
 
@@ -31,18 +31,12 @@ extension AppDelegate {
     }
 
     /// 删掉一个会话（在该位的队列上调用）：Gemini / Claude 移到废纸篓，Codex 归档。
-    func deleteOne(agent: String, cid: String) -> Bool {
+    func deleteOne(agent: String, cid: String, onBlocked: (String) -> Void = { _ in }) -> Bool {
         // 会话 ID 必须是个正经的名字：空的或带路径的 ID 拼出来的会是整个目录（比如 brain/），绝不能删
-        guard isSafeId(cid) else { return false }
+        guard validConversationId(cid, agent: agent) else { return false }
         switch agent {
         case "gemini":
-            let db = geminiConversationDb(cid)
-            let removedDb = trash(db)
-            _ = trash(db + "-wal")
-            _ = trash(db + "-shm")
-            let removedBrain = trash("\(geminiBrainDir)/\(cid)")
-            geminiCache.removeValue(forKey: cid)
-            return removedDb || removedBrain
+            return deleteGemini(cid, onBlocked: onBlocked)
         case "claude":
             var ok = false
             if let path = findClaudeSession(cid: cid) {
@@ -54,14 +48,16 @@ extension AppDelegate {
         case "deepseek":
             return trashDeepSeek(cid: cid)
         default:
-            return archiveCodex(cid: cid)
+            return archiveCodex([cid]).contains(cid)
         }
     }
 
     func deleteConversation(agent: String, cid: String) {
         queue(for: agent).async { [self] in
-            let ok = deleteOne(agent: agent, cid: cid)
-            sendToJS("onConversationDeleted", ["agent": agent, "conversationId": cid, "ok": ok])
+            var result: [String: Any] = ["agent": agent, "conversationId": cid]
+            let ok = deleteOne(agent: agent, cid: cid) { result["reason"] = $0 }
+            result["ok"] = ok
+            sendToJS("onConversationDeleted", result)
             listConversations(agent: agent)
         }
     }
@@ -69,11 +65,13 @@ extension AppDelegate {
     /// 「删除项目」：一次删掉多个会话，最后只通知、刷新一次。
     func deleteConversations(agent: String, ids: [String]) {
         queue(for: agent).async { [self] in
-            var deleted: [String] = [], failed: [String] = []
-            for cid in ids {
-                if deleteOne(agent: agent, cid: cid) { deleted.append(cid) } else { failed.append(cid) }
-            }
-            sendToJS("onConversationsDeleted", ["agent": agent, "deleted": deleted, "failed": failed])
+            var result: [String: Any] = ["agent": agent]
+            let ok = agent == "gpt" ? archiveCodex(ids) : Set(ids.filter { cid in
+                deleteOne(agent: agent, cid: cid) { result["reason"] = $0 }
+            })
+            result["deleted"] = ids.filter(ok.contains)
+            result["failed"] = ids.filter { !ok.contains($0) }
+            sendToJS("onConversationsDeleted", result)
             listConversations(agent: agent)
         }
     }
@@ -96,14 +94,16 @@ extension AppDelegate {
     /// 只有文字的记录（Gemini 历史）：每轮最后一段回答是正式回答，前面的算工作过程。
     /// 历史会话默认只发最近 300 条消息（太长的会话全部渲染会卡），并告诉网页省略了多少条；
     /// 用户点了「显示更早的」就多发一些（loadConversation 带 limit）。
-    func recentHistory(_ messages: [[String: Any]], into payload: [String: Any]) -> [String: Any] {
+    func recentHistory(_ messages: [[String: Any]], into payload: [String: Any], reqId: Int? = nil) -> [String: Any] {
         var out = payload
+        out["reqId"] = reqId
         procLock.lock()
         let limit = historyLimits[payload["conversationId"] as? String ?? ""] ?? 300
         procLock.unlock()
         var recent = Array(messages.suffix(limit))
         attachChatImages(&recent, payload: payload)   // 用户消息里的图片换成缩略图（ChatImages.swift）
         out["messages"] = recent
+        // 搜索可能定位到很早的一句；默认仍只显示 300 条，明确展开时保留继续加载的入口。
         out["omitted"] = max(0, messages.count - limit)
         out["limit"] = limit
         return out

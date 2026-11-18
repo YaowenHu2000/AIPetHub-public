@@ -7,6 +7,7 @@ struct CLIResult {
     var status: Int32
     var cancelled: Bool
     var launchError: String?
+    var warmDied = false   // 接手前已退出；由入口重建 LiveTurn，完整冷启动一次
 }
 
 struct AskRequest {
@@ -32,6 +33,15 @@ struct AskRequest {
 
     /// 登记 CLI 进程用的键：同一位可以同时跑多个会话，按每次请求区分。
     var key: String { "\(agent)#\(reqId)" }
+}
+
+/// CLI 明确记录的最后一轮。时间统一为 Unix 秒，网页用本轮最后写入时间识别崩溃遗留的开始标记。
+struct HistoryTurnActivity {
+    let running: Bool
+    let startedAt: Double
+    var updatedAt: Double
+
+    var payload: [String: Any] { ["running": running, "startedAt": startedAt, "updatedAt": updatedAt] }
 }
 
 struct AgentReply {

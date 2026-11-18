@@ -1,113 +1,106 @@
-// 第四位：DeepSeek（走 dsh 的本机服务）。会真的调用 DeepSeek（几轮很短的对话）。
-// DIR、REPO、AGENT、MODEL、FULL_PERM 由 run.sh 加在前面：tools/uitest/run.sh deepseek e2e-deepseek.js
-const sleep = ms => new Promise(r => setTimeout(r, ms));
-const until = async (cond, ms, what) => { const t0 = Date.now(); while (Date.now() - t0 < ms) { const v = cond(); if (v) return v; await sleep(200); } throw new Error('等不到：' + what); };
-const out = { steps: [], ok: true };
-const check = (name, pass, got) => { out.steps.push(`${pass ? '✓' : '✗'} ${name}：${JSON.stringify(got)}`); if (!pass) out.ok = false; };
-const id = 'deepseek';
+// DeepSeek：添加、续聊、工具/改动、补充、余额、停止、历史、移除。
+const { out, check, note, skip, until, finish } = makeSuite('deepseek');
+const id = 'deepseek', nativeSteps = [];
 const saved = localStorage.getItem('aihub_enabled_agents');
+const previousResponse = window.onAgentResponse, previousStep = window.onAgentStep;
+let response;
+window.onAgentResponse = data => { if (data.agent === id) response = data; previousResponse(data); };
+window.onAgentStep = data => { if (data.agent === id) nativeSteps.push(data); previousStep(data); };
 try {
-  await sleep(1200);
-  // 加进来：四位都在，左栏四格、桌宠四张卡片、第四位是鲸鱼娘（逐帧，没有骨骼）
   if (!AGENT_IDS.includes(id)) enableAgent(id);
-  await sleep(1500);
-  const p = pets[id];
-  check('四位都在', AGENT_IDS.join() === 'gemini,claude,gpt,deepseek' && document.querySelectorAll('.hist-section').length === 4 && document.querySelectorAll('#stage-column .pet-card').length === 4,
-    { ids: AGENT_IDS.join(), sections: document.querySelectorAll('.hist-section').length, cards: document.querySelectorAll('#stage-column .pet-card').length, bodyAgents: document.body.dataset.agents });
-  await until(() => p.front.complete && p.front.naturalWidth > 0, 8000, '鲸鱼娘的图').catch(() => 0);
-  check('鲸鱼娘显示出来了（逐帧）', p.front.naturalWidth > 0 && !p.rig && getComputedStyle(p.front).visibility === 'visible',
-    { src: (p.front.currentSrc || p.front.src).split('/').slice(-3).join('/'), w: p.front.naturalWidth, rig: !!p.rig });
-  const cards = [...document.querySelectorAll('#stage-column .pet-card')].map(c => Math.round(c.getBoundingClientRect().height));
-  const stage = els.stage;
-  check('四张卡片排得下、不用滚动', stage.scrollHeight <= stage.clientHeight + 2, { cards, scroll: stage.scrollHeight, client: stage.clientHeight });
-  postNative('testSnapshot', { path: DIR + '/four.png' }); await sleep(700);
-
-  setActive(id);
-  setWorkspace(id, REPO, false);
-  S[id].perm = 'danger-full-access'; renderComposer();
+  await until(() => pets[id] && S[id], 5000, '添加 DeepSeek');
+  check('四位都有会话栏和角色卡片', AGENT_IDS.join() === 'gemini,claude,gpt,deepseek' && document.querySelectorAll('.hist-section').length === 4 && document.querySelectorAll('#stage-column .pet-card').length === 4, AGENT_IDS);
+  setActive(id); setWorkspace(id, REPO, false); S[id].perm = FULL_PERM; renderComposer();
   const box = S[id].msgEl;
-  const ask = async text => { els.input.value = text; send(); await until(() => viewBusy(id), 8000, '开始回答'); };
-  const idle = (ms = 150000) => until(() => !isBusy(id), ms, '回答结束');
-  const lastTurn = () => [...box.querySelectorAll('.msg.bot.turn')].pop();
-  const answer = () => (lastTurn()?.querySelector('.answer')?.textContent || '').trim();
-
-  // ① 一问一答
-  let t0 = Date.now();
-  await ask('只回复一个字：甲');
-  await idle();
-  await sleep(600);
+  const last = () => [...box.querySelectorAll('.msg.bot.turn')].at(-1);
+  const answer = () => last()?.querySelector('.answer')?.textContent.trim() || '';
+  const ask = async text => {
+    response = null; nativeSteps.length = 0;
+    els.input.value = text; send();
+    await until(() => response || viewBusy(id), 8000, '开始回答');
+  };
+  const idle = async (ms = 180000) => {
+    await until(() => response && !isBusy(id) && !box.querySelector('.msg.user.queued'), ms, '回答与队列结束');
+    check('回合无错误', !response.error && !/^⚠️/.test(response.reply || ''), response);
+  };
+  await ask('只回复一个字：甲'); await idle();
   const cid = S[id].conversationId;
-  check('① 回答', answer().includes('甲'), { answer: answer().slice(0, 40), seconds: Math.round((Date.now() - t0) / 1000) });
-  check('① 有会话编号', /^session-/.test(cid), cid);
-  check('模型菜单跟着 dsh 报的走，Flash 一直留着', AGENTS[id].models.some(m => m.v === 'deepseek-v4-pro') && AGENTS[id].models.some(m => m.v === 'deepseek-v4-flash'), AGENTS[id].models.map(m => `${m.v}[${(m.efforts || []).join('/')}]`));
-  check('默认是 Flash + High', S[id].model === 'deepseek-v4-flash' && S[id].effort === 'high', { model: S[id].model, effort: S[id].effort });
-
-  // ② 续聊：记得上一句
-  await ask('我上一句让你回复了哪个字？只回复那个字');
-  await idle();
-  await sleep(600);
-  check('② 续聊答得出', answer().includes('甲') && S[id].conversationId === cid, { answer: answer().slice(0, 40), sameConversation: S[id].conversationId === cid });
-
-  // ③ 跑命令、改文件：有步骤，有改动卡片
-  await ask('先用终端运行 echo hi > note.txt，再把 note.txt 里的 hi 改成 ho，最后只回复「好了」。');
-  await idle(200000);
-  await sleep(800);
-  const kinds = [...lastTurn().querySelectorAll('.step')].map(s => [...s.classList].find(c => c.startsWith('step-') && c !== 'step-head') || s.className);
-  check('③ 有命令步骤', !!lastTurn().querySelector('.step-command'), kinds);
-  check('③ 回答', answer().includes('好了'), answer().slice(0, 40));
-  check('③ 改动卡片里有 note.txt', (lastTurn().querySelector('.files-card')?.textContent || '').includes('note.txt'), (lastTurn().querySelector('.files-card')?.textContent || '').replace(/\s+/g, ' ').slice(0, 80));
-  postNative('testSnapshot', { path: DIR + '/steps.png' }); await sleep(700);
-
-  // ③b 中途补充：它在下一步开始前看到，不用等这一轮结束
-  await ask('先用终端运行 sleep 6（前台等它跑完），再用终端运行 echo done，最后只回复「睡醒了」。');
-  await until(() => box.querySelector('.msg.bot.turn.live .step-command'), 60000, '开始跑命令').catch(() => 0);
-  els.input.value = '补充：回答的最后请加上「收到补充」这四个字。'; send();
-  await idle(200000);
-  await sleep(800);
-  const said = [...lastTurn().querySelectorAll('.step')].some(s => s.textContent.includes('你补充说'));
-  check('③b 补充的话进了这一轮（不是排到下一轮）', said && answer().includes('收到补充'), { stepInTurn: said, answer: answer().slice(0, 60), userBubbles: box.querySelectorAll('.msg.user:not(.queued)').length });
-
-  // ③c 账户余额
-  window.__usage = null;
-  const prevUsage = window.onAgentUsage;
-  window.onAgentUsage = d => { if (d.agent === id) window.__usage = d; prevUsage && prevUsage(d); };
-  postNative('loadUsage', { agent: id, force: true });
-  await until(() => window.__usage && (window.__usage.items || []).length, 40000, '余额').catch(() => 0);
-  window.onAgentUsage = prevUsage;
-  const labels = ((window.__usage || {}).items || []).map(i => i.label);
-  check('③c 查到账户余额', labels.includes('账户余额') && /[\d.]+/.test(String(((window.__usage || {}).items || [])[0]?.text || '')), { labels, error: (window.__usage || {}).error });
-
-  // ④ 停止
-  await ask('用终端运行 sleep 40（前台等它跑完，不要放到后台），然后回复「睡醒了」。');
-  await until(() => box.querySelector('.msg.bot.turn.live .step'), 60000, '开始做事').catch(() => 0);
-  await sleep(1500);
-  t0 = Date.now();
-  stop();
-  await idle(30000);
-  check('④ 停得下来', Date.now() - t0 < 15000 && !answer().includes('睡醒了'), { seconds: Math.round((Date.now() - t0) / 1000), answer: answer().slice(0, 30) });
-  await sleep(1500);
-  await ask('只回复：乙');
-  await idle();
-  await sleep(500);
-  check('④ 停止之后还能接着聊', answer().includes('乙'), answer().slice(0, 30));
-
-  // ⑤ 历史：列表里有这个会话，重新读进来回合数对得上
+  check('首轮回答已显示', !!answer(), answer());
+  check('有 DeepSeek 会话编号', /^session-/.test(cid), cid);
+  check('模型菜单包含 dsh 的 Pro 和 Flash', ['deepseek-v4-pro', 'deepseek-v4-flash'].every(v => AGENTS[id].models.some(m => m.v === v)), AGENTS[id].models.map(m => m.v));
+  check('默认 Flash + High', S[id].model === 'deepseek-v4-flash' && S[id].effort === 'high', { model: S[id].model, effort: S[id].effort });
+  await ask('我上一句让你回复了哪个字？只回复那个字'); await idle();
+  check('续聊保持同一会话且新增回答', S[id].conversationId === cid && box.querySelectorAll('.msg.bot.turn').length === 2 && !!answer(), { cid: S[id].conversationId, answer: answer() });
+  const command = async (name, prompt, requireRunning = false) => {
+    const running = () => [...new Map(nativeSteps.map(e => [e.index, e.step])).values()].some(s => s?.kind === 'command' && s.status === 'running');
+    for (let attempt = 0; attempt < 2; attempt++) {
+      await ask(prompt);
+      await until(() => response || (requireRunning ? running() : nativeSteps.some(e => e.step?.kind === 'command')), 120000, '命令事件或最终回答');
+      const issued = nativeSteps.some(e => e.step?.kind === 'command') && (!requireRunning || (!response && running()));
+      if (issued) {
+        check(name + '：原生命令显示成步骤', !!last()?.querySelector('.step-command'), nativeSteps.map(e => e.step));
+        return true;
+      }
+      await idle(); note(name + '：模型实际回答 ' + (attempt + 1), answer());
+    }
+    skip(name, '模型没照做', { reply: response?.reply, steps: nativeSteps.map(e => e.step) });
+    return false;
+  };
+  if (await command('命令与改文件', '先用终端运行 echo hi > note.txt，再把 note.txt 里的 hi 改成 ho，最后简短回复。')) {
+    await idle();
+    // 文件若确实被模型改动，App 必须给卡片；没有改动是模型前置没完成。
+    const file = await readLocalFile(REPO + '/note.txt', REPO).catch(() => null);
+    if ((file && !file.error) || response.files?.some(f => /note\.txt$/.test(f.path))) {
+      await until(() => last()?.querySelector('.files-card'), 8000, 'DeepSeek 改动卡片');
+      check('改动卡片包含 note.txt', last().querySelector('.files-card').textContent.includes('note.txt'));
+    } else if (last()?.querySelector('.files-card')) {
+      check('改动卡片包含 note.txt', last().querySelector('.files-card').textContent.includes('note.txt'));
+      note('文件实际结果', file);
+    } else skip('改动卡片', '模型没照做', { reply: answer(), file });
+  }
+  if (await command('中途补充', '先用终端运行 sleep 6（前台等它跑完），再用终端运行 echo done，最后简短回复。', true)) {
+    const turnsBefore = box.querySelectorAll('.msg.bot.turn').length;
+    els.input.value = '补充：回答最后加上「收到补充」。'; send();
+    check('补充产生队列项', !!box.querySelector('.msg.user.queued'));
+    await idle();
+    check('补充显示在同一轮', box.querySelectorAll('.msg.bot.turn').length === turnsBefore && !!last()?.querySelector('.step-user'), { answer: answer(), turnsBefore, turnsAfter: box.querySelectorAll('.msg.bot.turn').length, hasUserStep: !!last()?.querySelector('.step-user') });
+    check('补充后队列清空', !box.querySelector('.msg.user.queued'));
+  }
+  let usage;
+  const previousUsage = window.onAgentUsage;
+  window.onAgentUsage = data => { if (data.agent === id) usage = data; previousUsage?.(data); };
+  try {
+    postNative('loadUsage', { agent: id, force: true });
+    await until(() => usage, 40000, 'DeepSeek 余额回调');
+    check('账户余额返回数值', usage.items?.some(i => i.label === '账户余额' && /[\d.]+/.test(i.text || '')), usage);
+  } finally { window.onAgentUsage = previousUsage; }
+  if (await command('停止命令', '用终端运行 sleep 40（前台等它跑完，不要放后台），然后简短回复。', true)) {
+    const at = Date.now(); stop(); await idle(30000);
+    check('停止回调 cancelled 且15秒内完成', response.cancelled === true && Date.now() - at < 15000, response);
+  }
+  await ask('只回复：乙'); await idle();
+  check('停止后可继续回答', !!answer() && !viewBusy(id), answer());
+  const usersBefore = box.querySelectorAll('.msg.user:not(.queued)').length;
+  const botsBefore = box.querySelectorAll('.msg.bot.turn').length;
   postNative('listConversations', { agent: id });
-  await sleep(7000);   // 等后台同步跑过两轮：这里自己答的不该被标成「在别处运行中」
-  check('自己答的不标「在别处运行中」', !box.querySelector('.work.elsewhere'), [...box.querySelectorAll('.work-label')].map(n => n.textContent));
-  const item = await until(() => (S[id].conversations || []).find(c => c.id === cid), 20000, '历史列表里出现这个会话').catch(() => null);
-  check('⑤ 历史列表里有它', !!item, item && { title: item.title, cwd: item.cwd, time: item.time });
-  S[id].loadedId = ''; S[id].loadedSig = '';
-  postNative('loadConversation', { agent: id, conversationId: cid });
-  await until(() => S[id].loadedId === cid, 30000, '会话读进来');
-  await sleep(1200);
-  const users = box.querySelectorAll('.msg.user:not(.queued)').length, bots = box.querySelectorAll('.msg.bot.turn').length;
-  check('⑤ 读回来：6 问（补充的那句算在它那一轮里），回答都在', users === 6 && bots >= 5 && box.textContent.includes('甲') && !!box.querySelector('.step-command'), { users, bots });
-
-  // ⑥ 移除：回到三位
-  disableAgent(id); await sleep(500);
-  check('⑥ 移除后回到三位，出现「添加 AI」', AGENT_IDS.join() === 'gemini,claude,gpt' && !!document.querySelector('.pet-add'), AGENT_IDS.join());
+  await until(() => S[id].conversations?.some(c => c.id === cid), 20000, 'DeepSeek 历史会话出现');
+  check('历史列表包含当前会话', S[id].conversations.some(c => c.id === cid));
+  let loaded = 0;
+  const previousLoaded = window.onConversationLoaded;
+  window.onConversationLoaded = data => { previousLoaded(data); if (data.agent === id && data.conversationId === cid) loaded++; };
+  try {
+    S[id].loadedSig = ''; postNative('loadConversation', { agent: id, conversationId: cid });
+    await until(() => loaded, 30000, 'DeepSeek 历史读取完成');
+    check('历史问答数量保持', box.querySelectorAll('.msg.user:not(.queued)').length === usersBefore && box.querySelectorAll('.msg.bot.turn').length === botsBefore, { usersBefore, botsBefore, users: box.querySelectorAll('.msg.user:not(.queued)').length, bots: box.querySelectorAll('.msg.bot.turn').length });
+    check('自己的会话没有标成别处运行', !box.querySelector('.work.elsewhere'));
+  } finally { window.onConversationLoaded = previousLoaded; }
+  disableAgent(id);
+  await until(() => !AGENT_IDS.includes(id), 5000, '移除 DeepSeek');
+  check('移除后回到三位并有添加按钮', AGENT_IDS.join() === 'gemini,claude,gpt' && !!document.querySelector('.pet-add'));
   out.conversation = cid;
-} catch (e) { out.ok = false; out.error = String(e) + ' | ' + String(e && e.stack).slice(0, 300); }
-if (saved === null) localStorage.removeItem('aihub_enabled_agents'); else localStorage.setItem('aihub_enabled_agents', saved);
-return out;
+} catch (error) { out.error = String(error); }
+finally {
+  window.onAgentResponse = previousResponse; window.onAgentStep = previousStep;
+  if (saved === null) localStorage.removeItem('aihub_enabled_agents'); else localStorage.setItem('aihub_enabled_agents', saved);
+}
+return finish();

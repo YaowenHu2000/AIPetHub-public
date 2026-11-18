@@ -1,6 +1,49 @@
 // Gemini（agy）的事件 → 工作步骤：`agy -p` 的 stream-json（一问一答）和 ACP 的 session/update（交互式）各一套解析器。
 import Foundation
 
+func agyFailureNotice(_ failure: String) -> (text: String, reason: String) {
+    let reason = failure.contains("network issue") ? "网络连接出了问题（\(failure)）" : failure
+    return ("⚠️ agy 中途出错，这次没有做完：\(reason)\n\n会话和已经做完的步骤都还在：可以点「重试」，或者发一句「继续」让它接着做。", reason)
+}
+
+/// 同一组重试在实时流和会话库里占一个步骤；子会话的恢复不能结束主会话的重试。
+struct AgyRetries {
+    private var active: [String: (key: String, index: Int, count: Int, detail: String)] = [:]
+    private var rounds = 0
+    var isEmpty: Bool { active.isEmpty }
+
+    mutating func note(in turn: TurnBuilder, conversation: String = "", at index: Int, detail: String? = nil) {
+        if active[conversation] == nil {
+            rounds += 1
+            active[conversation] = ("agy-retry-\(rounds)", index, 0, "")
+        }
+        guard var run = active[conversation] else { return }
+        run.count += 1
+        run.index = max(run.index, index)
+        let reason = trimmed(detail)
+        // 最新的原因排在前面，早期的长错误不能把最终放弃的原因挤出详情上限。
+        if !reason.isEmpty, run.detail != reason, !run.detail.hasPrefix(reason + "\n") {
+            run.detail = clip(run.detail.isEmpty ? reason : reason + "\n" + run.detail, maxDetail)
+        }
+        active[conversation] = run
+        let step = makeStep("error", "连接出错，正在重试（第 \(run.count) 次）",
+                            detail: run.detail.isEmpty ? "调用模型的请求失败了（多半是网络问题），agy 会自动重试几次。" : run.detail,
+                            status: "running")
+        if turn.step(run.key) == nil { turn.add(step, key: run.key) } else { turn.update(run.key, step) }
+    }
+
+    @discardableResult
+    mutating func finish(in turn: TurnBuilder, conversation: String = "", recovered: Bool, after index: Int? = nil, failure: String = "") -> Bool {
+        guard let run = active[conversation], index.map({ $0 > run.index }) ?? true else { return false }
+        var fields = ["title": recovered ? "连接出错 \(run.count) 次，重试后恢复" : "连接出错，重试 \(run.count) 次后放弃",
+                      "status": recovered ? "ok" : "error"]
+        if !failure.isEmpty { fields["detail"] = clip(failure, maxDetail) }
+        turn.update(run.key, fields)
+        active[conversation] = nil
+        return true
+    }
+}
+
 final class AgyStreamParser {
     let turn: TurnBuilder
     var conversationId = ""
@@ -10,13 +53,10 @@ final class AgyStreamParser {
     /// result 里的 status（SUCCESS / ERROR …）和出错原因；没收到 result 时 status 是 nil
     var status: String?
     var error = ""
-    private var texts: [Int: String] = [:]
-    private var lastTextPush: [Int: Date] = [:]
-    // 「连接出错，正在重试」那一步：同一轮重试共用一步，恢复后再出错算新的一轮
-    private var retryKey: String?
-    private var retryIndex = -1
-    private var retryCount = 0
-    private var retryRounds = 0
+    private(set) var abandonedRetry = false
+    private var texts: [String: String] = [:]
+    private var lastTextPush: [String: Date] = [:]
+    private var retries = AgyRetries()
 
     init(turn: TurnBuilder) { self.turn = turn }
 
@@ -32,25 +72,6 @@ final class AgyStreamParser {
         return status.map { "agy 返回了 \($0)" } ?? "agy 意外退出（退出码 \(exitStatus)）"
     }
 
-    /// 调用模型失败（多半是网络问题）时 agy 会自动重试，每失败一次来一个 error_message 步骤，里面没有文字。
-    /// 以前这些步骤被忽略，重试的那几分钟界面像是卡住了；现在合成一步「连接出错，正在重试」，恢复或放弃时更新它。
-    private func noteRetry(_ idx: Int) {
-        if retryKey == nil { retryRounds += 1; retryKey = "agy-retry-\(retryRounds)"; retryCount = 0 }
-        guard let key = retryKey else { return }
-        retryCount += 1
-        retryIndex = max(retryIndex, idx)
-        let step = makeStep("error", "连接出错，正在重试（第 \(retryCount) 次）",
-                            detail: "调用模型的请求失败了（多半是网络问题），agy 会自动重试几次。", status: "running")
-        if turn.step(key) == nil { turn.add(step, key: key) } else { turn.update(key, step) }
-    }
-
-    /// 重试之后来了新的步骤：连接恢复了。
-    private func retryRecovered(_ idx: Int) {
-        guard let key = retryKey, idx > retryIndex else { return }
-        turn.update(key, ["title": "连接出错 \(retryCount) 次，重试后恢复", "status": "ok"])
-        retryKey = nil
-    }
-
     /// 会话 ID 以最先给出的为准：第一条 init 事件就带着（启动后几秒），界面靠它马上认出这个会话。
     /// 之后不再跟着变，免得子代理步骤带的会话 ID 把它换掉（中途停止时就会记成子代理的会话）。
     private func noteConversation(_ value: Any?) {
@@ -63,18 +84,17 @@ final class AgyStreamParser {
         case "step_update":
             guard let u = obj["step_update"] as? [String: Any] else { return }
             noteConversation(u["conversation_id"])
-            step(u)
+            step(u, conversation: [u["conversation_id"], obj["conversation_id"]].compactMap { $0 as? String }.first { !$0.isEmpty } ?? conversationId)
         case "result":
             guard let r = obj["result"] as? [String: Any] else { return }
             noteConversation(r["conversation_id"])
             response = r["response"] as? String
             status = r["status"] as? String
             error = trimmed(r["error"] as? String)
-            if let key = retryKey {
-                turn.update(key, status == "SUCCESS" ? ["title": "连接出错 \(retryCount) 次，重试后恢复", "status": "ok"]
-                                                     : ["title": "连接出错，重试 \(retryCount) 次后放弃", "status": "error"])
-                retryKey = nil
-            }
+            let conversation = [r["conversation_id"], obj["conversation_id"]].compactMap { $0 as? String }.first { !$0.isEmpty } ?? conversationId
+            let recovered = status == "SUCCESS"
+            let endedRetry = retries.finish(in: turn, conversation: conversation, recovered: recovered, failure: recovered ? "" : error)
+            if conversation == conversationId { abandonedRetry = endedRetry && !recovered }
             durationSeconds = (r["duration_seconds"] as? NSNumber)?.doubleValue
             denied = (r["denied_actions"] as? [[String: Any]] ?? []).compactMap { ($0["display_name"] as? String) ?? ($0["action"] as? String) }
             if !denied.isEmpty {
@@ -85,32 +105,39 @@ final class AgyStreamParser {
         }
     }
 
-    private func step(_ u: [String: Any]) {
+    private func step(_ u: [String: Any], conversation: String) {
         let idx = (u["step_index"] as? NSNumber)?.intValue ?? -1
-        let key = "agy-\(idx)"
+        // 子会话会复用主会话的步号；缓冲、节流和重试都必须跟同一个会话身份走。
+        let key = conversation.isEmpty || conversation == conversationId ? "agy-\(idx)" : "agy-session-\(conversation)-\(idx)"
         let state = u["state"] as? String ?? ""
         let type = u["step_type"] as? String
-        if type == "agent_response" || type == "tool" { retryRecovered(idx) }
+        if type == "agent_response" || type == "tool" { retries.finish(in: turn, conversation: conversation, recovered: true, after: idx) }
         switch type {
         case "error_message":
-            noteRetry(idx)
+            retries.note(in: turn, conversation: conversation, at: idx)
         case "agent_response":
-            if let delta = u["text_delta"] as? String { texts[idx, default: ""] += delta }
-            let text = trimmed(texts[idx])
+            if let delta = u["text_delta"] as? String { texts[key, default: ""] += delta }
+            let text = trimmed(texts[key])
             guard !text.isEmpty else { return }
             let done = state == "DONE"
             if turn.step(key) == nil {
                 turn.add(makeStep("text", "说明", detail: text, status: done ? "ok" : "running"), key: key)
-                lastTextPush[idx] = Date()
-            } else if done || Date().timeIntervalSince(lastTextPush[idx] ?? .distantPast) > textPushInterval {
+                lastTextPush[key] = Date()
+            } else if done || Date().timeIntervalSince(lastTextPush[key] ?? .distantPast) > textPushInterval {
                 turn.update(key, ["detail": text, "status": done ? "ok" : "running"])
-                lastTextPush[idx] = Date()
+                lastTextPush[key] = Date()
             }
         case "tool":
             let info = u["tool_info"] as? [String: Any] ?? [:]
             let name = (u["tool_name"] as? String) ?? (info["name"] as? String) ?? "tool"
             let params = info["parameters"] as? [String: Any] ?? [:]
-            let status = state == "ERROR" ? "error" : (state == "DONE" ? "ok" : "running")
+            let status: String
+            switch state {
+            case "ERROR": status = "error"
+            case "CANCELED", "INTERRUPTED": status = "interrupted"
+            case "DONE": status = "ok"
+            default: status = "running"
+            }
             var step = agyToolStep(name: name, params: params)
             step["status"] = status
             if status == "error", let err = (info["error"] as? [String: Any])?["message"] as? String {
@@ -140,6 +167,7 @@ final class AcpParser {
     private var current = ""     // 正在长的那一段的 key（"acp-text-N" / "acp-think-N"）
     private var buffer = ""
     private var lastPush = Date.distantPast
+    private var toolCalls: [String: [String: Any]] = [:]
 
     init(turn: TurnBuilder) { self.turn = turn }
 
@@ -148,10 +176,7 @@ final class AcpParser {
         case "agent_message_chunk": chunk("text", (u["content"] as? [String: Any])?["text"] as? String ?? "")
         case "agent_thought_chunk": chunk("think", (u["content"] as? [String: Any])?["text"] as? String ?? "")
         case "available_commands_update":
-            let list = (u["availableCommands"] as? [[String: Any]] ?? []).compactMap { c -> [String: String]? in
-                guard let name = c["name"] as? String, !name.isEmpty else { return nil }
-                return ["name": name, "desc": c["description"] as? String ?? ""]
-            }
+            let list = acpCommands(u)
             if !list.isEmpty { onCommands?(list) }
         case "usage_update":   // 这个会话的上下文用了多少（ACP：used / size）
             if let used = (u["used"] as? NSNumber)?.intValue, let size = (u["size"] as? NSNumber)?.intValue, size > 0 { onUsage?(used, size) }
@@ -159,11 +184,19 @@ final class AcpParser {
             endSegment()
             guard let id = u["toolCallId"] as? String else { return }
             let key = "acp-\(id)"
+            // update 是字段补丁：省略的名称、参数、状态仍属于同一次调用。
+            var merged = toolCalls[id] ?? [:]
+            u.forEach { merged[$0.key] = $0.value }
+            if let previous = toolCalls[id]?["status"] as? String, ["completed", "failed"].contains(previous),
+               !["completed", "failed"].contains(merged["status"] as? String ?? "") { merged["status"] = previous }
+            if let args = u["args"] ?? u["rawInput"] { merged["args"] = args }
+            toolCalls[id] = merged
+            let u = merged
             let args = (u["args"] as? [String: Any]) ?? (u["rawInput"] as? [String: Any]) ?? [:]
             let st = u["status"] as? String ?? ""
             var step = agyToolStep(name: u["name"] as? String ?? (u["title"] as? String ?? "tool"), params: args)
             step["status"] = st == "failed" ? "error" : (st == "completed" ? "ok" : "running")
-            if st == "failed" {
+            if st == "failed" || (st == "completed" && step["kind"] as? String == "command") {
                 let texts = (u["content"] as? [[String: Any]] ?? []).compactMap { ($0["content"] as? [String: Any])?["text"] as? String }
                 if !texts.isEmpty { step["output"] = clip(texts.joined(separator: "\n"), maxOutput) }
             }
@@ -261,4 +294,12 @@ func agyDiff(_ params: [String: Any]) -> String? {
         return simpleDiff(old: target, new: params["ReplacementContent"] as? String ?? "")
     }
     return nil
+}
+
+/// ACP 的 available_commands_update → 命令列表（名字、说明）。
+func acpCommands(_ u: [String: Any]) -> [[String: String]] {
+    (u["availableCommands"] as? [[String: Any]] ?? []).compactMap { c -> [String: String]? in
+        guard let name = c["name"] as? String, !name.isEmpty else { return nil }
+        return ["name": name, "desc": c["description"] as? String ?? ""]
+    }
 }

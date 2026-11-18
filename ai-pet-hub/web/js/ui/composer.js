@@ -3,14 +3,31 @@
 // 输入框周边：预热、图片附件、/ 命令和 @ 文件、↑ ↓ 翻发过的话、消息上的「编辑」、内置浏览器工具的开关、搜索后定位。
 // 接在 changes.js 后面加载。纯逻辑在 logic.js。
 
+// 每位的输入在触发时就定下值；程序回填立即落盘，键入才短暂防抖。
+const draftTimers = new Map();
+function setDraft(id, value, delay = 0) {
+  clearTimeout(draftTimers.get(id));
+  draftTimers.delete(id);
+  S[id].draft = value;
+  if (id === active && els.input.value !== value) els.input.value = value;
+  const save = () => {
+    draftTimers.delete(id);
+    // 异常/队列回填可能已经更新了草稿，旧键入不得覆盖它。
+    if (S[id].draft === value) lsSet(`${id}_draft`, value);
+  };
+  if (delay) draftTimers.set(id, setTimeout(save, delay));
+  else save();
+  closeSuggest();
+}
+
 // ===== 预热：开始打字、或者上一轮刚答完，就让原生按现在的设置把 CLI 先起好（LiveTurn.swift / Prewarm.swift），发送时少等两三秒 =====
 let warmSig = '', warmAt = 0;
-function prewarm(id) {
+function prewarm(id, typing = false) {
   if (!hasBridge() || viewBusy(id)) return;
   const st = S[id];
-  const req = { agent: id, model: st.model, effort: st.effort, permissionMode: st.perm, workspace: st.workspace, conversationId: st.conversationId, browserTools: browserToolsOn(), fast: fastOn(id) };
+  const req = { agent: id, model: st.model, effort: st.effort, permissionMode: st.perm, workspace: st.workspace, conversationId: st.conversationId, typing: typing && !!st.conversationId && ['gpt', 'gemini'].includes(id), browserTools: browserToolsOn(), fast: fastOn(id) };
   const sig = JSON.stringify(req);
-  if (sig === warmSig && Date.now() - warmAt < 60000) return;   // 刚为同样的设置预热过
+  if (!req.typing && sig === warmSig && Date.now() - warmAt < 60000) return;   // 刚为同样的设置预热过
   warmSig = sig;
   warmAt = Date.now();
   postNative('prewarmAgent', req);
@@ -26,7 +43,7 @@ function addEditButton(div, id, text) {
   b.addEventListener('click', e => {
     e.stopPropagation();
     if (id !== active) setActive(id);
-    els.input.value = text;
+    setDraft(id, text);
     els.input.focus();
     els.input.selectionStart = els.input.selectionEnd = text.length;
     autosize();
@@ -47,6 +64,8 @@ window.onAgentCommands = data => {
   if (!AGENTS[data.agent] || !Array.isArray(data.commands)) return;
   agentCommands[data.agent] = mergeCommands(agentCommands[data.agent] || [], data.commands);   // 这次没带说明的沿用以前的
   lsSet(`${data.agent}_commands`, JSON.stringify(agentCommands[data.agent].slice(0, 200)));
+  // 正在输入框里打 / 等着：列表到了就刷新（Gemini 的列表要等它接上会话才报，常常是打了 / 之后才到）
+  if (data.agent === active && slashQuery(els.input.value) !== null) updateSuggest();
 };
 
 const suggest = { el: null, items: [], index: 0, kind: '', start: 0, seq: 0, timer: 0 };
@@ -64,6 +83,8 @@ function suggestBox() {
 function closeSuggest() {
   suggest.items = [];
   suggest.seq++;
+  clearTimeout(suggest.timer);
+  suggest.pending = null;
   if (suggest.el) suggest.el.hidden = true;
 }
 
@@ -87,6 +108,19 @@ function showSuggest(kind, items, start) {
   });
 }
 
+/** 建议框里只放一行说明（不能选）。 */
+function showSuggestNote(text) {
+  suggest.kind = 'note';
+  suggest.items = [];
+  const box = suggestBox();
+  box.hidden = false;
+  box.innerHTML = '';
+  const row = document.createElement('div');
+  row.className = 'suggest-row suggest-note';
+  row.textContent = text;
+  box.appendChild(row);
+}
+
 function moveSuggest(dir) {
   const n = suggest.items.length;
   suggest.index = (suggest.index + dir + n) % n;
@@ -99,13 +133,13 @@ function acceptSuggest() {
   if (!it) return;
   const input = els.input;
   if (suggest.kind === 'slash') {
-    input.value = '/' + it.name + ' ';
+    setDraft(active, '/' + it.name + ' ');
     input.selectionStart = input.selectionEnd = input.value.length;
   } else {
     const caret = input.selectionStart;
     const before = input.value.slice(0, suggest.start);
     const insert = (/\s/.test(it.name) ? `"${it.name}"` : it.name) + ' ';
-    input.value = before + insert + input.value.slice(caret);
+    setDraft(active, before + insert + input.value.slice(caret));
     input.selectionStart = input.selectionEnd = before.length + insert.length;
   }
   closeSuggest();
@@ -117,42 +151,55 @@ function acceptSuggest() {
 function suggestKey(e) {
   if (!suggest.items.length || !suggest.el || suggest.el.hidden) return false;
   if (e.key === 'ArrowDown' || e.key === 'ArrowUp') { e.preventDefault(); moveSuggest(e.key === 'ArrowDown' ? 1 : -1); return true; }
-  if (e.key === 'Enter' || e.key === 'Tab') { e.preventDefault(); acceptSuggest(); return true; }
+  if ((e.key === 'Enter' || e.key === 'Tab') && !e.shiftKey && !e.ctrlKey && !e.altKey && !e.metaKey) { e.preventDefault(); acceptSuggest(); return true; }
   if (e.key === 'Escape') { e.preventDefault(); e.stopPropagation(); closeSuggest(); return true; }
   return false;
 }
 
 function updateSuggest() {
+  closeSuggest();
   const input = els.input;
   const id = active;
   const value = input.value;
   const slash = slashQuery(value);
   if (slash !== null) {
-    showSuggest('slash', rankCommands(agentCommands[id] || [], slash), 0);
+    const list = agentCommands[id] || [];
+    // 还从没拿到过命令列表（Gemini 要接上一个会话才报）：说一声，而不是什么都不出
+    if (!list.length && id === 'gemini') { showSuggestNote('先给 Gemini 发一句话，接上会话后这里会显示可用命令'); return; }
+    showSuggest('slash', rankCommands(list, slash), 0);
     return;
   }
   const at = mentionQuery(value.slice(0, input.selectionStart));
   if (at && S[id].workspace && hasBridge()) {
     const start = at.start;
-    const seq = ++suggest.seq;
-    clearTimeout(suggest.timer);
+    const seq = suggest.seq;
+    // reqId 用全页面共用的编号（每次页面加载从不重复的起点开始），重载前发出的旧回应对不上
+    const pending = { seq, reqId: nextRequestId(), start, id, workspace: S[id].workspace, value, caret: input.selectionStart };
+    suggest.pending = pending;
     suggest.timer = setTimeout(() => {
-      suggest.pending = { seq, start };
-      postNative('listFiles', { workspace: S[id].workspace, query: at.q, reqId: seq });
+      if (!currentSuggest(pending)) return;
+      postNative('listFiles', { workspace: pending.workspace, query: at.q, reqId: pending.reqId });
     }, 100);
     return;
   }
   closeSuggest();
 }
 
+function currentSuggest(pending) {
+  return pending && pending.seq === suggest.seq && pending.id === active
+    && pending.workspace === S[active].workspace && pending.value === els.input.value
+    && pending.caret === els.input.selectionStart;
+}
+
 window.onFilesListed = data => {
-  if (!suggest.pending || data.reqId !== suggest.pending.seq || data.reqId !== suggest.seq) return;   // 已经接着打字了
+  if (!currentSuggest(suggest.pending) || data.reqId !== suggest.pending.reqId) return;
   showSuggest('file', (data.files || []).map(f => ({ name: f })), suggest.pending.start);
 };
 
 els.input.addEventListener('input', () => {
+  setDraft(active, els.input.value, 300);
   updateSuggest();
-  if (els.input.value.trim()) prewarm(active);   // 开始打字了：先把 CLI 起好
+  if (els.input.value.trim()) prewarm(active, true);   // 开始打字了：先把 CLI 起好
 });
 els.input.addEventListener('blur', () => setTimeout(closeSuggest, 150));
 
@@ -215,13 +262,53 @@ function takeAttachments(id) {
 function jumpToSearchHit(id) {
   const st = S[id];
   const q = histQuery;
-  if (!q || q.length < 2 || !st.bodyHits?.has(st.conversationId) || st.bodyQuery !== q) return;
+  if (!q || q.length < 2 || !st.bodyHits?.has(st.conversationId) || st.bodyQuery !== q) { st.pendingSearchHit = null; return; }
   const box = st.msgEl;
-  const hit = [...box.children].find(n => n.matches('.msg.user, .msg.bot') && n.textContent.toLowerCase().includes(q));
-  if (!hit) return;   // 命中的在更早、没显示的消息里，或者在工作过程的细节里
+  // 原生大小写规则包含 ß / sigma 等等价字；用它返回的实际原文定位，避免 JavaScript lowerCase 漏掉。
+  const actual = st.bodyItems?.find(it => it.id === st.conversationId)?.searchMatch;
+  const needles = [q, actual].filter(Boolean).map(text => text.toLowerCase());
+  const matches = text => needles.some(needle => text.toLowerCase().includes(needle));
+  function userText(node) {
+    const text = node.querySelector('.msg-text')?.textContent
+      ?? [...node.childNodes].filter(n => n.nodeType === 3).map(n => n.textContent).join('');
+    return [...node.querySelectorAll('.msg-img-missing')].map(n => n.textContent).concat(text).join('\n');
+  }
+  function visibleText(node) {
+    const copy = node.cloneNode(true);
+    copy.querySelectorAll('.katex-mathml, button').forEach(n => n.remove());
+    // 透明颜色会继承，但子节点可以显式换回可见颜色；零高度的 smash 仍然显示。
+    const walker = document.createTreeWalker(copy, NodeFilter.SHOW_TEXT);
+    let text = '', part;
+    while ((part = walker.nextNode())) {
+      let color = '', el = part.parentElement;
+      while (el && !color) { color = el.style.color; el = el.parentElement; }
+      if (color !== 'transparent') text += part.textContent;
+    }
+    return text;
+  }
+  function bodyText(node) {
+    if (node.matches('.msg.user')) return userText(node);
+    return [...node.querySelectorAll('.step-user-tag, .step-user-text, .step-text, .step-title, .step-cmdline, .step-body pre, .answer')]
+      .map(n => n.classList.contains('step-user-text') ? userText(n) : visibleText(n)).join('\n');
+  }
+  const hit = [...box.children].find(n => n.matches('.msg.user, .msg.bot') && matches(bodyText(n)));
+  if (!hit) { st.pendingSearchHit = { query: q, cid: st.conversationId }; return; }
+  st.pendingSearchHit = null;
+  // 搜索也包含已折叠步骤的文字，定位后展开，避免点进来还看不到命中。
+  hit.querySelector('.work')?.classList.add('open');
+  hit.querySelectorAll('.step-body').forEach(body => { if (matches(visibleText(body))) body.hidden = false; });
   hit.scrollIntoView({ block: 'center' });
   hit.classList.add('search-hit');
   setTimeout(() => hit.classList.remove('search-hit'), 2600);
+}
+
+function retryPendingSearchHit() {
+  AGENT_IDS.forEach(id => {
+    const st = S[id], pending = st.pendingSearchHit;
+    if (!pending) return;
+    if (pending.query !== histQuery || pending.cid !== st.conversationId) { st.pendingSearchHit = null; return; }
+    jumpToSearchHit(id);
+  });
 }
 
 // ===== 空输入框按 ↑ / ↓ 翻发过的话 =====
@@ -240,7 +327,7 @@ function browsePrompts(id, dir) {
   const next = promptStep(list, st.promptAt ?? -1, els.input.value, dir);
   if (!next) return false;   // 自己打了字就不翻了
   st.promptAt = next.at;
-  els.input.value = next.value;
+  setDraft(id, next.value);
   els.input.selectionStart = els.input.selectionEnd = next.value.length;
   autosize();
   return true;
@@ -248,4 +335,4 @@ function browsePrompts(id, dir) {
 
 // 切到另一位时，附件栏跟着换成那一位的
 const baseRenderComposer = renderComposer;
-renderComposer = function () { baseRenderComposer(); renderAttachments(); };
+renderComposer = function () { closeSuggest(); baseRenderComposer(); renderAttachments(); };

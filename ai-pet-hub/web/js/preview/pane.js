@@ -28,7 +28,7 @@ function setPaneVisible(on) {
 function openPreview({ path, base = '', diff = '' }) {
   const raw = cleanPath(path);
   if (BROWSER_DOC_RE.test(raw)) { openBrowser(raw, base); return; }
-  let tab = pane.tabs.find(t => (t.raw === raw && t.base === base) || (t.resolved && (t.resolved === raw || t.resolved.endsWith('/' + raw.replace(/^\.\//, '')))));
+  let tab = pane.tabs.find(t => (t.raw === raw && t.base === base) || (raw.startsWith('/') && t.resolved === raw));
   const existed = !!tab;
   if (!tab) {
     tab = { id: ++pane.seq, raw, path, base, diff, data: null, mode: null, scrolled: false };
@@ -312,7 +312,10 @@ function loadLocalImages(root, base) {
   root.querySelectorAll('img[data-local]').forEach(img => {
     readLocalFile(img.dataset.local, base).then(data => {
       if (data.image) img.src = data.image;
-      else img.replaceWith(Object.assign(document.createElement('span'), { className: 'md-img-missing', textContent: `［图片：${img.alt || img.dataset.local}］` }));
+      else {
+        img.replaceWith(Object.assign(document.createElement('span'), { className: 'md-img-missing', textContent: `［图片：${img.alt || img.dataset.local}］` }));
+        if (typeof retryPendingSearchHit === 'function') retryPendingSearchHit();
+      }
     });
   });
 }

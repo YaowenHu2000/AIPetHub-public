@@ -43,18 +43,6 @@ extension AppDelegate {
         (try? JSONSerialization.jsonObject(with: data)) as? [String: Any]
     }
 
-    /// 从 CLI 输出里找最后一个满足条件的 JSON 对象（容忍行首的转圈字符等杂质）。
-    func lastJSONObject(in output: String, where match: ([String: Any]) -> Bool) -> [String: Any]? {
-        for line in output.split(separator: "\n").reversed() {
-            guard let brace = line.firstIndex(of: "{") else { continue }
-            if let obj = jsonObject(line[brace...]), match(obj) { return obj }
-        }
-        if let brace = output.firstIndex(of: "{"), let obj = jsonObject(output[brace...]), match(obj) {
-            return obj
-        }
-        return nil
-    }
-
     func textBlocks(_ content: Any?) -> String {
         if let s = content as? String { return s.trimmingCharacters(in: .whitespacesAndNewlines) }
         guard let blocks = content as? [[String: Any]] else { return "" }
@@ -115,7 +103,7 @@ extension AppDelegate {
     }
 
     /// 只读打开；WAL 库缺 -shm 等原因读不了时，退回 immutable 方式（不加锁的快照读）。
-    func withReadableSQLite<T>(_ path: String, _ body: (OpaquePointer) -> T) -> T? {
+    func withReadableSQLite<T>(_ path: String, busyTimeout: Int32 = 3000, _ body: (OpaquePointer) -> T) -> T? {
         guard fm.fileExists(atPath: path) else { return nil }
         let encoded = path.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed) ?? path
         for uri in ["file:\(encoded)?mode=ro", "file:\(encoded)?immutable=1"] {
@@ -124,7 +112,7 @@ extension AppDelegate {
                 if db != nil { sqlite3_close(db) }
                 continue
             }
-            sqlite3_busy_timeout(handle, 3000)
+            sqlite3_busy_timeout(handle, busyTimeout)
             if sqlite3_exec(handle, "SELECT count(*) FROM sqlite_master;", nil, nil, nil) == SQLITE_OK {
                 defer { sqlite3_close(handle) }
                 return body(handle)

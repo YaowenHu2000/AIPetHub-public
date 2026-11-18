@@ -1,7 +1,7 @@
 // 真实窗口的自动化测试：`AIPetHub --uitest <脚本.js> <结果.json>`
 // 照常开窗口、载入界面（网页 ↔ 原生 ↔ CLI 整条链路都是真的），页面好了以后在页面里跑脚本（async 函数体，return 的东西写进结果文件），
 // 跑完就退出。窗口完全透明、点不到、不抢焦点、不进 Dock（屏幕上看不见它）；网页的本地存储用临时的，不会动到平时用的设置和草稿。
-// 脚本里可以 `postNative('testSnapshot', { path })` 把当时的界面存成 PNG。
+// 真实窗口模式（REAL=1）下脚本可以 `postNative('testWindowShot', { path })` 把整个窗口存成 PNG。
 import Cocoa
 import WebKit
 
@@ -27,9 +27,10 @@ enum UITest {
 extension AppDelegate {
     func uiTestStart() {
         guard UITest.active else { return }
-        // 页面脚本都载入、桌宠建好了再开始
+        // 页面脚本都载入、桌宠建好了再开始。要等整页载完：桌宠是 boot.js 建的，预览那几个脚本排在它后面，
+        // 只看桌宠的话偶尔会在它们载入之前就开跑（测试里用到 dirOf 之类就报未定义）
         Timer.scheduledTimer(withTimeInterval: 0.3, repeats: true) { [weak self] timer in
-            self?.webView.evaluateJavaScript("typeof flushQueue === 'function' && typeof pets === 'object' && !!pets.claude") { ok, _ in
+            self?.webView.evaluateJavaScript("document.readyState === 'complete' && typeof flushQueue === 'function' && typeof pets === 'object' && !!pets.claude") { ok, _ in
                 guard (ok as? Bool) == true, timer.isValid else { return }
                 timer.invalidate()
                 self?.uiTestRun()
@@ -55,27 +56,17 @@ extension AppDelegate {
             if let data = try? JSONSerialization.data(withJSONObject: payload, options: [.prettyPrinted, .sortedKeys]) {
                 try? data.write(to: URL(fileURLWithPath: UITest.out))
             }
-            // 还在跑的 CLI 连同它启动的命令一起结束，再退出
-            self.procLock.lock(); let procs = Array(self.runningProcs.values) + self.warmProcs.values.map { $0.proc }; self.procLock.unlock()
-            procs.filter { $0.isRunning }.forEach { self.terminateTree($0.processIdentifier) }
-            DispatchQueue.main.asyncAfter(deadline: .now() + (procs.isEmpty ? 0.2 : 1.5)) { exit(0) }
-        }
-    }
-
-    /// 把当时的界面存成 PNG（只在测试时可用）。
-    func uiTestSnapshot(_ path: String) {
-        guard UITest.active else { return }
-        webView.takeSnapshot(with: nil) { image, _ in
-            guard let tiff = image?.tiffRepresentation, let rep = NSBitmapImageRep(data: tiff),
-                  let png = rep.representation(using: .png, properties: [:]) else { return }
-            try? png.write(to: URL(fileURLWithPath: path))
+            // exit 不会调用 applicationWillTerminate；和正常退出一样清理全部子进程，
+            // 包括尚未查完用量的辅助命令，并等强制结束完成，不能提前丢掉延迟清理。
+            self.terminateAllChildren()
+            exit(0)
         }
     }
 
     // MARK: 真实窗口模式才有的：整窗截图、真实的鼠标点击、红绿灯的位置
 
     /// 把整个窗口截成 PNG：连标题栏、红绿灯、原生的毛玻璃一起，是系统真正合成出来的样子
-    /// （testSnapshot 只截网页内容，而且截不出背景模糊）。截自己的窗口不需要屏幕录制权限。
+    /// （只截网页内容的话截不出背景模糊）。截自己的窗口不需要屏幕录制权限。
     /// CGWindowListCreateImage 在新的 SDK 里标成了不可用，但函数还在，这里按名字找出来调。
     func uiTestWindowShot(_ path: String) {
         guard UITest.active, UITest.real else { return }

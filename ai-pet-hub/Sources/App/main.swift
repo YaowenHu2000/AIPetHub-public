@@ -7,7 +7,7 @@
 //   Preview/  文件预览、内置浏览器（含给智能体用的工具）、文档预览、对话里的图片、搜索
 //
 // 程序入口：平时启动应用；带 --mcp-browser 时当 MCP 服务器（给 CLI 用内置浏览器），带 --uitest 时跑真实窗口的自动化测试，
-// 带 --check-permissions 时只检查磁盘访问权限。自测程序（HUB_SELFTEST）走 tools/selftest.swift。
+// 带 --check-permissions 时只检查磁盘访问权限。自测程序（HUB_SELFTEST）走 tools/tests/selftest.swift。
 import Cocoa
 /// 诊断：`AIPetHub --check-permissions 输出.json` 用 App 自己的身份试读几处只有「完全磁盘访问权限」才能读的位置，
 /// 把结果写进文件就退出（不开窗口，也不会弹授权窗口），用来确认权限有没有给上。

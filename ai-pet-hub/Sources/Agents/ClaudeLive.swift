@@ -11,7 +11,7 @@ final class ClaudeLiveTurn: LiveTurn {
     private var sent = 1
     private var acked = 0
     private var sawEvent = false
-    private var steers: [(id: String, text: String)] = []
+    private var steers: [(id: String, text: String, images: [String])] = []
 
     init(app: AppDelegate, req: AskRequest, command: Command) {
         self.command = command
@@ -25,6 +25,9 @@ final class ClaudeLiveTurn: LiveTurn {
         input.send(userMessage(req.prompt, images: req.images))
         let res = run(executable: command.executable, arguments: app.claudeArgs(req, command, live: true),
                       cwd: app.validWorkspace(req.workspace) ?? app.home)
+        if res.warmDied {
+            return AgentReply(reply: app.fallbackReply(res, cli: "Claude"), conversationId: req.conversationId)
+        }
         if let e = res.launchError {
             return AgentReply(reply: "⚠️ 无法启动 Claude Code：\(e)", conversationId: req.conversationId)
         }
@@ -45,7 +48,7 @@ final class ClaudeLiveTurn: LiveTurn {
     // MARK: 网页发来的
 
     override func steer(_ text: String, images: [String], id: String) -> Bool {
-        locked { steers.append((id, text)); sent += 1 }
+        locked { steers.append((id, text, images)); sent += 1 }
         guard input.send(userMessage(text, images: images)) else {
             locked { steers.removeAll { $0.id == id }; sent -= 1 }
             return false
@@ -154,11 +157,11 @@ final class ClaudeLiveTurn: LiveTurn {
 
     /// 它回显了一句话：第一句是提问本身；之后每回显一句，就是轮到了一句中途补充的话。
     private func handleReplay() {
-        let steer: (id: String, text: String)? = locked {
+        let steer: (id: String, text: String, images: [String])? = locked {
             acked += 1
             return acked > 1 && !steers.isEmpty ? steers.removeFirst() : nil
         }
-        if let s = steer { noteSteerConsumed(s.id, text: s.text) }
+        if let s = steer { noteSteerConsumed(s.id, text: s.text, images: s.images) }
     }
 
     /// 这一轮答完了。发出去的话都轮到过了（或者要停）：关掉输入，CLI 收尾退出；
@@ -176,7 +179,7 @@ final class ClaudeLiveTurn: LiveTurn {
         if stop {
             let key = req.key
             DispatchQueue.global().asyncAfter(deadline: .now() + 0.5) { [weak app] in
-                if let pid = app?.runningPid(key) { app?.terminateTree(pid) }
+                if let pid = app?.runningPid(key) { terminateTree(pid) }
             }
         }
     }

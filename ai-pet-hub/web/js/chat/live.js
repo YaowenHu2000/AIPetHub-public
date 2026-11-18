@@ -71,6 +71,8 @@ function moveQueuedUp(run, item) {
   const before = [item, other].map(x => x.el.getBoundingClientRect().top);
   q.splice(i, 1);
   q.splice(j, 0, item);
+  run.nodes = run.nodes.filter(n => n !== item.el);
+  run.nodes.splice(run.nodes.indexOf(other.el), 0, item.el);
   other.el.parentNode.insertBefore(item.el, other.el);
   [item, other].forEach((x, k) => {
     const moved = before[k] - x.el.getBoundingClientRect().top;
@@ -124,7 +126,7 @@ function flushQueue(id, run, data) {
   const text = left.map(q => q.text).join('\n\n');   // 发不了时放回输入框用
   const here = id === active && (viewKey(id) === run.view || viewKey(id) === data.conversationId);
   const jump = left.some(q => q.jump);   // 点了「立即发送」：这一轮是为了插队才停的，接着发
-  if (queueAction({ cancelled: !!data.cancelled, failed: /^⚠️/.test((data.reply || '').trim()), here, busy: viewBusy(id), jump }) === 'restore') {
+  if (queueAction({ cancelled: !!data.cancelled, failed: data.outcome === 'failed' || /^⚠️/.test((data.reply || '').trim()), here, busy: viewBusy(id), jump }) === 'restore') {
     restoreDraft(id, text);   // 没法接着发（停止了 / 出错了 / 已经切到别的会话）：放回输入框，不丢
     const imgs = left.flatMap(q => q.images || []);
     if (imgs.length) addAttachments(id, imgs, false);

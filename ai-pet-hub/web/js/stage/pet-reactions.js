@@ -106,7 +106,7 @@ Pet.prototype.setBusy = function (busy) {
 };
 
 Pet.prototype.cyclePose = function () {
-  if (isBusy(this.id)) {
+  if (petBusy(this.id)) {
     this.say('正在忙活中，动作随实时步骤自动切换哟 ✨', 1800);
     return;
   }
@@ -165,7 +165,8 @@ Pet.prototype.renderStatus = function () {
   if (info) {
     const meta = info.meta;
     const label = info.kind === 'text' ? '回答中' : meta.label;
-    text = `${label} ${elapsedSince(info.since)}${info.count > 1 ? ` · ${info.count} 个会话` : ''}`;
+    text = info.elsewhere ? `在别处 · ${label} ${elapsedSince(info.since)}`
+      : `${label} ${elapsedSince(info.since)}${info.count > 1 ? ` · ${info.count} 个会话` : ''}`;
     icon = (info.fast ? UI.bolt : '') + phaseIcon(info.phase);
     cls = `busy phase-${info.phase}`;
     this.card.dataset.phase = info.phase;

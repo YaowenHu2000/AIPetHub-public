@@ -69,7 +69,7 @@
   --s1: color-mix(in srgb, var(--accent) 52%, #171a5c); --s2: var(--accent); --s3: color-mix(in srgb, var(--accent) 58%, #fff);
 }
 #popover.top .mp-slider { --s1: var(--top-1); --s2: var(--top-2); --s3: var(--top-3); }
-/* 圆钮和滑过的那一段的位置都看 --t（menus.js 里一根弹簧在管，拖过头时会略微超出 0…1）。
+/* 圆钮和滑过的那一段的位置都看 --t（model-menu.js 里一根弹簧在管，拖过头时会略微超出 0…1）。
    滑过的那一段：壳按档位裁宽度，里面的画布铺满整条（颜色和粒子怎么动见 js/ui/effort-flow.js） */
 .mp-fill {
   position: absolute; inset: 0; width: calc(var(--h) + (100% - var(--h)) * var(--t)); border-radius: calc(var(--h) / 2); overflow: hidden;

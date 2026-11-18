@@ -17,27 +17,40 @@ final class DshServer {
     private var generation = 0
     private var listeners: [String: [Int: ([String: Any]) -> Void]] = [:]
     private var nextToken = 0
-    private var stderrTail = ""
+    private var ready = false
+    private let startupQueue = DispatchQueue(label: "aipethub.dsh.start")
+    private let eventQueue = DispatchQueue(label: "aipethub.dsh.events")
+    private var sessionQueues: [String: DispatchQueue] = [:]
+    // 队列 → 短持 server 锁；先释放 server 锁才进回合锁，回合锁内不等 RPC/队列/I/O。
+    /// 同一会话的配置和提交不能穿插；等待答复正文不占这条队列。
+    func sessionQueue(_ sid: String) -> DispatchQueue {
+        lock.lock(); defer { lock.unlock() }
+        if let q = sessionQueues[sid] { return q }
+        let q = DispatchQueue(label: "aipethub.dsh.session.\(sid)")
+        sessionQueues[sid] = q
+        return q
+    }
     private static func localSession() -> URLSession {
         let c = URLSessionConfiguration.ephemeral
         c.timeoutIntervalForRequest = 120
         c.connectionProxyDictionary = [:]   // 本机服务：不走系统代理
         return URLSession(configuration: c)
     }
-    /// 调用和事件流各用一个会话。一个会话的回调是排着队一个个跑的：事件流的回调可能正等着某一轮的锁，
-    /// 而那一轮正拿着锁在等一次调用的答复（中途补充就是这样）——要是共用一个，答复排在后面永远轮不到，两边互相等到超时。
+    /// HTTP 与事件流各用一个会话；事件分发再移到 eventQueue，避免监听者拖住握手和接收回调。
     private let http = DshServer.localSession()
     private let streams = DshServer.localSession()
 
-    var isRunning: Bool { lock.lock(); defer { lock.unlock() }; return proc?.isRunning == true && port > 0 && !sockets.isEmpty }
+    var isRunning: Bool { lock.lock(); defer { lock.unlock() }; return ready && proc?.isRunning == true }
 
     /// 服务没在跑就起一个并连上两条事件流。成功返回 nil，否则是出错的原因。
     func ensure(executable: String, environment: [String: String], cwd: String) -> String? {
-        lock.lock(); defer { lock.unlock() }
-        if proc?.isRunning == true, port > 0, !sockets.isEmpty { return nil }
+        startupQueue.sync { start(executable: executable, environment: environment, cwd: cwd) }
+    }
+
+    private func start(executable: String, environment: [String: String], cwd: String) -> String? {
+        if isRunning { return nil }
         shutdown()
-        generation += 1
-        let gen = generation
+        lock.lock(); let gen = generation; lock.unlock()
         let p = Process()
         // 套一层 sh：App 正常退出时会来结束它（SIGTERM → 连 dsh 一起结束）；App 被强制结束、崩了的话没人来通知，
         // 所以它自己每两秒看一眼 App 还在不在，不在了就把 dsh 结束掉，不留下没人管的服务。
@@ -56,48 +69,77 @@ final class DshServer {
         p.standardError = err
         // 端口只在标准输出的那一行里：dsh web: http://127.0.0.1:50814
         let found = DispatchSemaphore(value: 0)
+        let outputLock = NSLock(), stderrTail = OutputBuffer(limit: 1500)
         var buffer = "", got = 0
         out.fileHandleForReading.readabilityHandler = { h in
             let d = h.availableData
             guard !d.isEmpty else { h.readabilityHandler = nil; return }
+            outputLock.lock(); defer { outputLock.unlock() }
+            guard got == 0 else { return }   // 端口找到后仍读走输出，但不再攒常驻服务的日志
             buffer += String(decoding: d, as: UTF8.self)
             if got == 0, let r = buffer.range(of: #"http://[^\s:/]+:(\d+)"#, options: .regularExpression),
                let n = Int(buffer[r].split(separator: ":").last ?? "") {
                 got = n
+                buffer = ""
                 found.signal()
             }
         }
-        err.fileHandleForReading.readabilityHandler = { [weak self] h in
+        err.fileHandleForReading.readabilityHandler = { h in
             let d = h.availableData
             guard !d.isEmpty else { h.readabilityHandler = nil; return }
-            self?.lock.lock()
-            self?.stderrTail = String(((self?.stderrTail ?? "") + String(decoding: d, as: UTF8.self)).suffix(1500))
-            self?.lock.unlock()
+            stderrTail.append(d)
         }
-        do { try p.run() } catch { return "dsh 启动不了：\(error.localizedDescription)" }
-        proc = p
-        guard found.wait(timeout: .now() + 30) == .success, got > 0 else {
-            let why = trimmed(stderrTail)
-            shutdown()
-            return "dsh 的本机服务没有启动起来" + (why.isEmpty ? "（30 秒内没有报出端口）" : "：\(String(why.suffix(300)))")
+        // 进程（sh 包装）退出就别再等端口：dsh 不存在或一启动就崩时立刻报错，不让用户干等 30 秒。
+        do { try ChildProcesses.shared.start(p, onExit: { found.signal() }) } catch {
+            out.fileHandleForReading.readabilityHandler = nil
+            err.fileHandleForReading.readabilityHandler = nil
+            return "dsh 启动不了：\(error.localizedDescription)"
         }
-        port = got
+        lock.lock()
+        let current = generation == gen
+        if current { proc = p }
+        lock.unlock()
+        guard current else { if p.isRunning { p.terminate() }; return "dsh 启动已取消" }
+        // 等端口/握手时不拿 server 锁，日志和事件回调才能继续排空。
+        let reported = found.wait(timeout: .now() + 30) == .success
+        outputLock.lock(); let announcedPort = got; outputLock.unlock()
+        guard reported, announcedPort > 0 else {
+            let why = trimmed(stderrTail.string)
+            shutdown(generation: gen)
+            return "dsh 的本机服务没有启动起来" + (why.isEmpty ? (reported ? "（还没报出端口就退出了）" : "（30 秒内没有报出端口）") : "：\(String(why.suffix(300)))")
+        }
+        lock.lock()
+        guard generation == gen else { lock.unlock(); return "dsh 启动已取消" }
+        port = announcedPort
+        lock.unlock()
         // 两条事件流都连上再算好：发一个 ping，收到回音说明握手完成了（之后的事件不会漏）
         let opened = DispatchGroup()
+        let pingLock = NSLock()
         var failed = false
         for path in ["events.mux", "events.host"] {
-            let task = streams.webSocketTask(with: URL(string: "ws://127.0.0.1:\(port)/api/\(path)")!)
+            let task = streams.webSocketTask(with: URL(string: "ws://127.0.0.1:\(announcedPort)/api/\(path)")!)
             task.maximumMessageSize = 64 << 20   // 一帧里可能带着整份系统提示词、大段命令输出
-            task.resume()
+            lock.lock()
+            guard generation == gen else { lock.unlock(); task.cancel(with: .goingAway, reason: nil); return "dsh 启动已取消" }
             sockets.append(task)
+            lock.unlock()
+            task.resume()
             opened.enter()
-            task.sendPing { e in if e != nil { failed = true }; opened.leave() }
+            task.sendPing { e in
+                pingLock.lock(); if e != nil { failed = true }; pingLock.unlock()
+                opened.leave()
+            }
             pump(task, gen)
         }
-        if opened.wait(timeout: .now() + 10) != .success || failed {
-            shutdown()
+        let openedInTime = opened.wait(timeout: .now() + 10) == .success
+        pingLock.lock(); let pingFailed = failed; pingLock.unlock()
+        if !openedInTime || pingFailed {
+            shutdown(generation: gen)
             return "连不上 dsh 的本机服务（事件流没有握上手）"
         }
+        lock.lock(); defer { lock.unlock() }
+        guard generation == gen, p.isRunning, sockets.count == 2 else { return "dsh 启动已取消" }
+        ready = true
         return nil
     }
 
@@ -106,7 +148,7 @@ final class DshServer {
             guard let self = self else { return }
             switch result {
             case .failure:
-                self.disconnected(gen)
+                self.eventQueue.async { self.disconnected(gen) }
             case .success(let message):
                 let data: Data?
                 switch message {
@@ -117,7 +159,11 @@ final class DshServer {
                 if let d = data, let frame = (try? JSONSerialization.jsonObject(with: d)) as? [String: Any],
                    var payload = frame["payload"] as? [String: Any] {
                     payload["_rpcId"] = frame["rpcId"]   // 答复审批时要原样带回去
-                    self.dispatch(payload)
+                    let event = payload
+                    self.eventQueue.async {
+                        self.lock.lock(); let current = self.generation == gen; self.lock.unlock()
+                        if current { self.dispatch(event) }
+                    }
                 }
                 self.pump(task, gen)
             }
@@ -137,19 +183,24 @@ final class DshServer {
         lock.lock()
         guard gen == generation, !sockets.isEmpty else { lock.unlock(); return }
         let all = listeners.values.flatMap { Array($0.values) }
-        shutdown()
         lock.unlock()
+        shutdown(generation: gen)
         all.forEach { $0(["type": "_disconnected"]) }
     }
 
     /// 停掉服务（App 退出、事件流断了）。SIGTERM 它半秒内就退。
-    func shutdown() {
-        lock.lock(); defer { lock.unlock() }
-        sockets.forEach { $0.cancel(with: .goingAway, reason: nil) }
+    func shutdown(generation expected: Int? = nil) {
+        lock.lock()
+        guard expected == nil || expected == generation else { lock.unlock(); return }
+        generation += 1
+        let oldSockets = sockets, oldProc = proc
         sockets = []
         port = 0
-        if let p = proc, p.isRunning { p.terminate() }
+        ready = false
         proc = nil
+        lock.unlock()
+        oldSockets.forEach { $0.cancel(with: .goingAway, reason: nil) }
+        if let p = oldProc, p.isRunning { p.terminate() }
     }
 
     /// 盯一个会话的事件（两条流上带这个 sessionId 的帧都会来）。返回的号用来取消。
@@ -167,7 +218,7 @@ final class DshServer {
     }
 
     /// 调一个方法，等它答复。typert：那一批参数要包在 args 里的端点（commands/execute 等）。
-    /// rpcId：自己指定这次调用的编号（发出去的话会带着它出现在事件里，用来认出「这句是我发的」）。
+    /// rpcId：自己指定这次调用的编号（发出去的话会带着它出现在事件里，用来认出这句是 App 自己发的）。
     func call(_ method: String, _ payload: [String: Any] = [:], typert: Bool = false, rpcId: String? = nil, timeout: TimeInterval = 60) -> (value: Any?, error: String?, code: String) {
         lock.lock(); let port = self.port; lock.unlock()
         guard port > 0, let url = URL(string: "http://127.0.0.1:\(port)/api/\(method)") else { return (nil, "dsh 的本机服务没有在运行", "not-running") }

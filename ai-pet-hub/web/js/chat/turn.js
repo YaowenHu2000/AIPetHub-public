@@ -23,8 +23,8 @@ function renderStep(step) {
   const el = document.createElement('div');
   el.className = `step step-${step.kind}` + (step.status === 'running' ? ' running' : '') + (step.status === 'error' ? ' error' : '');
   if (step.kind === 'user') {   // 回答进行中你补充的一句
-    el.innerHTML = '<div class="step-user"><span class="step-user-tag">你补充说</span><span class="step-user-text"></span></div>';
-    el.querySelector('.step-user-text').textContent = step.detail || '';
+    el.innerHTML = '<div class="step-user"><span class="step-user-tag">你补充说</span><div class="step-user-text"></div></div>';
+    fillUserMessage(el.querySelector('.step-user-text'), step.detail || '', step.images);
     return el;
   }
   if (step.kind === 'text') {   // 中途的说明文字直接显示成浅色段落
@@ -130,11 +130,14 @@ function renderTurn(msg, cwd) {
   const el = document.createElement('div');
   el.className = 'msg bot turn';
   el.dataset.cwd = cwd || '';
+  el._historySig = messageSignature({ ...msg, role: 'bot' });
   el._files = msg.files || [];
   const steps = msg.steps || [];
   if (steps.length) {
     const d = durationText(msg.duration);
-    el.appendChild(renderWork(steps, d ? `已工作 ${d}` : '工作过程', false));
+    const work = renderWork(steps, d ? `已工作 ${d}` : '工作过程', false);
+    work.dataset.sec = Math.round(msg.duration || 0);   // 在别处跑着时，从这个数接着实时往上走（chat/elsewhere.js）
+    el.appendChild(work);
   }
   if (msg.text) {
     const answer = document.createElement('div');
@@ -155,7 +158,7 @@ function renderTurn(msg, cwd) {
 }
 
 /** 出错或被停止的回答下面加「重试」：用同一句话在这个会话里再问一次。 */
-function addRetry(turn, id, text) {
+function addRetry(turn, id, text, images = []) {
   let actions = turn.querySelector('.turn-actions');
   if (!actions) {
     actions = document.createElement('div');
@@ -169,9 +172,8 @@ function addRetry(turn, id, text) {
   btn.title = '用同一句话再问一次';
   btn.addEventListener('click', () => {
     if (id !== active || viewBusy(id)) return;
-    els.input.value = text;
-    autosize();
-    send();
+    // 重试自己的完整请求，输入框里可能已经放着下一条的图片。
+    startRun(id, text, images);
   });
   actions.appendChild(btn);
 }
@@ -222,6 +224,7 @@ window.onFilesDropped = data => {
   const lead = before && !/\s$/.test(before) ? ' ' : '';
   const tail = after && !/^\s/.test(after) ? ' ' : '';
   el.value = before + lead + text + tail + after;
+  setDraft(active, el.value);
   el.selectionStart = el.selectionEnd = (before + lead + text).length;
   el.focus();
   autosize();

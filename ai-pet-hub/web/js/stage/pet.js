@@ -77,7 +77,7 @@ class Pet {
       else if (act === 'sleep') this.toggleSleep();
     }));
     this.statusEl.addEventListener('click', e => {
-      if (!isBusy(id)) {
+      if (!petBusy(id)) {
         e.stopPropagation();
         this.cyclePose();
       }
@@ -217,14 +217,18 @@ class Pet {
       if (!keys) keys = [0, 1, 2, 3].map(i => `${phase}_f${i}`);
       const n = keys.length;
       this.card.classList.toggle('fast-art', fastArt);   // 放的是专门画的 fast 帧（stage.css：这时不再整个人前倾）
-      let i = Math.round((this.busyFrame || 0) * n) % n;
+      const start = Math.round((this.busyFrame || 0) * n) % n;
+      const began = Date.now();
+      const frameMs = (meta.frameMs * 4) / n / (this.fastForm ? FAST_FORM_SPEED : 1);
       this.stopBusyLoop();   // 同一时间只留一个循环（延时开始的和立即开始的不会叠成两个）
       const id = setInterval(() => {
         if (this.state !== phase || this.busyTimer !== id) { clearInterval(id); if (this.busyTimer === id) this.busyTimer = null; return; }
-        i = (i + 1) % n;
+        if (document.hidden || !this.card.offsetWidth) return;
+        // 隐藏期间不写帧；恢复后按经过的时间接上，避免从旧位置慢慢追赶。
+        const i = (start + Math.floor((Date.now() - began) / frameMs)) % n;
         this.busyFrame = i / n;
         this.showFrame(keys[i], true);
-      }, (meta.frameMs * 4) / n / (this.fastForm ? FAST_FORM_SPEED : 1));
+      }, frameMs);
       this.busyTimer = id;
     };
     if (delayMs > 0) this.seqTimers.push(setTimeout(begin, delayMs));

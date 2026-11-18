@@ -1,0 +1,6 @@
+# 模拟装了 Git LFS 的机器（CI 就是）：全局带着过滤器。tools/test.sh 用它把快照测试再跑一遍。
+[filter "lfs"]
+	clean = git-lfs clean -- %f
+	smudge = git-lfs smudge -- %f
+	process = git-lfs filter-process
+	required = true

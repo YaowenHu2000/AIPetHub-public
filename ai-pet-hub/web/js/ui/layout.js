@@ -118,7 +118,7 @@ function buildSplitter(i) {
   return bar;
 }
 
-// ===== 左右拖动：历史栏宽度、桌宠活动空间 =====
+// ===== 左右拖动：历史栏宽度、桌宠活动空间（拖到底就收起） =====
 const COLUMNS = {
   sidebar: { key: 'sidebar_w', def: 260, min: 200, max: 480, cssVar: '--sidebar-w' },
   stage: { key: 'stage_w', def: 330, min: 240, max: 760, cssVar: '--stage-w' },
@@ -132,22 +132,23 @@ const widths = {
 
 function applyWidths() {
   const sidebarOn = !document.body.classList.contains('sidebar-hidden');
+  const stageOn = !document.body.classList.contains('stage-hidden');
   const paneEl = document.getElementById('preview-pane');
   const previewOn = !!paneEl && !paneEl.hidden;
   const maxed = previewOn && document.body.classList.contains('preview-max');
   let sw = clamp(widths.sidebar, COLUMNS.sidebar.min, COLUMNS.sidebar.max);
   let tw = clamp(widths.stage, COLUMNS.stage.min, COLUMNS.stage.max);
   let pw = clamp(widths.preview, COLUMNS.preview.min, COLUMNS.preview.max);
-  const room = window.innerWidth - (maxed ? 0 : 380) - 15;   // 中间聊天至少留 380px
-  const used = () => (sidebarOn ? sw : 0) + tw + (previewOn && !maxed ? pw : 0);
+  const room = window.innerWidth - (maxed ? COLUMNS.preview.min : 380) - 15;   // 聊天至少留 380px；最大化时把这份空间让给预览的最小宽度
+  const used = () => (sidebarOn ? sw : 0) + (stageOn ? tw : 0) + (previewOn && !maxed ? pw : 0);
   // 放不下时先缩预览，再缩舞台，最后缩左栏
   if (previewOn && !maxed && used() > room) pw = Math.max(COLUMNS.preview.min, pw - (used() - room));
-  if (used() > room) tw = Math.max(COLUMNS.stage.min, tw - (used() - room));
+  if (stageOn && used() > room) tw = Math.max(COLUMNS.stage.min, tw - (used() - room));
   if (sidebarOn && used() > room) sw = Math.max(COLUMNS.sidebar.min, sw - (used() - room));
   // 还放不下（窗口很窄又开着预览）：先把桌宠舞台收起来，窗口变宽后自动回来，聊天和预览优先
-  const squeezed = used() > room;
+  const squeezed = stageOn && used() > room;
   document.body.classList.toggle('stage-squeezed', squeezed);
-  if (squeezed) tw = 0;
+  if (squeezed || !stageOn) tw = 0;
   document.documentElement.style.setProperty('--sidebar-w', `${sw}px`);
   document.documentElement.style.setProperty('--stage-w', `${tw}px`);
   document.documentElement.style.setProperty('--preview-w', `${pw}px`);
@@ -167,9 +168,17 @@ function setupColumnResizer(el, which) {
     document.body.classList.add('resizing-col');
     closePopover();
     let snapped = false;
+    // 左栏、右栏：一直往外拖，拖过最小宽度的一半就收起来（松手前往回拖还能拉出来）；收起的那一下触控板一震
+    const setHidden = which === 'sidebar' ? setSidebarHidden : which === 'stage' ? setStageHidden : null;
+    const hiddenClass = `${which}-hidden`;
     const move = ev => {
       const dx = ev.clientX - startX;
       let w = which === 'sidebar' ? startW + dx : startW - dx;
+      if (setHidden) {
+        const collapse = w < COLUMNS[which].min / 2;
+        if (collapse !== document.body.classList.contains(hiddenClass)) { setHidden(collapse); postNative('haptic', {}); }
+        if (collapse) return;
+      }
       // 靠近默认宽度时吸过去（差 9px 以内），吸上的那一下触控板轻轻一震；要再拖开得多拖出这一小段
       const near = Math.abs(w - COLUMNS[which].def) <= 9;
       if (near) w = COLUMNS[which].def;
@@ -184,6 +193,7 @@ function setupColumnResizer(el, which) {
       el.removeEventListener('pointercancel', up);
       el.classList.remove('dragging');
       document.body.classList.remove('resizing-col');
+      if (setHidden && document.body.classList.contains(hiddenClass)) { widths[which] = Math.round(startW); return; }   // 收起了：宽度还是拖之前的，下次展开照旧
       widths[which] = Math.round(target.getBoundingClientRect().width);
       lsSet(COLUMNS[which].key, widths[which]);
     };
@@ -201,6 +211,14 @@ function setupColumnResizer(el, which) {
 function setSidebarHidden(hidden) {
   document.body.classList.toggle('sidebar-hidden', hidden);
   lsSet('sidebar_hidden', hidden ? '1' : '');
+  applyWidths();
+}
+
+/** 右栏（AI 娘）收起 / 展开。 */
+function setStageHidden(hidden) {
+  document.body.classList.toggle('stage-hidden', hidden);
+  lsSet('stage_hidden', hidden ? '1' : '');
+  document.querySelectorAll('.btn-stage-toggle').forEach(b => { b.title = hidden ? '展开 AI 娘' : '收起 AI 娘'; });
   applyWidths();
 }
 

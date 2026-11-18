@@ -31,6 +31,7 @@ extension AppDelegate {
     func webViewWebContentProcessDidTerminate(_ webView: WKWebView) {
         if webView === browser { webView.reload(); return }
         browser?.isHidden = true
+        syncPDF()
         webView.loadFileURL(indexURL, allowingReadAccessTo: indexURL.deletingLastPathComponent())
     }
 }

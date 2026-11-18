@@ -11,40 +11,13 @@ extension AppDelegate {
         procLock.unlock()
         if let c = cached, c.path != nil || Date().timeIntervalSince(c.at) < 60 { return c.path }
         let shell = ProcessInfo.processInfo.environment["SHELL"].flatMap { fm.isExecutableFile(atPath: $0) ? $0 : nil } ?? "/bin/zsh"
-        let res = runOnce(shell, ["-lc", "command -v \(name)"], cwd: home, timeout: 8)
+        let res = runTool(shell, ["-lc", "command -v \(name)"], cwd: home, timeout: 8)
         let found = res.out.split(separator: "\n").map { $0.trimmingCharacters(in: .whitespaces) }
             .last { $0.hasPrefix("/") && fm.isExecutableFile(atPath: $0) }
         procLock.lock()
         pathLookupCache[name] = (found, Date())
         procLock.unlock()
         return found
-    }
-
-    /// 跑一个命令等它结束，最多等 timeout 秒（超时就结束它）。只用来找命令、做验证，不登记到「正在回答」里。
-    func runOnce(_ executable: String, _ arguments: [String], cwd: String, timeout: TimeInterval) -> (out: String, err: String, status: Int32, timedOut: Bool) {
-        let proc = Process()
-        proc.executableURL = URL(fileURLWithPath: executable)
-        proc.arguments = arguments
-        proc.currentDirectoryURL = URL(fileURLWithPath: cwd)
-        proc.environment = cliEnvironment()
-        proc.standardInput = FileHandle.nullDevice
-        let outPipe = Pipe(), errPipe = Pipe()
-        proc.standardOutput = outPipe
-        proc.standardError = errPipe
-        var outData = Data(), errData = Data()
-        let group = DispatchGroup()
-        do { try proc.run() } catch { return ("", error.localizedDescription, -1, false) }
-        // 两个管道各用一个线程读完：输出多的时候不读会把管道填满，进程就卡住不退了
-        group.enter(); DispatchQueue.global().async { outData = outPipe.fileHandleForReading.readDataToEndOfFile(); group.leave() }
-        group.enter(); DispatchQueue.global().async { errData = errPipe.fileHandleForReading.readDataToEndOfFile(); group.leave() }
-        var timedOut = false
-        if group.wait(timeout: .now() + timeout) == .timedOut {
-            timedOut = true
-            proc.terminate()
-            if group.wait(timeout: .now() + 3) == .timedOut { kill(proc.processIdentifier, SIGKILL); _ = group.wait(timeout: .now() + 2) }
-        }
-        proc.waitUntilExit()
-        return (String(data: outData, encoding: .utf8) ?? "", String(data: errData, encoding: .utf8) ?? "", proc.terminationStatus, timedOut)
     }
 
     /// 这一位的 CLI 在哪，以及验证时怎么让它答一句话。没装返回 nil。
@@ -85,14 +58,14 @@ extension AppDelegate {
             let started = Date()
             var payload: [String: Any] = ["agent": agent, "ok": false]
             if let p = self.agentProbe(agent), agent == "gpt",
-               self.runOnce(p.path, ["login", "status"], cwd: self.home, timeout: 15).status != 0 {
+               self.runTool(p.path, ["login", "status"], cwd: self.home, timeout: 15).status != 0 {
                 // Codex 没登录时 exec 会一直等，验证要白等 100 秒：先问它登录了没有（零点几秒）
                 payload["path"] = p.path
                 payload["error"] = "Codex 还没有登录：在终端运行 codex login 登录后再试"
             } else if let p = self.agentProbe(agent) {
                 let dir = NSTemporaryDirectory() + "aipethub-verify"
                 try? self.fm.createDirectory(atPath: dir, withIntermediateDirectories: true)
-                let res = self.runOnce(p.path, p.verify, cwd: dir, timeout: 100)
+                let res = self.runTool(p.path, p.verify, cwd: dir, timeout: 100)
                 let reply = res.out.trimmingCharacters(in: .whitespacesAndNewlines)
                 let ok = res.status == 0 && !res.timedOut && !reply.isEmpty
                 payload["ok"] = ok

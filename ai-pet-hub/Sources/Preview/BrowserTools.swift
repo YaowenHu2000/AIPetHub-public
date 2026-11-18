@@ -72,8 +72,11 @@ extension AppDelegate {
         guard let req = jsonObject(data), let tool = req["tool"] as? String else { return Data() }
         let id = UUID().uuidString
         browserJobs[id] = .some(nil)
+        let lifetime = hooks.browserJobLifetime ?? 60   // MCP 客户端通常等 45 秒；退出或超时后无人领取的结果也要释放
+        DispatchQueue.main.asyncAfter(deadline: .now() + lifetime) { [weak self] in self?.browserJobs[id] = nil }
         browserTool(tool, req["args"] as? [String: Any] ?? [:]) { [weak self] result in
-            self?.browserJobs[id] = .some((try? JSONSerialization.data(withJSONObject: result)) ?? Data("{}".utf8))
+            guard let self = self, self.browserJobs.keys.contains(id) else { return }
+            self.browserJobs[id] = .some((try? JSONSerialization.data(withJSONObject: result)) ?? Data("{}".utf8))
         }
         return Data(id.utf8)
     }
@@ -100,13 +103,18 @@ extension AppDelegate {
     }
 
     /// 等页面载入完（最多 20 秒）。
-    private func whenLoaded(_ then: @escaping (WKWebView?) -> Void) {
+    private func whenLoaded(generation: Int, _ then: @escaping (WKWebView?, String?) -> Void) {
         var ticks = 0
         Timer.scheduledTimer(withTimeInterval: 0.25, repeats: true) { [weak self] t in
             ticks += 1
-            let b = self?.browser
-            if ticks >= 3, let b = b, !b.isLoading, b.url != nil, self?.docPreviewPending == nil { t.invalidate(); then(b) }
-            else if ticks > 80 { t.invalidate(); then(b) }
+            guard let self = self else { t.invalidate(); then(nil, "内置浏览器没有打开"); return }
+            guard self.browserNavigation.generation == generation else {
+                t.invalidate(); then(nil, "已被其它导航取代"); return
+            }
+            let b = self.browser
+            if let b = b, self.browserNavigation.finished, !b.isLoading, self.docPreviewPending == nil {
+                t.invalidate(); then(b, nil)
+            } else if ticks > 80 { t.invalidate(); then(nil, "等待页面加载超时") }
         }
     }
 
@@ -116,8 +124,22 @@ extension AppDelegate {
         case "browser_open":
             let url = trimmed(args["url"] as? String)
             guard !url.isEmpty else { fail("要给一个地址"); return }
-            sendToJS("onBrowserToolOpen", ["url": url])   // 让网页切到浏览器标签并打开（和用户在地址栏输入走同一条路）
-            whenLoaded { [weak self] b in
+            // 原生同步发起导航才能把回调绑到这一次；网页仍负责切出同一个浏览器面板。
+            var target = url
+            let http = target.lowercased().hasPrefix("http://") || target.lowercased().hasPrefix("https://")
+            let local = !http && (target.hasPrefix("/") || target.hasPrefix("~/") || target.lowercased().hasPrefix("file://")
+                || target.range(of: "\\.(html?|svg|pdf)$", options: [.regularExpression, .caseInsensitive]) != nil || isPreviewDocument(target))
+            if !local, !target.lowercased().hasPrefix("http://"), !target.lowercased().hasPrefix("https://") {
+                if target.range(of: "^[0-9]{2,5}$", options: .regularExpression) != nil { target = "localhost:" + target }
+                let loopback = target.range(of: "^(localhost|127\\.0\\.0\\.1|0\\.0\\.0\\.0|\\[::1\\])", options: [.regularExpression, .caseInsensitive]) != nil
+                target = (loopback ? "http://" : "https://") + target
+            }
+            openInBrowser([local ? "path" : "url": target])
+            let generation = browserNavigation.generation
+            // navigateBrowser 会忽略纯空白；仍切出面板，但不会像空字符串那样抢地址栏焦点。
+            sendToJS("onBrowserToolOpen", ["url": " "])
+            whenLoaded(generation: generation) { [weak self] b, error in
+                if let error = error { fail(error); return }
                 guard let self = self, let b = b else { fail("内置浏览器没有打开"); return }
                 if !self.browserFailedURL.isEmpty { fail("打不开 \(self.browserFailedURL)：\(self.browserFailedTitle)"); return }
                 done(["text": "已打开。\n" + self.pageInfo(b)])

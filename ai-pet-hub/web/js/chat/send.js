@@ -33,6 +33,7 @@ function send() {
   const text = els.input.value.trim();
   const images = takeAttachments(id);   // 输入框上面附的图片（composer.js）
   if (!text && !images.length) return;
+  setDraft(id, '');
   els.input.value = '';
   st.draft = '';
   lsSet(`${id}_draft`, '');
@@ -51,14 +52,19 @@ function send() {
 }
 
 /** 开始新的一轮回答：记一个 run、显示用户消息和「正在工作」、交给原生去问。 */
-function startRun(id, text, images) {
+function startRun(id, text, images = []) {
   const st = S[id];
+  discardHistoryRefreshes(st);
   pets[id].moodEvent('sent');
   const run = {
     agent: id,
-    reqId: ++reqCounter,
+    reqId: nextRequestId(),
     view: viewKey(id),
     text,
+    prompt: text || '请看这张图片。',
+    images: images.slice(),
+    historyStart: !st.conversationId ? 0 : st.loadedId === st.conversationId
+      ? (st.shownOmitted || 0) + [...st.msgEl.children].filter(n => n.matches('.msg.user:not(.queued), .msg.bot.turn')).length : null,
     since: Date.now(),
     workspace: st.workspace || '',
     fast: fastOn(id),          // 这一轮开着 fast（桌宠换成 fast 的样子）
@@ -87,8 +93,8 @@ function startRun(id, text, images) {
   postNative('askAgent', {
     agent: id,
     reqId: run.reqId,
-    prompt: text || '请看这张图片。',
-    images,                          // 作为真正的图片交给模型（原生读文件）
+    prompt: run.prompt,
+    images: run.images,              // 作为真正的图片交给模型（原生读文件）
     browserTools: browserToolsOn(),  // 带不带内置浏览器的工具
     fast: run.fast,                  // fast 档（模型没有的话是 false）
     model: st.model,
@@ -122,6 +128,7 @@ function stop() {
 function setActive(id, focusInput = true) {
   if (!AGENTS[id]) return;
   if (id !== active) {
+    setDraft(active, els.input.value);
     S[active].draft = els.input.value;
     lsSet(`${active}_draft`, els.input.value);
     els.input.value = S[id].draft;

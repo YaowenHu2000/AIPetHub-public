@@ -1,43 +1,93 @@
-// 搜索会话正文：⌘F 除了标题和工作空间，也在三位的会话记录文件里找这段文字。
-// 直接在文件的字节里找（Claude、Codex 是 JSONL，Gemini 是 SQLite，文字都是明文 UTF-8），不解析内容，几百个会话也只要零点几秒。
+// 正文搜索先粗筛来源，再用打开历史的解析器和网页 Markdown 渲染确认；不建立磁盘索引。
 import Cocoa
+import SQLite3
 
 extension AppDelegate {
-    /// 每位的会话记录文件：会话 ID → 路径。
-    private func conversationFiles(_ agent: String) -> [(cid: String, path: String)] {
-        switch agent {
-        case "claude":
-            return claudeSessionFiles().map { ($0.cid, $0.path) }
-        case "deepseek":
-            return []   // 它的记录是 zstd 压缩的，系统自带的库解不开；搜正文先不支持
-        case "gpt":
-            // rollout-<时间>-<会话ID>.jsonl：会话 ID 是文件名最后 36 个字符
-            return plainRollouts().compactMap { r in
-                let name = ((r.path as NSString).lastPathComponent as NSString).deletingPathExtension
-                return name.count >= 36 ? (String(name.suffix(36)), r.path) : nil
-            }
-        default:
-            let dir = "\(geminiCliDir)/conversations"
-            return ((try? fm.contentsOfDirectory(atPath: dir)) ?? []).filter { $0.hasSuffix(".db") }
-                .map { (String($0.dropLast(3)), "\(dir)/\($0)") }
-        }
-    }
-
-    func searchConversations(agent: String, query: String) {
+    func searchConversations(agent: String, query: String, files: [(cid: String, path: String)]? = nil) {
         let q = trimmed(query)
-        guard q.count >= 2 else { sendToJS("onConversationsSearched", ["agent": agent, "query": query, "ids": [String]()]); return }
+        let request = ConversationSearchRequests.shared.begin(self, agent: agent)
+        guard q.count >= 2 else {
+            sendToJS("onConversationsSearched", ["agent": agent, "query": query, "ids": [String](), "complete": true]); return
+        }
         DispatchQueue.global(qos: .userInitiated).async { [self] in
-            // 英文不分大小写：原样、全小写、全大写、首字母大写各找一遍
-            var needles = [q, q.lowercased(), q.uppercased(), q.capitalized]
-            needles = Array(Set(needles))
-            let patterns = needles.map { Data($0.utf8) }
-            var ids: [String] = []
-            for f in conversationFiles(agent) {
-                guard let size = (try? fm.attributesOfItem(atPath: f.path))?[.size] as? Int, size > 0, size < 60_000_000,
-                      let data = try? Data(contentsOf: URL(fileURLWithPath: f.path), options: .mappedIfSafe) else { continue }
-                if patterns.contains(where: { data.range(of: $0) != nil }) { ids.append(f.cid) }
+            let renderer = ConversationSearchText(app: self)
+            var ids: [String] = [], items: [[String: Any]] = [], problems: [String] = []
+            var sent = Date(), scanned = 0
+            func current() -> Bool { ConversationSearchRequests.shared.current(self, agent: agent, request: request) }
+            func publish(_ complete: Bool) {
+                guard current() else { return }
+                var payload: [String: Any] = ["agent": agent, "query": query, "ids": ids, "items": items, "complete": complete, "scanned": scanned]
+                if !problems.isEmpty { payload["unavailable"] = Array(Set(problems)).sorted().joined(separator: "；") }
+                sendToJS("onConversationsSearched", payload)
+                sent = Date()
             }
-            sendToJS("onConversationsSearched", ["agent": agent, "query": query, "ids": ids])
+            guard renderer.available else { problems.append("这一位没搜：正文渲染器读取失败"); publish(true); return }
+            let found = searchSources(agent: agent, files: files)
+            if let error = found.error { problems.append("这一位没搜：" + error) }
+            let cache = hooks.conversationSearchCache ?? ConversationSearchCache.shared
+            for source in found.sources {
+                guard current() else { return }
+                scanned += 1
+                let key = agent + ":" + source.cid + ":" + source.paths.joined(separator: "|")
+                let stamp = searchStamp(source)
+                let shared = searchSharedDatabases(source)
+                let individualStamp = shared.isEmpty ? nil : searchStamp(source, excluding: shared)
+                var cachedValue = cache.get(key, stamp: stamp)
+                if cachedValue == nil, let individual = individualStamp,
+                   let previous = cache.revalidationCandidate(key, individualStamp: individual),
+                   let revision = searchDatabaseRevision(source), revision == previous.databaseRevision,
+                   stamp == searchStamp(source) {
+                    // 只有共享库变化、本会话原始内容没变：保留渲染结果，更新文件指纹。
+                    cache.put(key, stamp: stamp, texts: previous.texts, item: previous.item, dependencies: previous.dependencies,
+                              individualStamp: individual, databaseRevision: revision)
+                    cachedValue = previous
+                }
+                var texts: [String], item: [String: Any]
+                if let cached = cachedValue {
+                    texts = cached.texts; item = cached.item
+                } else {
+                    let candidate = searchCandidate(source, query: q)
+                    if let error = candidate.error { problems.append(error) }
+                    guard candidate.possible else {
+                        if Date().timeIntervalSince(sent) >= 0.3 { publish(false) }
+                        continue
+                    }
+                    let databaseRevision = individualStamp == nil ? nil : searchDatabaseRevision(source)
+                    hooks.conversationSearchLoaded?(agent, source.cid)
+                    let loaded = searchHistory(source, agent: agent, explicit: files != nil)
+                    if let error = loaded.error { problems.append(error) }
+                    renderer.prepare(loaded.messages, cwd: loaded.cwd)
+                    var visible = loaded.messages
+                    attachChatImages(&visible, payload: ["agent": agent, "conversationId": source.cid, "cwd": loaded.cwd], labelsOnly: true)
+                    texts = renderer.messages(visible)
+                    item = source.item
+                    if (item["title"] as? String ?? "").isEmpty {
+                        let first = loaded.messages.first { $0["role"] as? String == "user" }?["text"] as? String ?? ""
+                        item["title"] = titleFrom(first, fallbackId: source.cid)
+                    }
+                    if (item["cwd"] as? String ?? "").isEmpty { item["cwd"] = loaded.cwd }
+                    // 解析期间本会话被追加则不能缓存；只有共享库的无关写入可用会话指纹复核。
+                    let after = searchStamp(source)
+                    var unchanged = stamp == after
+                    if !unchanged, let individual = individualStamp, let revision = databaseRevision,
+                       individual == searchStamp(source, excluding: shared),
+                       revision == searchDatabaseRevision(source), after == searchStamp(source) { unchanged = true }
+                    if loaded.error == nil, unchanged {
+                        cache.put(key, stamp: after, texts: texts, item: item, dependencies: renderer.dependencies,
+                                  individualStamp: individualStamp, databaseRevision: databaseRevision)
+                    }
+                }
+                if let hit = texts.lastIndex(where: { $0.range(of: q, options: .caseInsensitive) != nil }) {
+                    ids.append(source.cid)
+                    item["searchLimit"] = max(300, texts.count - hit)
+                    if let range = texts[hit].range(of: q, options: .caseInsensitive) {
+                        item["searchMatch"] = String(texts[hit][range])
+                    }
+                    items.append(item)
+                }
+                if Date().timeIntervalSince(sent) >= 0.3 { publish(false) }
+            }
+            publish(true)
         }
     }
 }
@@ -48,11 +98,12 @@ extension AppDelegate {
     /// 工作空间里的文件（相对路径）。git 仓库用 git 列（自动跳过忽略的文件），否则自己走一遍目录。缓存 15 秒。
     private func workspaceFiles(_ ws: String) -> [String] {
         procLock.lock()
-        if let c = fileListCache[ws], Date().timeIntervalSince(c.at) < 15 { procLock.unlock(); return c.files }
+        fileListCache = fileListCache.filter { Date().timeIntervalSince($0.value.at) < 15 }
+        if let c = fileListCache[ws] { procLock.unlock(); return c.files }
         procLock.unlock()
         var files: [String] = []
-        if let listed = runGit(["ls-files", "--cached", "--others", "--exclude-standard"], in: ws) {
-            files = listed.split(separator: "\n").map(String.init)
+        if let listed = runGit(["ls-files", "-z", "--cached", "--others", "--exclude-standard"], in: ws) {
+            files = listed.split(separator: "\0").map(String.init)
         } else if let walker = fm.enumerator(atPath: ws) {
             let skip: Set<String> = ["node_modules", "build", "dist", ".git", "DerivedData", "__pycache__", ".venv", "venv"]
             while let rel = walker.nextObject() as? String, files.count < 8000 {
@@ -62,7 +113,13 @@ extension AppDelegate {
             }
         }
         if files.count > 20_000 { files = Array(files.prefix(20_000)) }
-        procLock.lock(); fileListCache[ws] = (Date(), files); procLock.unlock()
+        procLock.lock()
+        fileListCache = fileListCache.filter { Date().timeIntervalSince($0.value.at) < 15 }
+        fileListCache[ws] = (Date(), files)
+        while fileListCache.count > 8, let oldest = fileListCache.min(by: { $0.value.at < $1.value.at })?.key {
+            fileListCache.removeValue(forKey: oldest)
+        }
+        procLock.unlock()
         return files
     }
 

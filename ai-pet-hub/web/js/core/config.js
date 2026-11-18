@@ -29,6 +29,7 @@ const UI = {
   send: lineIcon('<path d="M12 19V5M5.5 11.5L12 5l6.5 6.5"/>'),
   stop: '<svg viewBox="0 0 24 24" fill="currentColor"><rect x="7" y="7" width="10" height="10" rx="2"/></svg>',
   sidebar: lineIcon('<rect x="3" y="4.5" width="18" height="15" rx="2.5"/><path d="M9 4.5v15"/>'),
+  sidebarRight: lineIcon('<rect x="3" y="4.5" width="18" height="15" rx="2.5"/><path d="M15 4.5v15"/>'),
   file: lineIcon('<path d="M14 3H7a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2V8z"/><path d="M14 3v5h5"/>'),
   filePlus: lineIcon('<path d="M14 3H7a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2V8z"/><path d="M14 3v5h5M12 11v6M9 14h6"/>'),
   pencil: lineIcon('<path d="M4 20h4L19 9l-4-4L4 16z"/><path d="M13.5 6.5l4 4"/>'),
@@ -84,7 +85,7 @@ const AGENTS = {
       { v: 'gpt-oss-120b', name: 'GPT-OSS 120B', tip: '开源模型，思考强度固定为中等', efforts: ['medium'] },
     ],
     model: 'gemini-4-argon',
-    efforts: effortOptions('low', 'medium', 'high'),
+    efforts: effortOptions('low', 'medium', 'high', 'xhigh', 'max'),
     effort: 'medium',
     perms: [
       { v: 'bypassPermissions', name: '最高权限', desc: '自动批准所有读写和命令' },
@@ -208,7 +209,7 @@ const AGENT_IDS = (() => {
   const list = Array.isArray(saved) ? ALL_AGENT_IDS.filter(id => saved.includes(id)) : [];
   return list.length ? list : ['gemini', 'claude', 'gpt'].filter(id => ALL_AGENT_IDS.includes(id));
 })();
-// 写死的模型列表只是 CLI 还没报上来之前的样子；CLI 一报（预热、第一次回答时），菜单就换成它的（见 ui/menus.js 的 onAgentModels）
+// 写死的模型列表只是 CLI 还没报上来之前的样子；CLI 一报（预热、第一次回答时），菜单就换成它的（见 ui/model-menu.js 的 onAgentModels）
 const BUILTIN_MODELS = Object.fromEntries(ALL_AGENT_IDS.map(id => [id, AGENTS[id].models]));
 // 以前写死的条目 → CLI 里对应的名字（选着旧条目的会自动换过去）
 const MODEL_ALIASES = { 'claude-opus-5-5': 'opus', 'claude-opus-5-5[1m]': 'opus', 'claude-fable-5-1[1m]': 'fable', 'claude-fable-5[1m]': 'fable', 'claude-sonnet-5-5': 'sonnet', 'gpt-oss-120b': 'gpt-oss-120b-medium' };

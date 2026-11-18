@@ -101,6 +101,13 @@ def cut_sheet(sheet, base, out_dir):
     return out
 
 
+def run_jobs(jobs, n=12):
+    """并发发一批生图请求，每张出来就打印一行。"""
+    with ThreadPoolExecutor(n) as ex:
+        for msg in ex.map(imgapi.run, jobs):
+            print(msg, flush=True)
+
+
 if __name__ == '__main__':
     cmd, work = sys.argv[1], Path(sys.argv[2])
     if cmd == 'bases':

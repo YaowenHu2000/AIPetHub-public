@@ -25,7 +25,8 @@ mkdir -p build
 touch build/.metadata_never_index
 rm -rf "$APP"
 mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources/web"
-swiftc -O Sources/**/*.swift -o "$APP/Contents/MacOS/$APP_NAME" -framework Cocoa -framework WebKit -lsqlite3
+# -j：同时编多个文件（默认只用一个核，48 秒；18 核上约 7 秒），优化级别和产物不变
+swiftc -O -j "$(sysctl -n hw.ncpu)" Sources/**/*.swift -o "$APP/Contents/MacOS/$APP_NAME" -framework Cocoa -framework WebKit -lsqlite3
 
 cp web/index.html "$APP/Contents/Resources/web/"
 cp -R web/js web/css web/vendor web/rig "$APP/Contents/Resources/web/"

@@ -6,8 +6,9 @@ App 优先放这一套；缺图时退回原来的 4 帧（`<动作>_f0…f3`）�
 这里放的是 PNG 原图，出图和处理的脚本都读写它；`build.sh` 打包时转成 WebP 放进 App（见 `build.sh` 里的说明），
 加载素材的代码在 `web/js/stage/sprites.js`，扩展名由其中的 `SPRITE_EXT` 决定。
 
-**fast 形态**（开着 fast 时思考 / 查阅 / 施工换成的那一套，只有克劳蒂娜和吉佩缇有）：`<动作>_fast_g00 … _g05.png`，6 帧。
-画法不一样：让模型把 6 帧一次画在同一张图里（3×2），再切开，帧和帧之间细节一致。脚本是 `gen_fast.py`，用法见它开头；
+**fast 形态**（开着 fast 时思考 / 查阅 / 施工换成的那一套，极其猫没有）：`<动作>_fast_g00 … _g05.png`，6 帧。
+画法不一样：让模型把 6 帧一次画在同一张图里（3×2），再切开，帧和帧之间细节一致。脚本是 `gen_fast.py`，用法见它开头
+（大肥鱼整套都是这个画法，用的是 `deepseek/gen_set.py`，见 [deepseek/README.md](deepseek/README.md)）；
 这套做法整理成了技能 `.claude/skills/sprite-sheet-animation`，新的多帧素材都按它来。
 
 ## 原则

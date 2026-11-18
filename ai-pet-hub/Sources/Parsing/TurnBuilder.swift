@@ -44,8 +44,8 @@ func simpleDiff(old: String, new: String) -> String {
 
 func makeStep(_ kind: String, _ title: String, detail: String? = nil, path: String? = nil, status: String = "ok") -> [String: Any] {
     var step: [String: Any] = ["kind": kind, "title": title, "status": status]
-    // 说明文字不截断：最后一段会成为正式回答
-    if let d = detail, !d.isEmpty { step["detail"] = kind == "text" ? d : clip(d, maxDetail) }
+    // 正文和用户原话不能丢；工具说明仍限制长度
+    if let d = detail, !d.isEmpty { step["detail"] = ["text", "user"].contains(kind) ? d : clip(d, maxDetail) }
     if let p = path, !p.isEmpty { step["path"] = p }
     return step
 }
@@ -86,8 +86,21 @@ final class TurnBuilder {
 
     func update(_ key: String, _ fields: [String: Any]) {
         guard let i = keyIndex[key] else { return }
+        let interrupted = steps[i]["status"] as? String == "interrupted"
         fields.forEach { steps[i][$0.key] = $0.value }
+        // 有的 CLI 把取消回执也报成 failed。保留输出和真正完成的结果，避免已停止的工具又变红或转圈。
+        if interrupted, let status = fields["status"] as? String, status == "error" || status == "running" {
+            steps[i]["status"] = "interrupted"
+        }
         onChange?(i, steps[i])
+    }
+
+    func interruptRunningTools() {
+        for i in steps.indices where steps[i]["status"] as? String == "running" {
+            if ["text", "think", "error"].contains(steps[i]["kind"] as? String ?? "") { continue }
+            steps[i]["status"] = "interrupted"
+            onChange?(i, steps[i])
+        }
     }
 
     func addFile(_ path: String, kind: String, diff: String? = nil) {
@@ -108,14 +121,28 @@ final class TurnBuilder {
     var isEmpty: Bool { steps.isEmpty && files.isEmpty }
 
     /// 最后一段说明文字就是正式回答；和 finalText 相同就从步骤里拿掉。
-    func finish(finalText: String?) -> [String: Any] {
+    /// outcome：completed / failed / interrupted / incomplete；非正常结局保留正文并附上原因。
+    func finish(finalText: String?, outcome: String = "completed", error: String? = nil, stepOrder: [Int]? = nil, includeEnding: Bool = true) -> [String: Any] {
         var final = trimmed(finalText)
-        var out = steps
+        var out = stepOrder?.map { steps[$0] } ?? steps
         if let i = out.lastIndex(where: { $0["kind"] as? String == "text" }) {
             let t = trimmed(out[i]["detail"] as? String)
             if final.isEmpty { final = t; out.remove(at: i) } else if t == final { out.remove(at: i) }
         }
-        for j in out.indices where out[j]["status"] as? String == "running" { out[j]["status"] = "ok" }
-        return ["text": final, "steps": out, "files": fileOrder.compactMap { files[$0] }]
+        // 进程结束不代表工具成功；只有工具结果才能把它变成 ok。
+        for j in out.indices where out[j]["status"] as? String == "running" {
+            if outcome == "interrupted" { out[j]["status"] = "interrupted" }
+            else if outcome == "failed" { out[j]["status"] = "error" }
+            else if outcome == "completed", ["text", "think"].contains(out[j]["kind"] as? String ?? "") { out[j]["status"] = "ok" }
+        }
+        if includeEnding, outcome != "completed" {
+            let title = outcome == "failed" ? "出错" : (outcome == "interrupted" ? "已中断" : "未完成")
+            let fallback = outcome == "failed" ? "这一轮出错了。" : (outcome == "interrupted" ? "这一轮已中断。" : "记录到这里就断了，这一轮还没写完。")
+            let ending = makeStep("error", title, detail: trimmed(error).isEmpty ? fallback : error, status: outcome == "interrupted" ? "interrupted" : "error")
+            // 解析器可能已经实时展示了同一个终态错误，收尾时不重复列两次。
+            if out.last?["kind"] as? String == "error", out.last?["detail"] as? String == ending["detail"] as? String { out.removeLast() }
+            out.append(ending)
+        }
+        return ["outcome": outcome, "text": final, "steps": out, "files": fileOrder.compactMap { files[$0] }]
     }
 }

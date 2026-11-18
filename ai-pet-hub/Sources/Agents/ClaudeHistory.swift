@@ -19,18 +19,19 @@ extension AppDelegate {
         return roots
     }
 
-    func findClaudeSession(cid: String) -> String? {
+    /// 调用方在 claudeQueue 上；同 ID 的副本先沿用列表确定的路径，没有缓存时和列表一样取最新。
+    func findClaudeSession(cid: String, files: [(cid: String, path: String, mtime: Date)]? = nil) -> String? {
         if let cached = claudeCache[cid], fm.fileExists(atPath: cached.path) { return cached.path }
-        for root in claudeProjectRoots() {
-            for proj in (try? fm.contentsOfDirectory(atPath: root)) ?? [] {
-                let candidate = "\(root)/\(proj)/\(cid).jsonl"
-                if fm.fileExists(atPath: candidate) { return candidate }
-            }
-        }
-        return nil
+        return (files ?? claudeSessionFiles()).first { $0.cid == cid && fm.fileExists(atPath: $0.path) }?.path
     }
 
     /// 一行会话记录对应的可展示文字；工具调用、子代理、元信息等返回 nil。
+    /// 点了停止之后 Claude Code 自己往记录里写的一条「用户消息」（[Request interrupted by user] / … for tool use）：
+    /// 它不是用户说的话，是「这一轮被中断了」的标记。
+    func claudeInterruptMarker(_ text: String) -> Bool {
+        text.trimmingCharacters(in: .whitespacesAndNewlines).hasPrefix("[Request interrupted by user")
+    }
+
     func claudeDisplayText(_ obj: [String: Any]) -> String? {
         for flag in ["isSidechain", "isMeta", "isApiErrorMessage", "isCompactSummary"] where (obj[flag] as? Bool) == true {
             return nil
@@ -41,12 +42,12 @@ extension AppDelegate {
         }
         guard let msg = obj["message"] as? [String: Any] else { return nil }
         let text = stripTagBlocks(textBlocks(msg["content"]), tags: ["system-reminder"])
-        if text.isEmpty { return nil }
+        if text.isEmpty || claudeInterruptMarker(text) { return nil }
         for prefix in ["<local-command", "<command-name>", "<command-message>", "<bash-input>", "<bash-stdout>",
                        "<bash-stderr>", "<task-notification>", "Caveat: The messages below"] where text.hasPrefix(prefix) {
             return nil
         }
-        return text
+        return text.replacingOccurrences(of: #"</?pasted_content\b[^>]*>"#, with: "", options: .regularExpression)
     }
 
     /// 逐行遍历（不把整个文件转成字符串）；body 返回 false 时停止。
@@ -67,7 +68,8 @@ extension AppDelegate {
             guard let r = data.range(of: needle, options: .backwards, in: data.startIndex..<searchEnd) else { return nil }
             if r.lowerBound == data.startIndex || data[r.lowerBound - 1] == 0x0A {
                 let end = data[r.lowerBound...].firstIndex(of: 0x0A) ?? data.endIndex
-                return jsonObject(data[r.lowerBound..<end])
+                // 文件可能正写到一半：跳过坏尾行，继续找上一条完整记录。
+                if let obj = jsonObject(data[r.lowerBound..<end]) { return obj }
             }
             searchEnd = r.lowerBound
         }
@@ -84,18 +86,42 @@ extension AppDelegate {
             title = t
         }
 
-        var firstUser = "", cwd = ""
+        var firstUser = "", cwd = "", entrypoint = "", started: Date?
+        let iso = ISO8601DateFormatter()
+        iso.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
         let scanLimit = data.startIndex + min(data.count, 4_000_000)
         forEachLine(data) { line in
             guard line.startIndex < scanLimit else { return false }
             guard let obj = jsonObject(line) else { return true }
             if cwd.isEmpty, let c = obj["cwd"] as? String, !c.isEmpty, c != "/" { cwd = c }
-            if obj["type"] as? String == "user", let text = claudeDisplayText(obj) { firstUser = text }
+            if entrypoint.isEmpty, let e = obj["entrypoint"] as? String { entrypoint = e }
+            if started == nil, let t = obj["timestamp"] as? String { started = iso.date(from: t) }
+            if obj["type"] as? String == "user" {
+                if let text = claudeDisplayText(obj) { firstUser = text }
+                else if (obj["isSidechain"] as? Bool) != true, (obj["isMeta"] as? Bool) != true,
+                        ((obj["origin"] as? [String: Any])?["kind"] as? String ?? "human") == "human",
+                        !claudeImageSources(obj).isEmpty { firstUser = "图片对话" }
+            }
             return firstUser.isEmpty
         }
         if firstUser.isEmpty && title.isEmpty { return nil }
-        return ["id": cid, "title": titleFrom(title.isEmpty ? firstUser : title, fallbackId: cid),
-                "time": timeLabel(mtime), "timestamp": mtime.timeIntervalSince1970, "cwd": cwd]
+        title = title.replacingOccurrences(of: #"</?pasted_content\b[^>]*>"#, with: "", options: .regularExpression)
+        var item: [String: Any] = ["id": cid, "title": titleFrom(title.isEmpty ? firstUser : title, fallbackId: cid),
+                                   "time": timeLabel(mtime), "timestamp": mtime.timeIntervalSince1970, "cwd": cwd]
+        // 别的工具派出去的 `claude -p`（entrypoint 为 sdk-cli）归进「任务会话」。App 自己起的 Claude 从这个版本起写 aipethub；
+        // 在那之前 App 的会话也是 sdk-cli、分不出来，所以只认分界时间之后开始的。
+        if entrypoint == "sdk-cli", let t = started, t >= claudeTaskSince { item["task"] = true }
+        return item
+    }
+
+    /// 「App 的 Claude 会话写 entrypoint = aipethub」从哪一刻开始生效：新版第一次读历史时记下，之后不变。
+    var claudeTaskSince: Date {
+        if let d = hooks.claudeTaskSince { return d }
+        let key = "claudeEntrypointSince"
+        if let t = UserDefaults.standard.object(forKey: key) as? Double { return Date(timeIntervalSince1970: t) }
+        let now = Date().timeIntervalSince1970
+        UserDefaults.standard.set(now, forKey: key)
+        return Date(timeIntervalSince1970: now)
     }
 
     /// 所有 Claude 会话文件，最新的在前。
@@ -145,18 +171,23 @@ extension AppDelegate {
         return ids
     }
 
-    func loadClaude(cid: String) {
+    func loadClaude(cid: String, reqId: Int? = nil) {
         claudeQueue.async { [self] in
             var messages: [[String: Any]] = []
             var cwd = ""
+            var context: [String: Any]?
             let sessionPath = findClaudeSession(cid: cid)
             if let path = sessionPath,
                let data = try? Data(contentsOf: URL(fileURLWithPath: path), options: .alwaysMapped) {
-                (messages, cwd) = claudeTurns(data)
+                (messages, cwd) = claudeTurns(data) { message, timestamp in
+                    context = claudeHistoryContext(message, timestamp: timestamp)
+                }
             }
-            sendToJS("onConversationLoaded", recentHistory(messages, into: [
+            var payload: [String: Any] = [
                 "agent": "claude", "conversationId": cid, "cwd": cwd, "missing": sessionPath == nil
-            ]))
+            ]
+            payload["context"] = context
+            sendToJS("onConversationLoaded", recentHistory(messages, into: payload, reqId: reqId))
         }
     }
 
@@ -217,13 +248,14 @@ extension AppDelegate {
     }
 
     /// 会话 jsonl → 一问一答的回合：用户消息 + （工作步骤、正式回答、改动的文件）。
-    func claudeTurns(_ data: Data) -> ([[String: Any]], String) {
+    func claudeTurns(_ data: Data, lastUsage: (([String: Any], String?) -> Void)? = nil) -> ([[String: Any]], String) {
         var messages: [[String: Any]] = []
         var cwd = ""
         var turn: TurnBuilder?
         var pending: [String: PendingFile] = [:]
         var turnStart: Date?
         var lastTime: Date?
+        var interrupted = false   // 这一轮是被用户停下的（记录里有中断标记）
         let iso = ISO8601DateFormatter()
         iso.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
         let userMark = Data("\"type\":\"user\"".utf8)
@@ -232,7 +264,9 @@ extension AppDelegate {
 
         func flush() {
             guard let t = turn else { return }
-            var bot = t.finish(finalText: nil)
+            let unfinished = t.steps.contains { $0["status"] as? String == "running" }
+            var bot = t.finish(finalText: nil, outcome: interrupted ? "interrupted" : (unfinished ? "incomplete" : "completed"))
+            interrupted = false
             if let s = turnStart, let e = lastTime, e > s { bot["duration"] = e.timeIntervalSince(s) }
             if !trimmed(bot["text"] as? String).isEmpty || !((bot["steps"] as? [Any]) ?? []).isEmpty {
                 bot["role"] = "bot"
@@ -242,14 +276,24 @@ extension AppDelegate {
             pending = [:]
         }
 
+        var lastAnswer: [String: Any]?
         let sideBranch = claudeSideBranch(data)   // 分叉出去的旁支不显示
         forEachLine(data) { line in
             if !sideBranch.isEmpty, let id = claudeLineUuid(line), sideBranch.contains(id) { return true }
             // 回答进行中补充的话：算在这一轮里，显示成工作过程里的「你补充说」（和当时看到的一样）
             if line.range(of: queuedMark) != nil, let obj = jsonObject(line), obj["type"] as? String == "attachment",
                let att = obj["attachment"] as? [String: Any], att["type"] as? String == "queued_command", (obj["isSidechain"] as? Bool) != true {
-                let said = (att["prompt"] as? String) ?? (att["prompt"] as? [[String: Any]] ?? []).compactMap { $0["text"] as? String }.joined(separator: "\n")
-                if let t = turn, !trimmed(said).isEmpty { t.add(makeStep("user", "你补充说", detail: trimmed(said))) }
+                let said = ((att["prompt"] as? String) ?? (att["prompt"] as? [[String: Any]] ?? []).compactMap { $0["text"] as? String }.joined(separator: "\n"))
+                    .replacingOccurrences(of: #"</?pasted_content\b[^>]*>"#, with: "", options: .regularExpression)
+                // 同样的附件也用来送后台任务完成之类的系统通知：那不是用户说的话，不显示
+                let origin = (att["origin"] as? [String: Any])?["kind"] as? String
+                let fromUser = origin.map { $0 == "human" } ?? !trimmed(said).hasPrefix("<")
+                let images = claudeImageSources(obj)
+                if let t = turn, fromUser, !trimmed(said).isEmpty || !images.isEmpty {
+                    var step = makeStep("user", "你补充说", detail: trimmed(said))
+                    if !images.isEmpty { step["imageSources"] = images }
+                    t.add(step)
+                }
                 return true
             }
             let isUser = line.range(of: userMark) != nil
@@ -259,6 +303,13 @@ extension AppDelegate {
             let ts = (obj["timestamp"] as? String).flatMap { iso.date(from: $0) }
             let blocks = (obj["message"] as? [String: Any])?["content"] as? [[String: Any]] ?? []
             if type == "user" {
+                // 中断标记：不是一句提问，不开新的一轮；记在手头这一轮上，收尾时显示「已中断」
+                if claudeInterruptMarker(textBlocks((obj["message"] as? [String: Any])?["content"])) {
+                    if turn == nil { turn = TurnBuilder(); turnStart = ts }
+                    interrupted = true
+                    if let ts = ts { lastTime = ts }
+                    return true
+                }
                 let images = claudeImageSources(obj)
                 if let text = claudeDisplayText(obj) ?? (images.isEmpty ? nil : "") {   // 只发了图片也算一句
                     flush()
@@ -271,6 +322,8 @@ extension AppDelegate {
                     if let ts = ts { lastTime = ts }
                 }
             } else if type == "assistant", (obj["isApiErrorMessage"] as? Bool) != true {
+                if lastUsage != nil, let message = obj["message"] as? [String: Any], message["usage"] is [String: Any],
+                   message["model"] as? String != "<synthetic>" { lastAnswer = obj }
                 if turn == nil { turn = TurnBuilder(); turnStart = ts }
                 if let t = turn { blocks.forEach { claudeBlock($0, turn: t, pending: &pending) } }
                 if let ts = ts { lastTime = ts }
@@ -278,6 +331,7 @@ extension AppDelegate {
             return true
         }
         flush()
+        if let row = lastAnswer, let message = row["message"] as? [String: Any] { lastUsage?(message, row["timestamp"] as? String) }
         return (messages, cwd)
     }
 }

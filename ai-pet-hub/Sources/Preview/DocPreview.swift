@@ -19,8 +19,9 @@ func isPreviewDocument(_ path: String) -> Bool {
     return quickLookDocExts.contains(ext) || richTextDocExts.contains(ext)
 }
 
-let docPreviewRoot = FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask)[0]
-    .appendingPathComponent("AIPetHub/DocPreview", isDirectory: true)
+let docPreviewRoot = TestHooks.selfTest
+    ? URL(fileURLWithPath: NSTemporaryDirectory()).appendingPathComponent("aipethub-preview-test-\(getpid())", isDirectory: true)
+    : FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask)[0].appendingPathComponent("AIPetHub/DocPreview", isDirectory: true)
 private let docPreviewVersion = "v2"                  // 改了加进网页的样式就加一，旧缓存自动作废
 private let docPreviewKeep = 12                       // 最多留几份
 private let docPreviewMaxAge: TimeInterval = 3 * 86400   // 几天没看就删
@@ -59,9 +60,30 @@ func injectHead(_ html: String, _ extra: String) -> String {
     return extra + html
 }
 
+/// 每个队列任务持有自己的转换进程，取消与启动在同一把锁下交接，避免刚取消又启动。
+final class DocumentPreviewTask {
+    private let lock = NSLock()
+    private var cancelled = false
+    private var process: Process?
+    var isCancelled: Bool { lock.lock(); defer { lock.unlock() }; return cancelled }
+    func start(_ p: Process, onExit: @escaping () -> Void) throws -> Bool {
+        lock.lock(); defer { lock.unlock() }
+        guard !cancelled else { return false }
+        try ChildProcesses.shared.start(p, onExit: onExit)
+        process = p
+        return true
+    }
+    func cancel() {
+        lock.lock(); defer { lock.unlock() }
+        cancelled = true
+        if let p = process, p.isRunning { terminateTree(p.processIdentifier) }
+    }
+}
+
 /// 生成（或直接用缓存的）预览，返回在浏览器里打开的文件；失败返回原因。在后台队列调用。
-func makeDocumentPreview(_ path: String) -> (file: URL?, error: String) {
+func makeDocumentPreview(_ path: String, task: DocumentPreviewTask = DocumentPreviewTask()) -> (file: URL?, error: String) {
     let fm = FileManager.default
+    guard !task.isCancelled else { return (nil, "已取消预览") }
     guard let attrs = try? fm.attributesOfItem(atPath: path) else { return (nil, "文件不存在") }
     let mtime = (attrs[.modificationDate] as? Date)?.timeIntervalSince1970 ?? 0
     let size = (attrs[.size] as? NSNumber)?.int64Value ?? 0
@@ -84,13 +106,14 @@ func makeDocumentPreview(_ path: String) -> (file: URL?, error: String) {
         try? fm.createDirectory(at: stage, withIntermediateDirectories: true)
         guard (try? html.write(to: stage.appendingPathComponent("Preview.html"), atomically: true, encoding: .utf8)) != nil else { return (nil, "写不了缓存") }
     } else {
-        switch runQuickLook(path, into: tmp) {
+        switch runQuickLook(path, into: tmp, task: task) {
         case .success(let out): stage = out
         case .failure(let e): return (nil, e.message)
         }
         guard previewEntry(in: stage) != nil else { return (nil, "系统预览没有给出可显示的内容") }
         decorateQuickLookHTML(in: stage, ext: ext)
     }
+    guard !task.isCancelled else { return (nil, "已取消预览") }
     try? path.write(to: stage.appendingPathComponent(".origin"), atomically: true, encoding: .utf8)
     if (try? fm.moveItem(at: stage, to: dir)) == nil, previewEntry(in: dir) == nil { return (nil, "写不了缓存") }   // 同时生成的另一份先到了也算成功
     pruneDocumentPreviews()
@@ -120,19 +143,23 @@ func documentPreviewOrigin(_ url: URL?) -> String? {
 private struct PreviewFailure: Error { let message: String }
 
 /// qlmanage -p -o：Quick Look 的命令行入口，把预览输出成文件（Preview.html + 附件）而不弹窗。
-private func runQuickLook(_ path: String, into tmp: URL) -> Result<URL, PreviewFailure> {
+private func runQuickLook(_ path: String, into tmp: URL, task: DocumentPreviewTask) -> Result<URL, PreviewFailure> {
     let p = Process()
     p.executableURL = URL(fileURLWithPath: "/usr/bin/qlmanage")
+    if let path = TestHooks.quickLookExecutable { p.executableURL = URL(fileURLWithPath: path) }
+    let timeout = TestHooks.quickLookTimeout ?? 60
     p.arguments = ["-p", "-o", tmp.path, path]
     p.standardOutput = FileHandle.nullDevice
     p.standardError = FileHandle.nullDevice
     let done = DispatchSemaphore(value: 0)
-    p.terminationHandler = { _ in done.signal() }
-    do { try p.run() } catch { return .failure(PreviewFailure(message: "调用不了系统预览（qlmanage）")) }
-    if done.wait(timeout: .now() + 60) == .timedOut {
-        p.terminate()
+    do {
+        guard try task.start(p, onExit: { done.signal() }) else { return .failure(PreviewFailure(message: "已取消预览")) }
+    } catch { return .failure(PreviewFailure(message: "调用不了系统预览（qlmanage）")) }
+    if done.wait(timeout: .now() + timeout) == .timedOut {
+        task.cancel()
         return .failure(PreviewFailure(message: "生成预览超时（文件太大或格式异常）"))
     }
+    guard !task.isCancelled else { return .failure(PreviewFailure(message: "已取消预览")) }
     guard let name = (try? FileManager.default.contentsOfDirectory(atPath: tmp.path))?.first(where: { $0.hasSuffix(".qlpreview") }) else {
         return .failure(PreviewFailure(message: "系统预览打不开这个文件（可能已损坏或格式不支持）"))
     }

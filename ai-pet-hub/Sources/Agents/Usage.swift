@@ -1,6 +1,6 @@
 // 三位的剩余用量（模型菜单底下那几行）：各自问自己的 CLI，统一成「名字、还剩百分之几、什么时候重置」。
 //   Claude：起一个 CLI 进程，发 get_usage 这个控制请求
-//   Codex ：起 app-server，initialize 之后问 account/rateLimits/read
+//   Codex ：起 app-server，initialize 之后一起问 model/list 和 account/rateLimits/read
 //   Gemini：`agy -p /usage`，一行一项、用制表符隔开
 // 不在点开菜单时才查：App 启动后在后台每 5 分钟查一轮，菜单打开时直接给手头最新的那份（带上是什么时候查的）。
 // 这次没查到就留着上一次的；查到的结果记在本机，下次打开 App 马上就有。
@@ -61,8 +61,11 @@ extension AppDelegate {
             if let items = items { self.usageCache[agent] = (now, items) }
             let last = self.usageCache[agent]
             let store = self.usageCache.mapValues { ["at": $0.at.timeIntervalSince1970, "items": $0.items] as [String: Any] }
-            self.procLock.unlock()
-            if items != nil { UserDefaults.standard.set(store, forKey: self.usageStoreKey) }
+            if items != nil {
+                if TestHooks.selfTest { self.hooks.usageStore?(store) }
+                else { UserDefaults.standard.set(store, forKey: self.usageStoreKey) }
+            }
+            self.procLock.unlock()   // 快照与写回保持同一顺序，不能让较早的快照覆盖后来完成的查询
             DispatchQueue.main.async {
                 // 这次没查到：有上一次的就接着显示上一次的，一次都没查到过才说没查到
                 if let l = last { self.sendUsage(agent, l.items, at: l.at, error: nil) }
@@ -77,29 +80,37 @@ extension AppDelegate {
         let cli = CLIProcess(input: LiveInput())
         let done = DispatchSemaphore(value: 0)
         var finished = false
-        cli.warmFilter = { line in
-            guard !finished, let input = cli.input else { return true }
+        // weak：cli 拿着这个闭包，闭包再拿着 cli 的话两边谁也放不掉，三根管道就一直开着，
+        // 每 5 分钟漏几个，攒到系统给的 256 个上限后 Pipe() 建不出来，下一次往里写就崩。
+        cli.warmFilter = { [weak cli] line in
+            guard !finished, let input = cli?.input else { return true }
             if onLine(line, input) { finished = true; done.signal() }
             return true
         }
-        guard (try? cli.start(executable: executable, arguments: arguments, cwd: cwd ?? home, environment: cliEnvironment())) != nil else { return }
+        guard (try? cli.start(executable: executable, arguments: arguments, cwd: cwd ?? home, environment: cliEnvironment())) != nil else { cli.input?.abandon(); return }
         lines.forEach { cli.input?.send($0) }
         _ = done.wait(timeout: .now() + timeout)
         if cli.proc.isRunning { terminateTree(cli.proc.processIdentifier) }
+        _ = cli.waitForExit()   // 等它真的退出（terminateTree 最多 3 秒后强杀），顺便停掉读输出的监听
+        cli.input?.close()
     }
 
     /// 一个会话的上下文用了多少（Claude 答完一轮后问 get_context_usage，Codex 每轮都会报）：告诉网页，模型面板里显示。
     /// parts：是什么占的（每项 id / name / tokens；kind 为 "buffer" 的是留给自动压缩的，不算已用）。各家给得出什么就报什么，给不出就是空的。
     /// estimated：明细是估算的（加起来不一定等于已用）。
-    func noteContext(agent: String, conversationId: String, used: Int, max: Int, parts: [[String: Any]] = [], estimated: Bool = false) {
+    func noteContext(agent: String, conversationId: String, used: Int, max: Int, parts: [[String: Any]] = [], estimated: Bool = false, seq: Int? = nil) {
         guard !conversationId.isEmpty, max > 0 else { return }
+        var data: [String: Any] = ["agent": agent, "conversationId": conversationId, "used": used, "max": max,
+                                   "parts": parts, "estimated": estimated, "at": Date().timeIntervalSince1970 * 1000]
+        data["seq"] = seq
         DispatchQueue.main.async {
-            self.sendToJS("onAgentContext", ["agent": agent, "conversationId": conversationId, "used": used, "max": max, "parts": parts, "estimated": estimated])
+            self.sendToJS("onAgentContext", data)
         }
     }
 
     private func usageItem(_ label: String, used: Double, resets: Double?) -> [String: Any] {
-        var item: [String: Any] = ["label": label, "left": max(0, min(100, Int((100 - used).rounded())))]
+        guard used.isFinite else { return ["label": label, "text": "未知"] }
+        var item: [String: Any] = ["label": label, "left": Int(max(0, min(100, 100 - used)).rounded())]
         if let r = resets, r > 0 { item["resetsAt"] = r }
         return item
     }
@@ -157,15 +168,23 @@ extension AppDelegate {
     private func codexUsage() -> [[String: Any]]? {
         guard let codex = codexExecutable() else { return nil }
         var result: [[String: Any]]?
+        var gotModels = false, gotUsage = false
         askCLI(codex, ["app-server"], send: [codexInitialize], timeout: 45) { line, input in
             guard let obj = self.jsonObject(line), obj["method"] == nil, let id = (obj["id"] as? NSNumber)?.intValue else { return false }
             if id == 1 {
-                input.send(["method": "initialized"])
+                guard obj["error"] == nil else { return true }
+                self.codexInitialized(input)
                 input.send(["id": 7, "method": "account/rateLimits/read"])
                 return false
             }
+            if id == 8 {
+                self.noteCodexModels(obj["result"] as? [String: Any] ?? [:])
+                gotModels = true
+                return gotUsage
+            }
             guard id == 7 else { return false }
-            guard let limits = (obj["result"] as? [String: Any])?["rateLimits"] as? [String: Any] else { return true }
+            gotUsage = true
+            guard let limits = (obj["result"] as? [String: Any])?["rateLimits"] as? [String: Any] else { return gotModels }
             var items: [[String: Any]] = []
             for key in ["primary", "secondary"] {
                 guard let w = limits[key] as? [String: Any], let used = (w["usedPercent"] as? NSNumber)?.doubleValue else { continue }
@@ -174,7 +193,8 @@ extension AppDelegate {
                 items.append(self.usageItem(label, used: used, resets: (w["resetsAt"] as? NSNumber)?.doubleValue))
             }
             if let credits = limits["credits"] as? [String: Any], (credits["hasCredits"] as? Bool) == true {
-                let balance = (credits["unlimited"] as? Bool) == true ? "不限" : String(Int((Double(credits["balance"] as? String ?? "") ?? 0).rounded()))
+                let value = Double(credits["balance"] as? String ?? "") ?? 0
+                let balance = (credits["unlimited"] as? Bool) == true ? "不限" : (value.isFinite ? String(format: "%.0f", value.rounded()) : "未知")
                 items.append(["label": "额外额度", "text": balance])
             }
             // 手里还有几次「把额度重置回满」（Codex 时不时送的）
@@ -182,15 +202,17 @@ extension AppDelegate {
                 items.append(["label": "重置次数", "text": "\(resets.intValue) 次可用"])
             }
             result = items
-            return true
+            return gotModels
         }
         return result
     }
 
     private func geminiUsage() -> [[String: Any]]? {
         guard let setup = geminiSetup(AskRequest(agent: "gemini", reqId: 0, prompt: "", model: "", effort: "", permissionMode: "", workspace: "", conversationId: "")) else { return nil }
-        refreshGeminiModels(setup.agy)
-        let res = runCLI(agent: "gemini#usage", executable: setup.agy, arguments: ["-p", "/usage", "--print-timeout", "40s"], cwd: home)
+        // 先跑 `agy models` 探路：它失败时只会安静退出，不会像 `agy -p` 一样在代理抖动/断网时直接拉起浏览器要求重登
+        guard refreshGeminiModels(setup.agy) else { return nil }
+        let res = runTool(setup.agy, ["-p", "/usage", "--print-timeout", "40s"], cwd: home, timeout: 45)
+        guard res.status == 0 else { return nil }
         let iso = ISO8601DateFormatter()
         var items: [[String: Any]] = []
         for line in res.out.split(separator: "\n") {
@@ -205,32 +227,24 @@ extension AppDelegate {
 
     /// agy 现在能用的模型（`agy models`，一行一个「模型-强度 <tab> 名字 (强度)」）：按模型归拢，强度收成这个模型支持的档位。
     /// 跟着用量一起每 5 分钟查一次，所以 agy 那边出了新模型，不用发话、不用重开，菜单里自己就有。
-    private func refreshGeminiModels(_ agy: String) {
-        let res = runCLI(agent: "gemini#models", executable: agy, arguments: ["models"], cwd: home)
-        let levels = ["low", "medium", "high"]
-        var order: [String] = [], names: [String: String] = [:], efforts: [String: [String]] = [:]
-        for line in res.out.split(separator: "\n") {
+    /// 返回是否成功拿到模型列表（网络不通或鉴权失效时返回 false，供 `geminiUsage` 熔断跳过会弹浏览器的 `agy -p`）。
+    @discardableResult
+    func refreshGeminiModels(_ agy: String) -> Bool {
+        let res = runTool(agy, ["models"], cwd: home, timeout: 30)
+        guard res.status == 0 else { return false }
+        let choices = res.out.split(separator: "\n").compactMap { line -> (String, String)? in
             let cols = line.split(separator: "\t").map { $0.trimmingCharacters(in: .whitespaces) }
-            guard cols.count >= 2, !cols[0].isEmpty, !cols[0].contains(" ") else { continue }
-            var id = cols[0], name = cols[1], level: String?
-            if let l = levels.first(where: { id.hasSuffix("-" + $0) }) {
-                level = l
-                id = String(id.dropLast(l.count + 1))
-                if let paren = name.range(of: " (", options: .backwards), name.hasSuffix(")") { name = String(name[..<paren.lowerBound]) }
-            }
-            if names[id] == nil { order.append(id); names[id] = name }
-            if let l = level, !(efforts[id] ?? []).contains(l) { efforts[id, default: []].append(l) }
+            guard cols.count >= 2, !cols[0].isEmpty, !cols[0].contains(" ") else { return nil }
+            return (cols[0], cols[1])
         }
-        guard !order.isEmpty else { return }
-        let models: [[String: Any]] = order.map { id in
-            var m: [String: Any] = ["v": id, "name": names[id] ?? id, "desc": ""]
-            if let e = efforts[id] { m["efforts"] = levels.filter(e.contains) }
-            return m
-        }
+        guard !choices.isEmpty else { return false }
+        procLock.lock(); geminiModelIds = Set(choices.map { $0.0 }); procLock.unlock()
+        let models = geminiMenuModels(choices)
         DispatchQueue.main.async {
             self.geminiModelsFromCLI = true
             self.sendToJS("onAgentModels", ["agent": "gemini", "models": models])
         }
+        return true
     }
 
     /// DeepSeek 是按量计费的，没有「额度还剩百分之几」，看的是账户里还剩多少钱（DeepSeek 开放平台的 /user/balance）。

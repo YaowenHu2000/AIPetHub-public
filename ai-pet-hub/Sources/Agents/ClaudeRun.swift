@@ -10,6 +10,7 @@ extension AppDelegate {
     /// 用哪个命令跑 Claude Code。装了 reclaude 就只用它（`reclaude cli …`），和以前完全一样；
     /// 没装才找标准的 `claude`（别人克隆下来也能用），这时历史会话读 ~/.claude/projects。
     func claudeCommand() -> (executable: String, prefix: [String], reclaude: Bool)? {
+        if let path = hooks.cliExecutable { return (path, [], false) }
         // 指定用哪个 claude（测试标准 claude 的路径时用；平时不用设）
         if let forced = ProcessInfo.processInfo.environment["AIPETHUB_CLAUDE"], fm.isExecutableFile(atPath: forced) { return (forced, [], false) }
         if let r = findExecutable(["\(home)/.local/bin/reclaude"]) { return (r, ["cli"], true) }
@@ -28,27 +29,30 @@ extension AppDelegate {
         }
     }
 
+    /// 升级既可能覆盖原文件，也可能把同一个链接切到新版本；两种情况都要重新探测能力。
+    func claudePartialCacheKey(_ executable: String) -> String? {
+        let path = (executable as NSString).resolvingSymlinksInPath
+        guard let attrs = try? fm.attributesOfItem(atPath: path),
+              let modified = attrs[.modificationDate] as? Date, let size = attrs[.size] as? NSNumber else { return nil }
+        return "\(path)\u{0}\(modified.timeIntervalSince1970)\u{0}\(size)\u{0}\(attrs[.systemFileNumber] ?? "")"
+    }
+
     func claudeSupportsPartial(_ executable: String, prefix: [String]) -> Bool {
-        let key = executable + prefix.joined()
-        procLock.lock()
-        if let known = partialSupport[key] { procLock.unlock(); return known }
-        procLock.unlock()
-        let p = Process()
-        p.executableURL = URL(fileURLWithPath: executable)
-        p.arguments = prefix + ["--help"]
-        let out = Pipe()
-        p.standardOutput = out
-        p.standardError = FileHandle.nullDevice
-        p.standardInput = FileHandle.nullDevice
-        var ok = false
-        if (try? p.run()) != nil {
-            let text = String(decoding: out.fileHandleForReading.readDataToEndOfFile(), as: UTF8.self)
-            p.waitUntilExit()
-            ok = text.contains("--include-partial-messages")
+        // reclaude 等包装器的文件不变，底层 CLI 也可能升级；不根据包装器时间猜它的能力。
+        let key = prefix.isEmpty ? claudePartialCacheKey(executable) : nil
+        if let key = key {
+            procLock.lock()
+            if let known = partialSupport[key] { procLock.unlock(); return known }
+            procLock.unlock()
         }
-        procLock.lock()
-        partialSupport[key] = ok
-        procLock.unlock()
+        let res = runTool(executable, prefix + ["--help"], cwd: home,
+                          environment: ProcessInfo.processInfo.environment, timeout: 15)
+        let ok = res.status != -1 && res.status != -2 && res.out.contains("--include-partial-messages")
+        if let key = key {
+            procLock.lock()
+            partialSupport[key] = ok
+            procLock.unlock()
+        }
         return ok
     }
 
@@ -67,7 +71,7 @@ extension AppDelegate {
             }
         }
         // 交互式（能审批、提问、中途补充）；这个版本的 CLI 不认交互式的参数时，退回一问一答
-        return ClaudeLiveTurn(app: self, req: req, command: cmd).run() ?? runClaudeOneShot(req, cmd)
+        return runLive({ ClaudeLiveTurn(app: self, req: req, command: cmd) }) { $0.run() } ?? runClaudeOneShot(req, cmd)
     }
 
     func claudeArgs(_ req: AskRequest, _ cmd: (executable: String, prefix: [String], reclaude: Bool), live: Bool) -> [String] {
@@ -126,7 +130,7 @@ extension AppDelegate {
         if complete { claudeModelsComplete = true }
         let skip = !complete && claudeModelsComplete
         procLock.unlock()
-        if !models.isEmpty && !skip { sendToJS("onAgentModels", ["agent": "claude", "models": models]) }
+        if !models.isEmpty && !skip { sendToJS("onAgentModels", ["agent": "claude", "models": models, "complete": complete]) }
     }
 
     /// 把 CLI 认得的斜杠命令告诉网页（输入框里打 / 时列出来）。
@@ -145,15 +149,20 @@ extension AppDelegate {
             return true
         }
         guard (try? cli.start(executable: cmd.executable, arguments: claudeArgs(req, cmd, live: true),
-                              cwd: validWorkspace(req.workspace) ?? home, environment: cliEnvironment())) != nil else { return nil }
+                              cwd: validWorkspace(req.workspace) ?? home, environment: cliEnvironment(claudeEntrypointEnv))) != nil else { cli.input?.abandon(); return nil }
         cli.input?.send(claudeInitializeRequest)
         return cli
     }
 
     func claudeReply(_ req: AskRequest, res: CLIResult, parser: ClaudeStreamParser, turn: TurnBuilder) -> AgentReply {
         let convId = parser.sessionId.isEmpty ? req.conversationId : parser.sessionId
+        let failedExit = !parser.completed && res.status != 0
+        let outcome = res.cancelled ? "interrupted" : (failedExit || parser.isError ? "failed" : (parser.completed || parser.compactNote != nil ? "completed" : "incomplete"))
+        let error = failedExit ? "⚠️ Claude Code 出错（退出码 \(res.status)）：\n" + (trimmed(res.err).isEmpty ? "进程在本轮完成前退出了。" : String(trimmed(res.err).suffix(1500)))
+            : (parser.isError ? (parser.result ?? parser.subtype) : nil)
         // 压缩上下文的那一轮没有回答正文：结果那句话就是回答
-        var built = turn.finish(finalText: (parser.result ?? "").isEmpty ? (parser.compactNote ?? parser.result) : parser.result)
+        var built = turn.finish(finalText: (parser.result ?? "").isEmpty ? (parser.compactNote ?? parser.result) : parser.result,
+                                outcome: outcome, error: res.cancelled ? nil : error)
         var reply = built["text"] as? String ?? ""
         if res.cancelled { return AgentReply(reply: reply, conversationId: convId, cancelled: true, turn: built) }
         if reply.isEmpty, !parser.subtype.isEmpty, parser.subtype != "success" { reply = "Claude Code 提前结束：\(parser.subtype)" }

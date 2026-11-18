@@ -106,6 +106,7 @@ final class ClaudeStreamParser {
     var sessionId = ""
     var result: String?
     var isError = false
+    private(set) var completed = false
     var subtype = ""
     var durationMs: Double?
     /// 这一轮压缩过上下文（/compact）：结果怎么样，给人看的一句话。压缩不经过模型，没有回答正文，这句话就是这一轮的回答
@@ -121,12 +122,14 @@ final class ClaudeStreamParser {
     init(turn: TurnBuilder) { self.turn = turn }
 
     func feed(_ obj: [String: Any]) {
+        // 完整消息和流式增量必须用同一条归属规则，否则子代理定稿会混回主回答。
+        if ["assistant", "user", "stream_event"].contains(obj["type"] as? String ?? ""),
+           !trimmed(obj["parent_tool_use_id"] as? String).isEmpty { return }
         if let sid = obj["session_id"] as? String, !sid.isEmpty { sessionId = sid }
         let blocks = (obj["message"] as? [String: Any])?["content"] as? [[String: Any]] ?? []
         switch obj["type"] as? String {
         case "stream_event":
             // 只流式显示主对话的文字；子代理（parent_tool_use_id 不为空）的中间文字不推
-            if let parent = obj["parent_tool_use_id"], !(parent is NSNull) { return }
             if let e = obj["event"] as? [String: Any] { partial(e) }
         case "assistant":
             let msgId = (obj["message"] as? [String: Any])?["id"] as? String ?? ""
@@ -148,6 +151,7 @@ final class ClaudeStreamParser {
         case "user":
             blocks.filter { $0["type"] as? String == "tool_result" }.forEach { claudeToolResult($0, turn: turn, pending: &pending) }
         case "result":
+            completed = true
             result = obj["result"] as? String
             isError = (obj["is_error"] as? Bool) == true
             subtype = obj["subtype"] as? String ?? ""

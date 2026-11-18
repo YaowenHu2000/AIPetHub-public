@@ -131,7 +131,7 @@ body.window-inactive .pet-card.active:not([data-phase]) { box-shadow: none; }
    · 左栏：窗口最底下垫着系统的毛玻璃（AppDelegate 里的 NSVisualEffectView，固定深色外观），左栏的底留 90%，带一点桌面的颜色；
      网页自己不画底，别的栏都是不透明的，盖住它。
    · 弹出面板：底留 86%，后面的内容模糊着透上来一点（背景模糊加在画底的那个伪元素上）。
-   这两样只有在真实窗口里才看得出对不对（tools/uitest/e2e-chrome.js，REAL=1），testSnapshot 截不出背景模糊。 */
+   这两样只有在真实窗口里才看得出对不对（tools/uitest/e2e-chrome.js，REAL=1），只截网页内容的截图看不出背景模糊。 */
 html, body { background: transparent; }
 /* 左栏的底：带一点靛紫的深色（不是中性灰），上面略亮、往下沉下去；留 90%，桌面的颜色只透上来一点点 */
 :root { --side-glass: linear-gradient(180deg, rgba(27, 23, 48, 0.9), rgba(17, 15, 32, 0.92)); }
@@ -142,7 +142,7 @@ html, body { background: transparent; }
 #popover:not(.scrolls), #popover-sub { --sq-fill: color-mix(in srgb, var(--bg-popover) 86%, transparent); }
 #popover:not(.scrolls)::after, #popover-sub::after { -webkit-backdrop-filter: blur(24px) saturate(160%); backdrop-filter: blur(24px) saturate(160%); }
 
-/* ===== 长对话里跳转（chat/jump.js）：聊天区右下角一颗竖着的胶囊，上面是「上一句我说的」，下面是「下一句 / 到底」 ===== */
+/* ===== 长对话里跳转（chat/jump.js）：聊天区右下角一颗竖着的胶囊，上面是「用户的上一句」，下面是「下一句 / 到底」 ===== */
 .jump-nav {
   position: absolute; right: 16px; bottom: 12px; z-index: 6; display: flex; flex-direction: column; padding: 3px; border-radius: 17px;
   background: color-mix(in srgb, var(--bg-popover) 88%, transparent); -webkit-backdrop-filter: blur(18px) saturate(160%); backdrop-filter: blur(18px) saturate(160%);
@@ -160,7 +160,7 @@ html, body { background: transparent; }
 .jump-nav svg { width: 15px; height: 15px; }
 .jump-nav .jump-down svg { transform: rotate(180deg); }
 
-/* 右边缘的一列小圆点：我说过的每一句一个，现在看到的那一句是亮的（chat/jump.js） */
+/* 右边缘的一列小圆点：用户说过的每一句一个，现在看到的那一句是亮的（chat/jump.js） */
 .jump-rail {
   position: absolute; right: 8px; top: 50%; transform: translateY(-50%); z-index: 5; max-height: calc(100% - 150px);
   display: flex; flex-direction: column; overflow-y: auto; scrollbar-width: none;

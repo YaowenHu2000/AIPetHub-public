@@ -96,7 +96,14 @@ class PetRigController {
 
   resize() {
     const r = this.canvas.getBoundingClientRect();
-    if (r.width > 0) this.renderer.setSize(r.width, r.height, false);
+    if (!(r.width > 0)) return;
+    const w = Math.round(r.width), h = Math.round(r.height);
+    if (w === this.sizeW && h === this.sizeH) return;   // 大小没变就不动：改画布尺寸会把画面清空
+    this.sizeW = w;
+    this.sizeH = h;
+    this.renderer.setSize(w, h, false);
+    // 改了尺寸画布是空的，等下一帧再画就会闪一下（拖右栏的宽度时一直在闪）：当场按现在的姿势重画
+    if (live.has(this)) this.renderer.render(this.scene, this.camera);
   }
 
   setState(state) {

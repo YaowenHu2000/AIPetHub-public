@@ -4,7 +4,8 @@ import Cocoa
 extension AppDelegate {
     /// codex 在哪、这次用的模型、思考强度、沙盒。没装 codex 返回 nil。
     func codexExecutable() -> String? {
-        findExecutable([
+        if let path = hooks.cliExecutable { return path }
+        return findExecutable([
             "\(home)/.local/bin/codex",
             "/Applications/ChatGPT.app/Contents/Resources/codex-cli/CodexCLI.app/Contents/MacOS/codex",
             "/opt/homebrew/bin/codex", "/usr/local/bin/codex"
@@ -28,7 +29,7 @@ extension AppDelegate {
         let codex = setup.codex, model = setup.model, effort = setup.effort, sandbox = setup.sandbox
         let workspace = validWorkspace(req.workspace)
         // 交互式（能审批、提问、中途补充，回答逐字出来）；这个版本的 codex 用不了 app-server 时退回 codex exec
-        if let reply = CodexLiveTurn(app: self, req: req, codex: codex, model: model, effort: effort, sandbox: sandbox).run() { return reply }
+        if let reply = runLive({ CodexLiveTurn(app: self, req: req, codex: codex, model: model, effort: effort, sandbox: sandbox) }, { $0.run() }) { return reply }
         let resuming = !req.conversationId.isEmpty
 
         var args = ["exec"]
@@ -42,6 +43,10 @@ extension AppDelegate {
 
         let turn = turnBuilder(for: req)
         let parser = CodexStreamParser(turn: turn)
+        parser.wasCancelled = {
+            self.procLock.lock(); defer { self.procLock.unlock() }
+            return self.asks[req.key]?.cancelled == true
+        }
         let noteConversation = conversationWatcher(req)
         let res = runCLI(agent: req.key, executable: codex, arguments: args, cwd: workspace ?? home, onStdoutLine: { [weak self] line in
             if let obj = self?.jsonObject(line) { parser.feed(obj) }
@@ -51,7 +56,11 @@ extension AppDelegate {
             return AgentReply(reply: "⚠️ 无法启动 codex：\(e)", conversationId: req.conversationId)
         }
         let convId = parser.threadId.isEmpty ? req.conversationId : parser.threadId
-        var built = turn.finish(finalText: parser.lastAgentMessage)
+        let failedExit = parser.status == nil && !res.cancelled
+        let outcome = res.cancelled ? "interrupted" : (parser.status ?? "failed")
+        let error = failedExit ? "⚠️ Codex 出错（退出码 \(res.status)）：\n" + (trimmed(res.err).isEmpty ? "进程在本轮完成前退出了。" : String(trimmed(res.err).suffix(1500)))
+            : parser.errors.joined(separator: "\n")
+        var built = turn.finish(finalText: parser.lastAgentMessage, outcome: outcome, error: res.cancelled ? nil : error)
         var reply = built["text"] as? String ?? ""
         if res.cancelled { return AgentReply(reply: reply, conversationId: convId, cancelled: true, turn: built) }
         if reply.isEmpty && !parser.errors.isEmpty { reply = "⚠️ Codex 出错：\n" + parser.errors.joined(separator: "\n") }

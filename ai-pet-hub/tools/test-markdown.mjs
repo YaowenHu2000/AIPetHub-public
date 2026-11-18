@@ -61,6 +61,14 @@ has('文件预览里显示网络图片', '![图](https://a.com/x.png)', '<img cl
 has('本地图片交给原生读', '![图](./a.png)', 'data-local="./a.png"');
 has('行内代码里的文件路径变成文件标签', '看 `src/main.swift:12`', 'class="file-chip"');
 lacks('不像文件的行内代码不变标签', '用 `let x = 1`', /file-chip/);
+has('文字里直接写的文件名标成候选', '- COF项目系统学习指南.md', '<span class="file-maybe" data-path="COF项目系统学习指南.md">COF项目系统学习指南.md</span>');
+has('文件名后面紧跟中文', '打开README.md看看', 'data-path="打开README.md"');
+has('文件名后面的句号不算', '见 docs/guide.md.', 'data-path="docs/guide.md"');
+has('带行号', '在 src/main.swift:12 里', 'data-path="src/main.swift:12"');
+has('粗体里的文件名', '**报告.pdf**', '<strong><span class="file-maybe" data-path="报告.pdf">');
+lacks('不认识的扩展名不算', '版本 3.5 和 a.mdx', /file-maybe/);
+lacks('网址不算文件', '看 https://a.com/x.html', /file-maybe/);
+lacks('文件预览里不标候选', 'README.md', /file-maybe/, {});
 
 console.log('· 结构');
 has('标题', '## 小节', '<h2');

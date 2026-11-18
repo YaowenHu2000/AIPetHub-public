@@ -45,7 +45,7 @@
     </div>
     <div id="hist-sections"></div>
   </aside>
-  <div class="col-resizer" id="resize-sidebar" title="拖动调整宽度，双击恢复默认"></div>
+  <div class="col-resizer" id="resize-sidebar" title="拖动调整宽度，一直往左拖到底收起，双击恢复默认"></div>
 
   <section id="chat-column">
     <div id="chat-header">
@@ -56,6 +56,7 @@
       <span class="crumb-sep">›</span>
       <span class="conv-label" id="conv-label"></span>
       <button class="icon-btn" id="btn-browser" title="内置浏览器：预览网页、本地开发服务器"></button>
+      <button class="icon-btn btn-stage-toggle"></button>
     </div>
 
     <div id="chat-stack"></div>
@@ -83,13 +84,14 @@
         <button class="icon-btn ed-open" title="用默认应用打开"></button>
         <button class="icon-btn ed-max" title="放大 / 还原（Esc 还原）"></button>
         <button class="icon-btn ed-close" title="关闭预览"></button>
+        <button class="icon-btn btn-stage-toggle"></button>
       </div>
     </div>
     <div class="ed-bar"></div>
     <div class="ed-body"></div>
   </section>
 
-  <div class="col-resizer" id="resize-stage" title="拖动调整桌宠活动空间，双击恢复默认"></div>
+  <div class="col-resizer" id="resize-stage" title="拖动调整桌宠活动空间，一直往右拖到底收起，双击恢复默认"></div>
   <aside id="stage-column"></aside>
 </main>
 
@@ -140,7 +142,10 @@
 <script src="js/chat/live-steps.js"></script>
 <script src="js/ui/effort-flow.js"></script>
 <script src="js/ui/menus.js"></script>
+<script src="js/ui/model-menu.js"></script>
+<script src="js/ui/usage-panel.js"></script>
 <script src="js/ui/history.js"></script>
+<script src="js/ui/project-delete.js"></script>
 <script src="js/ui/layout.js"></script>
 <script src="js/chat/send.js"></script>
 <script src="js/native-callbacks.js"></script>

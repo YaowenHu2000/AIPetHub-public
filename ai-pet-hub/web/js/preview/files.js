@@ -4,12 +4,11 @@
 
 // ---------- 读本机文件（经原生桥） ----------
 const fileReads = new Map();
-let fileReqSeq = 0;
 
 function readLocalFile(path, base) {
   return new Promise(resolve => {
     if (!hasBridge()) { resolve({ path, error: '预览模式下读不了本机文件' }); return; }
-    const reqId = ++fileReqSeq;
+    const reqId = nextRequestId();
     fileReads.set(reqId, resolve);
     postNative('readFile', { path, base, reqId });
   });

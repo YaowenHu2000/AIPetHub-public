@@ -12,7 +12,7 @@
 
 /* ---------- 选中的文字、输入光标 ---------- */
 ::selection { background: color-mix(in srgb, var(--accent) 46%, transparent); color: #fff; }
-.msg.user ::selection, .msg.user::selection { background: rgba(255, 255, 255, 0.36); color: #fff; }   /* 我发的话底色就是主色：选区换成白的才看得出 */
+.msg.user ::selection, .msg.user::selection { background: rgba(255, 255, 255, 0.36); color: #fff; }   /* 用户发的话底色就是主色：选区换成白的才看得出 */
 input, textarea, [contenteditable] { caret-color: var(--accent); }
 
 /* ---------- 滚动条：细、带一点配色里的紫，悬停时亮一些 ---------- */

@@ -1,7 +1,20 @@
 // 文件预览：把回答里写的路径解析成真实路径，读内容给预览面板。
 import Cocoa
 
+private let previewImageMIMEs = ["png": "image/png", "jpg": "image/jpeg", "jpeg": "image/jpeg", "gif": "image/gif",
+                                  "webp": "image/webp", "svg": "image/svg+xml"]
+
 extension AppDelegate {
+    /// 回答里的缺图标签和预览必须沿用同一读取条件，否则搜索命中后页面没有对应文字。
+    func previewImageData(at path: String) -> Data? {
+        let target = (path as NSString).resolvingSymlinksInPath
+        guard previewImageMIMEs[(target as NSString).pathExtension.lowercased()] != nil,
+              let attrs = try? fm.attributesOfItem(atPath: target),
+              attrs[.type] as? FileAttributeType == .typeRegular,
+              let size = attrs[.size] as? NSNumber, size.intValue <= 8_000_000 else { return nil }
+        return fm.contents(atPath: target)
+    }
+
     func resolvePath(_ raw: String, base: String) -> String {
         var p = raw.trimmingCharacters(in: .whitespacesAndNewlines)
         if p.hasPrefix("file://"), let url = URL(string: p) { return url.path }
@@ -33,28 +46,34 @@ extension AppDelegate {
     func readFileForPreview(path: String, base: String, reqId: Int) {
         DispatchQueue.global(qos: .userInitiated).async { [self] in
             let p = resolvePath(path, base: base)
+            let target = (p as NSString).resolvingSymlinksInPath
+            let attrs = try? fm.attributesOfItem(atPath: target)
             var payload: [String: Any] = ["reqId": reqId, "path": p]
             var isDir: ObjCBool = false
-            if !fm.fileExists(atPath: p, isDirectory: &isDir) {
+            if !fm.fileExists(atPath: target, isDirectory: &isDir) {
                 payload["error"] = "文件不存在（可能已被移动或删除）"
             } else if isDir.boolValue {
                 payload["error"] = "这是一个文件夹"
                 payload["isDir"] = true
+            } else if attrs?[.type] as? FileAttributeType != .typeRegular {
+                payload["error"] = "不是普通文件，无法预览"
             } else {
-                let size = ((try? fm.attributesOfItem(atPath: p))?[.size] as? NSNumber)?.intValue ?? 0
+                let size = (attrs?[.size] as? NSNumber)?.intValue ?? 0
                 payload["size"] = size
-                let images = ["png": "image/png", "jpg": "image/jpeg", "jpeg": "image/jpeg", "gif": "image/gif",
-                              "webp": "image/webp", "svg": "image/svg+xml"]
-                if let mime = images[(p as NSString).pathExtension.lowercased()] {
-                    if size <= 8_000_000, let data = fm.contents(atPath: p) {
+                if let mime = previewImageMIMEs[(target as NSString).pathExtension.lowercased()] {
+                    if let data = previewImageData(at: target) {
                         payload["image"] = "data:\(mime);base64,\(data.base64EncodedString())"
                     } else {
                         payload["error"] = "图片太大，无法预览"
                     }
-                } else if let handle = FileHandle(forReadingAtPath: p) {
+                } else if let handle = FileHandle(forReadingAtPath: target) {
                     let limit = 400_000
-                    let data = handle.readData(ofLength: limit)
-                    try? handle.close()
+                    defer { try? handle.close() }
+                    guard let data = try? (handle.read(upToCount: limit) ?? Data()) else {
+                        payload["error"] = "无法读取这个文件"
+                        sendToJS("onFileRead", payload)
+                        return
+                    }
                     if data.contains(0) {
                         payload["error"] = "二进制文件，无法预览"
                     } else {

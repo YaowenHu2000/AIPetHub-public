@@ -25,7 +25,13 @@ function renderForkHint() {
   const live = st.conversationId && !viewBusy(active) ? liveElsewhere[forkKey(active, st.conversationId)] : null;
   const on = !!live && Date.now() - live.at < 30000;
   forkHint.hidden = !on;
-  if (on) {
+  if (on && active === 'gemini' && live.status === 'readOnly') {
+    forkHint.textContent = '反重力桌面版会话只读 · 退出桌面版后即可续聊';
+    forkHint.title = '桌面版可能用内存中的旧记录覆盖这里的更改。你可以在桌面版里继续聊。';
+  } else if (on && active === 'gemini') {
+    forkHint.textContent = '会话正在其他客户端打开 · 关闭那边的会话后即可发送';
+    forkHint.title = 'agy 会把整轮记录写回这个会话。在两个客户端同时发送可能覆盖对方的记录。';
+  } else if (on) {
     forkHint.textContent = `会话正在其他客户端${live.status === 'busy' ? '运行' : '打开'} · 发送将创建分支会话`;
     forkHint.title = `该会话当前由其他客户端持有${live.name ? `（${live.name}）` : ''}。在此发送的消息将基于现有记录创建一个独立的分支会话，后续内容不与原会话同步；两个会话可能各自修改工作区文件。`;
   }
@@ -34,7 +40,7 @@ function renderForkHint() {
 /** 看着的这个会话是不是在别处开着：问原生（它用 CLI 自己的清单查，零点几秒）。 */
 function askSessionLive() {
   const st = S[active];
-  if (active !== 'claude' || !st.conversationId || st.loadedId !== st.conversationId || viewBusy(active)) { renderForkHint(); return; }
+  if (!['claude', 'gemini'].includes(active) || !st.conversationId || st.loadedId !== st.conversationId || viewBusy(active)) { renderForkHint(); return; }
   postNative('checkSessionLive', { agent: active, conversationId: st.conversationId });
 }
 

@@ -1,5 +1,11 @@
 /* ===== 右栏：三位 AI 娘 ===== */
 body.stage-squeezed #stage-column, body.stage-squeezed #resize-stage { display: none; }   /* 窗口太窄时自动收起舞台 */
+body.stage-hidden #stage-column, body.stage-hidden #resize-stage { display: none; }       /* 自己收起来的（顶栏右边的开关，或把分隔条一直往右拖） */
+body.stage-hidden .btn-stage-toggle { color: var(--text-muted); }
+/* 开着预览面板时只留预览右上角那一个（它在最右边、挨着右栏），聊天顶栏里的那个不显示 */
+body:has(#preview-pane:not([hidden])) #chat-header .btn-stage-toggle { display: none; }
+/* 正在拖的分隔条不能消失：拖过头收起了栏，再往回拖还要能把它拉出来 */
+#resize-sidebar.dragging, #resize-stage.dragging { display: block !important; }
 #stage-column {
   width: var(--stage-w); flex-shrink: 0;
   display: flex; flex-direction: column; gap: 10px; padding: 12px;

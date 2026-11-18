@@ -3,7 +3,7 @@ import Cocoa
 
 /// 一次交互式回答：CLI 的标准输入开着，回答进行中可以中途补充、请它停下来、答复它的请求。
 /// 三位的协议不同，各有一个子类（Agents/ 下的 ClaudeLive / CodexLive / GeminiLive）；这里是共用的状态和流程。
-/// 登记在 AppDelegate.liveTurns（键是「agent#reqId」），网页发来的补充、停止、答复按这个键找到它。
+/// 挂在 AppDelegate.asks 的 live 字段（键是「agent#reqId」），网页发来的补充、停止、答复按这个键找到它。
 class LiveTurn {
     unowned let app: AppDelegate
     let req: AskRequest
@@ -18,6 +18,13 @@ class LiveTurn {
     let lock = NSRecursiveLock()
     private let announceConversation: (String) -> Void
     private var stopRequested = false
+    private(set) var warmDied = false
+    private var initializationProcess: Process?
+    private var initializationTimer: DispatchWorkItem?
+    private var initializationGeneration = 0
+    private var initializationStages = Set<String>()
+    private(set) var initializationTimedOut = false
+    private(set) var initialPromptSubmitted = false
 
     init(app: AppDelegate, req: AskRequest) {
         self.app = app
@@ -26,6 +33,7 @@ class LiveTurn {
         input = warm?.input ?? LiveInput()
         builder = app.turnBuilder(for: req)
         announceConversation = app.conversationWatcher(req)
+        app.hooks.liveTurnCreated?(self)
     }
 
     // MARK: 子类实现
@@ -40,6 +48,8 @@ class LiveTurn {
     func handle(line: String) {}
     /// 接手预热的进程那一刻、处理任何输出之前。
     func adopted() {}
+    /// Claude 会立即把用户消息排进输入，不处于可安全重发的握手等待阶段。
+    var waitsForInitialization: Bool { false }
 
     // MARK: 共用
 
@@ -47,19 +57,89 @@ class LiveTurn {
     func run(executable: String, arguments: [String], cwd: String) -> CLIResult {
         app.registerLive(req.key, self)
         defer {
+            locked { cancelInitializationDeadline(); initializationProcess = nil }
             app.unregisterLive(req.key)
             input.close()
             pending.takeAll().forEach { app.closeRequest(req, id: $0) }
         }
-        return app.runCLI(agent: req.key, executable: executable, arguments: arguments, cwd: cwd, input: input, warm: warm,
-                          onAdopt: { [weak self] in self?.locked { self?.adopted() } },
+        let result = app.runCLI(agent: req.key, executable: executable, arguments: arguments, cwd: cwd, input: input, warm: warm,
+                          onAdopt: { [weak self] in self?.locked {
+                              self?.beginInitializationDeadline()
+                              self?.adopted()
+                          } },
                           onStdoutLine: { [weak self] line in self?.locked { self?.handle(line: line) } })
+        warmDied = result.warmDied
+        return result
     }
 
     func locked<T>(_ body: () -> T) -> T { lock.lock(); defer { lock.unlock() }; return body() }
 
     var stopping: Bool { locked { stopRequested } }
-    func markStopping() { locked { stopRequested = true } }
+    func markStopping() {
+        locked {
+            guard !stopRequested else { return }
+            stopRequested = true
+            builder.interruptRunningTools()
+            cancelInitializationDeadline()
+        }
+    }
+
+    /// 必须等本次进程完成登记和启动再计时；预热接手也从这里重新给足等待时间。
+    private func beginInitializationDeadline() {
+        guard waitsForInitialization, !stopping, !initialPromptSubmitted else { return }
+        app.procLock.lock(); initializationProcess = app.asks[req.key]?.proc; app.procLock.unlock()
+        scheduleInitializationDeadline()
+    }
+
+    private func cancelInitializationDeadline() {
+        initializationGeneration += 1
+        initializationTimer?.cancel()
+        initializationTimer = nil
+    }
+
+    private func scheduleInitializationDeadline() {
+        guard let process = initializationProcess, process.isRunning else { return }
+        cancelInitializationDeadline()
+        let generation = initializationGeneration
+        let expire = { [weak self, weak process] in
+            guard let self = self, let process = process else { return }
+            self.locked {
+                guard self.initializationGeneration == generation, self.initializationProcess === process,
+                      !self.stopping, !self.initialPromptSubmitted, !self.initializationTimedOut, process.isRunning else { return }
+                self.initializationTimedOut = true
+                self.cancelInitializationDeadline()
+                self.input.close()
+                // 只操作捕获的本次进程，不能在回退后再按 reqId 查到一问一答的新进程。
+                terminateTree(process.processIdentifier)
+            }
+        }
+        let timer = DispatchWorkItem(block: expire)
+        initializationTimer = timer
+        if let schedule = app.hooks.liveInitializationScheduled { schedule(expire) }
+        else { DispatchQueue.global(qos: .utility).asyncAfter(deadline: .now() + 300, execute: timer) }
+    }
+
+    /// 只有真正推进的阶段才能延长等待；重复 ACK、日志和未知握手不能无限续期。
+    @discardableResult
+    func initializationProgress(_ stage: String) -> Bool {
+        locked {
+            guard !stopping, !initialPromptSubmitted, !initializationTimedOut,
+                  initializationStages.insert(stage).inserted else { return false }
+            scheduleInitializationDeadline()
+            return true
+        }
+    }
+
+    /// send 只保证成功排队，但这已经可能被 CLI 消费；提交和超时必须互斥，不能等待 ACK 才禁止重发。
+    @discardableResult
+    func submitInitialPrompt(_ send: () -> Bool) -> Bool {
+        locked {
+            guard !stopping, !initialPromptSubmitted, !initializationTimedOut, send() else { return false }
+            initialPromptSubmitted = true
+            cancelInitializationDeadline()
+            return true
+        }
+    }
 
     /// CLI 一报出会话 ID 就告诉网页。
     func noteConversation(_ id: String) { announceConversation(id) }
@@ -69,8 +149,11 @@ class LiveTurn {
         app.sendToJS("onAgentSteer", ["agent": req.agent, "reqId": req.reqId, "steerId": id, "state": state])
     }
 
-    func noteSteerConsumed(_ id: String, text: String) {
-        builder.add(makeStep("user", "你补充说", detail: text))
+    func noteSteerConsumed(_ id: String, text: String, images: [String] = []) {
+        var step = makeStep("user", "你补充说", detail: text)
+        let thumbs = app.chatImages(sources: images.map { ["path": $0] }, text: text, base: req.workspace)
+        if !thumbs.isEmpty { step["images"] = thumbs }
+        builder.add(step)
         noteSteer(id, "consumed")
     }
 }
@@ -90,17 +173,32 @@ final class PendingRequests {
 }
 
 extension AppDelegate {
+    /// 跑一轮交互式回答。预热的进程在接手前就死了（warmDied）：提问没送到活着的进程，重建这一轮走一次冷启动。
+    /// 只重试一次；第二次还是这样就按普通失败返回。三位的入口共用。
+    func runLive<T: LiveTurn>(_ make: () -> T, _ run: (T) -> AgentReply?) -> AgentReply? {
+        let live = make()
+        let reply = run(live)
+        return live.warmDied ? run(make()) : reply
+    }
+
     func registerLive(_ key: String, _ live: LiveTurn) {
-        procLock.lock(); liveTurns[key] = live; procLock.unlock()
+        procLock.lock()
+        asks[key]?.live = live
+        let stopped = asks[key]?.cancelled == true
+        procLock.unlock()
+        // DeepSeek 没有 runCLI 替它接手登记前的停止。
+        if stopped { live.markStopping() }
+        hooks.liveRegistered?(key, live)
     }
 
     func unregisterLive(_ key: String) {
-        procLock.lock(); liveTurns[key] = nil; procLock.unlock()
+        procLock.lock(); asks[key]?.live = nil; procLock.unlock()
+        hooks.liveUnregistered?(key)
     }
 
     func liveTurn(agent: String, reqId: Int) -> LiveTurn? {
         procLock.lock(); defer { procLock.unlock() }
-        return liveTurns["\(agent)#\(reqId)"]
+        return asks["\(agent)#\(reqId)"]?.live
     }
 
     /// 网页：回答进行中又发来一句（可以带图片）。

@@ -16,11 +16,18 @@ ALL_AGENT_IDS.forEach(id => {
   box.hidden = true;
   els.chatStack.appendChild(box);
   S[id].msgEl = box;
+  jumpObserver.observe(box, { childList: true, subtree: true, attributes: true, attributeFilter: ['hidden'] });
   pets[id] = new Pet(id);
   showEmpty(id, S[id].conversationId ? '正在加载历史会话…' : '');
 });
 layoutAgents();
 
+// 右栏（AI 娘）的开关：聊天顶栏最右边一个，预览面板右上角一个（预览放大时聊天顶栏不在）
+document.querySelectorAll('.btn-stage-toggle').forEach(b => {
+  b.innerHTML = UI.sidebarRight;
+  b.addEventListener('click', () => setStageHidden(!document.body.classList.contains('stage-hidden')));
+});
+setStageHidden(lsGet('stage_hidden') === '1');
 applyWidths();
 setupColumnResizer($('#resize-sidebar'), 'sidebar');
 setupColumnResizer($('#resize-stage'), 'stage');
@@ -82,8 +89,7 @@ window.addEventListener('focus', () => {
     // 打开着的会话也重新读一遍（在终端里接着聊过的话，这里会同步过来）
     const st = S[id];
     if (st.conversationId && st.loadedId === st.conversationId && !viewBusy(id)) {
-      st.syncing = true;
-      postNative('loadConversation', { agent: id, conversationId: st.conversationId });
+      postNative('loadConversation', { agent: id, conversationId: st.conversationId, sync: true });
     }
   });
 });
@@ -106,14 +112,7 @@ jumpBtn.addEventListener('click', () => {
 els.chatStack.addEventListener('scroll', updateJumpButton, true);   // 滚动事件不冒泡，用捕获
 
 els.sendBtn.addEventListener('click', () => (viewBusy(active) ? stop() : send()));
-let draftTimer = 0;
-els.input.addEventListener('input', () => {
-  autosize();
-  // 输入框里的草稿随时存下来（App 重启、崩溃后还在）
-  clearTimeout(draftTimer);
-  const id = active;
-  draftTimer = setTimeout(() => { S[id].draft = els.input.value; lsSet(`${id}_draft`, els.input.value); }, 300);
-});
+els.input.addEventListener('input', autosize);
 els.input.addEventListener('keydown', e => {
   pets[active].touch();   // 打字算互动：不会打着字她睡着；已经睡着的会醒
   if (e.isComposing || e.keyCode === 229) return;
@@ -129,7 +128,7 @@ els.input.addEventListener('keydown', e => {
     if (!e.shiftKey) {
       e.preventDefault();
       const { selectionStart: start, selectionEnd: end, value } = els.input;
-      els.input.value = value.slice(0, start) + '\n' + value.slice(end);
+      setDraft(active, value.slice(0, start) + '\n' + value.slice(end));
       els.input.selectionStart = els.input.selectionEnd = start + 1;
       autosize();
     }
@@ -184,7 +183,7 @@ setInterval(() => {
 }, 1000);
 setInterval(renderAllHistory, 60000);   // 刷新「几分钟前」
 
-els.input.value = S[active].draft || '';   // 启动时恢复上次没发出去的草稿
+setDraft(active, S[active].draft || '');   // 启动时恢复上次没发出去的草稿
 autosize();
 setActive(active, true);
 AGENT_IDS.forEach(id => {

@@ -43,7 +43,8 @@ ALL_AGENT_IDS.forEach(id => {
     addedWs: lsJson(`${id}_added_ws`, []),        // 在左栏用 📁 打开过的工作空间：[{ path, ts }]
     conversationId: lsGet(`${id}_conv`, ''),
     roam: lsGet(`${id}_roam`) === '1',
-    groupState: lsJson(`${id}_groups`, {}),   // 工作空间分组：1 = 折叠，0 = 展开
+    groupState: lsJson(`${id}_groups`, {}),
+    taskOverrides: lsJson(`${id}_task_overrides`, {}),   // 手动移进 / 移出「任务会话」：会话 ID → true / false（history.js）   // 工作空间分组：1 = 折叠，0 = 展开
     expanded: new Set(),                     // 已点「查看全部」的分组
     conversations: null,
     loadedId: null,
@@ -78,6 +79,8 @@ let viewSeq = 0;
 /** 当前显示的会话：有 ID 用 ID，新对话用临时的 new:N。 */
 const viewKey = id => S[id].conversationId || S[id].newView;
 const isBusy = id => S[id].runs.size > 0;
+// 桌宠眼里的「在忙」：自己在答，或者打开着的会话正在别处跑。只用于桌宠的动作和睡觉，发送、删除等仍只看 isBusy。
+const petBusy = id => isBusy(id) || !!S[id].elsewherePet;
 const runsOf = (id, view) => [...S[id].runs.values()].filter(r => r.view === view);
 const viewBusy = id => runsOf(id, viewKey(id)).length > 0;
 const busySince = id => Math.min(Date.now(), ...[...S[id].runs.values()].map(r => r.since));
@@ -111,6 +114,11 @@ function syncRunPhase(run) {
 /** 汇总某位 AI 娘当前展示的忙碌阶段（优先看当前打开的会话，否则看最近活跃的会话）。 */
 function busyInfo(id) {
   const st = S[id];
+  if (st && !st.runs.size && st.elsewherePet) {   // 打开着的会话正在别处跑（chat/elsewhere.js）：桌宠照样按它最后一步动起来
+    const e = st.elsewherePet, meta = PHASE_META[e.phase] || PHASE_META.thinking;
+    return { phase: e.phase, kind: e.stepKind, meta, icon: KIND_ICONS[e.stepKind] || meta.icon, title: e.stepTitle,
+             count: 1, fast: false, since: e.since, elsewhere: true };
+  }
   if (!st || !st.runs.size) return null;
   const inView = runsOf(id, viewKey(id));
   const list = inView.length ? inView : [...st.runs.values()];
@@ -136,7 +144,8 @@ const fastOn = id => S[id].fast && !!find(AGENTS[id].models, S[id].model).fast;
 /** 这个模型支持的思考强度选项。 */
 function modelEfforts(id, m) {
   const all = AGENTS[id].efforts;
-  return m.efforts ? all.filter(o => m.efforts.includes(o.v)) : all;
+  const levels = m.efforts || (id === 'gemini' ? ['low', 'medium', 'high'] : null);
+  return levels ? all.filter(o => levels.includes(o.v)) : all;
 }
 /** 这个模型的思考强度：上次给它选的 → 默认 → 它支持的第一个。 */
 function effortOf(id, v) {
@@ -145,7 +154,13 @@ function effortOf(id, v) {
 }
 
 let active = AGENT_IDS.includes(lsGet('active')) ? lsGet('active') : AGENT_IDS[0];
-let reqCounter = Date.now();   // 从当前时间起编号：网页进程崩溃重新载入后，新的回答不会和原生层还在跑的旧回答撞号
+// 时间留高位；同时记住已发出的最大编号，快速重载或时钟回拨也不会复用旧请求。
+let reqCounter = Math.max(Date.now() * 1024, Number(lsGet('request_counter', 0)) || 0);
+function nextRequestId() {
+  const reqId = ++reqCounter;
+  lsSet('request_counter', reqId);
+  return reqId;
+}
 const pets = {};
 
 const $ = sel => document.querySelector(sel);
@@ -168,5 +183,19 @@ const els = {
 
 const hasBridge = () => !!(window.webkit && window.webkit.messageHandlers && window.webkit.messageHandlers.hubBridge);
 function postNative(action, payload = {}) {
-  if (hasBridge()) window.webkit.messageHandlers.hubBridge.postMessage({ action, ...payload });
+  if (!hasBridge()) return;
+  if (action === 'loadConversation') {
+    const st = S[payload.agent], reads = st.historyReads ??= new Map();
+    const mode = payload.sync ? 'sync' : (payload.afterSteer ? 'steer' : 'open');
+    if (mode === 'open') reads.clear();   // 切走再切回来，同一会话的旧回包也不能接手新页面。
+    const reqId = payload.reqId ?? nextRequestId();
+    reads.set(reqId, mode);
+    payload = { ...payload, reqId };
+  }
+  window.webkit.messageHandlers.hubBridge.postMessage({ action, ...payload });
+}
+
+// 当前页面已开始或收好一轮。这之前发出的后台读取只认识旧页面，包括补充结束后要求的整页回读。
+function discardHistoryRefreshes(st) {
+  st.historyReads?.forEach((mode, reqId) => { if (mode !== 'open') st.historyReads.delete(reqId); });
 }

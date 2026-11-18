@@ -58,16 +58,26 @@ extension AppDelegate {
                 NSWorkspace.shared.open(url)
             }
             return true
-        case "checkFiles":   // 回答里的文件标签：只给真实存在的文件
-            if let reqId = (body["reqId"] as? NSNumber)?.intValue, let paths = body["paths"] as? [String] {
+        case "checkFiles":   // 回答里的文件标签：只给真实存在的文件；只写了文件名的，也到回答里提到过的文件夹里找
+            if let reqId = (body["reqId"] as? NSNumber)?.intValue, let items = body["items"] as? [[String: Any]] {
                 let base = body["base"] as? String ?? ""
                 DispatchQueue.global(qos: .userInitiated).async { [self] in
-                    var exists: [String: Bool] = [:]
-                    for raw in paths.prefix(500) {
-                        var isDir: ObjCBool = false
-                        exists[raw] = fm.fileExists(atPath: resolvePath(raw, base: base), isDirectory: &isDir) && !isDir.boolValue
+                    var found: [String: Any] = [:]
+                    for item in items.prefix(800) {
+                        guard let key = item["key"] as? String, let paths = item["paths"] as? [String] else { continue }
+                        let dirs = (item["dirs"] as? [String] ?? []).map { resolvePath($0, base: base) }
+                        search: for (index, raw) in paths.enumerated() {
+                            for dir in [base] + dirs {
+                                let p = resolvePath(raw, base: dir)
+                                var isDir: ObjCBool = false
+                                if fm.fileExists(atPath: p, isDirectory: &isDir) && !isDir.boolValue {
+                                    found[key] = ["path": p, "index": index]
+                                    break search
+                                }
+                            }
+                        }
                     }
-                    sendToJS("onFilesChecked", ["reqId": reqId, "exists": exists])
+                    sendToJS("onFilesChecked", ["reqId": reqId, "found": found])
                 }
             }
             return true
@@ -112,8 +122,16 @@ extension AppDelegate {
                 listFiles(workspace: body["workspace"] as? String ?? "", query: body["query"] as? String ?? "", reqId: reqId)
             }
             return true
-        case "testSnapshot":   // 自动化测试：存一张界面截图
-            if let path = body["path"] as? String { uiTestSnapshot(path) }
+        case "testHoldHistory":
+            if UITest.active { hooks.heldHistoryReplies = [] }
+            return true
+        case "testReleaseHistory":
+            if UITest.active {
+                let replies = hooks.heldHistoryReplies ?? []
+                hooks.heldHistoryReplies = nil
+                replies.forEach { $0() }
+                sendToJS("onTestHistoryReleased", [:])
+            }
             return true
         case "testWindowShot":   // 自动化测试（真实窗口模式）：把整个窗口截下来
             if let path = body["path"] as? String { uiTestWindowShot(path) }
@@ -147,20 +165,20 @@ extension AppDelegate {
         case "listConversations":
             listConversations(agent: agent)
         case "loadConversation":
-            if let cid = body["conversationId"] as? String, isSafeId(cid) {
+            if let cid = body["conversationId"] as? String, validConversationId(cid, agent: agent) {
                 if let limit = (body["limit"] as? NSNumber)?.intValue, limit > 0 {
-                    procLock.lock(); historyLimits[cid] = min(limit, 5000); procLock.unlock()
+                    procLock.lock(); historyLimits[cid] = limit; procLock.unlock()
                 }
-                loadConversation(agent: agent, cid: cid)
+                loadConversation(agent: agent, cid: cid, reqId: (body["reqId"] as? NSNumber)?.intValue)
             }
         case "searchConversations":   // ⌘F：在会话正文里找（ConversationSearch.swift）
             searchConversations(agent: agent, query: body["query"] as? String ?? "")
         case "deleteConversation":
-            if let cid = body["conversationId"] as? String, isSafeId(cid) {
+            if let cid = body["conversationId"] as? String, validConversationId(cid, agent: agent) {
                 deleteConversation(agent: agent, cid: cid)
             }
         case "deleteConversations":
-            let ids = (body["conversationIds"] as? [String] ?? []).filter { isSafeId($0) }
+            let ids = (body["conversationIds"] as? [String] ?? []).filter { validConversationId($0, agent: agent) }
             if !ids.isEmpty { deleteConversations(agent: agent, ids: ids) }
         case "projectConversations":
             if let workspace = body["workspace"] as? String, !workspace.isEmpty {
@@ -171,7 +189,7 @@ extension AppDelegate {
         case "cancelAgent":
             cancel(agent: agent, reqId: reqId)
         case "prewarmAgent":   // 用户开始打字 / 上一轮刚答完：按现在的设置把 CLI 先起好（Prewarm.swift）
-            prewarm(askRequest(agent: agent, reqId: 0, body))
+            prewarm(askRequest(agent: agent, reqId: 0, body), typing: body["typing"] as? Bool == true)
         case "steerAgent":   // 回答进行中又发来一句（可以带图片）
             if let reqId = reqId, let text = body["text"] as? String, let sid = body["steerId"] as? String {
                 let images = (body["images"] as? [String] ?? []).filter { isAttachableImage($0) }
@@ -193,7 +211,7 @@ extension AppDelegate {
             agent: agent, reqId: reqId, prompt: body["prompt"] as? String ?? "",
             model: body["model"] as? String ?? "", effort: body["effort"] as? String ?? "",
             permissionMode: body["permissionMode"] as? String ?? "", workspace: body["workspace"] as? String ?? "",
-            conversationId: isSafeId(convId) ? convId : "",
+            conversationId: validConversationId(convId, agent: agent) ? convId : "",
             images: (body["images"] as? [String] ?? []).filter { isAttachableImage($0) },
             browserTools: body["browserTools"] as? Bool ?? true,
             fast: body["fast"] as? Bool ?? false)
@@ -201,10 +219,18 @@ extension AppDelegate {
 
     func sendToJS(_ fn: String, _ payload: [String: Any]) {
         if let sink = jsSink { sink(fn, payload); return }
-        guard let data = try? JSONSerialization.data(withJSONObject: payload),
+        // 字段按名字排好序再发：字典里字段的先后每次都可能不一样，网页那边拿整段内容比「变没变」时会被顺序骗到
+        guard let data = try? JSONSerialization.data(withJSONObject: payload, options: [.sortedKeys]),
               let json = String(data: data, encoding: .utf8) else { return }
         DispatchQueue.main.async { [weak self] in
-            self?.webView.evaluateJavaScript("window.\(fn) && window.\(fn)(\(json));", completionHandler: nil)
+            guard let self else { return }
+            let deliver: () -> Void = { [weak self] in
+                self?.webView.evaluateJavaScript("window.\(fn) && window.\(fn)(\(json));", completionHandler: nil)
+            }
+            if fn == "onConversationLoaded", self.hooks.heldHistoryReplies != nil {
+                self.hooks.heldHistoryReplies?.append(deliver)
+                self.sendToJS("onTestHistoryHeld", ["reqId": payload["reqId"] ?? 0])
+            } else { deliver() }
         }
     }
 

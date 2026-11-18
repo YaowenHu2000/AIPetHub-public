@@ -8,6 +8,7 @@ window.onConversationsListed = data => {
   if (!st) return;
   // 「添加 AI」时验证用的那句话（在临时目录 aipethub-verify 里问的）不算会话，不列出来
   st.conversations = (Array.isArray(data.items) ? data.items : []).filter(c => !/\/aipethub-verify\/?$/.test(c.cwd || ''));
+  if (data.agent === 'gpt') st.projectlessIds = new Set(data.projectlessIds || []);
   renderHistory(data.agent);
   if (data.agent === active) renderHeader();
   noteListedStamp(data.agent);   // 打开着的会话在别处动了没有（chat/elsewhere.js）
@@ -16,6 +17,10 @@ window.onConversationsListed = data => {
 window.onConversationLoaded = data => {
   const id = data.agent;
   const st = S[id];
+  const mode = st?.historyReads?.get(data.reqId);
+  st?.historyReads?.delete(data.reqId);
+  if (data.reqId != null && !mode) return;
+  const syncing = mode === 'sync';
   if (!st || data.conversationId !== st.conversationId) return;
   if (data.missing && !viewBusy(id)) {
     st.conversationId = '';
@@ -27,7 +32,9 @@ window.onConversationLoaded = data => {
     if (id === active) renderHeader();
     return;
   }
+  if (data.context) window.onAgentContext({ ...data.context, agent: id, conversationId: data.conversationId, history: true });
   st.loadedId = data.conversationId;
+  readElsewhereTurn(id, data, syncing);
   if (st.applyCwdOnLoad) {
     st.applyCwdOnLoad = false;
     // 继续历史会话时，工作空间跟随该会话原来的目录
@@ -35,10 +42,14 @@ window.onConversationLoaded = data => {
   }
   // 压缩上下文的命令不算一句话（有的 CLI 会把它记成一句提问）：不显示
   const messages = (Array.isArray(data.messages) ? data.messages : []).filter(m => !(m.role === 'user' && isCompactCommand(m.text)));
-  const last = messages[messages.length - 1] || {};
-  const sig = `${messages.length}|${data.omitted || 0}|${(last.text || '').length}|${(last.steps || []).length}`;
-  const syncing = st.syncing;
-  st.syncing = false;
+  let tail = messages.length - 1;
+  while (tail > 0 && messages[tail].role !== 'user') tail--;
+  const sig = JSON.stringify([data.conversationId, messages.length, data.omitted || 0, !!data.hasMore, messages.slice(Math.max(0, tail)).map(messageSignature)]);
+  // 即使正在回答而暂不重画，后来取回的旧页也已经改变了这轮在历史中的位置。
+  const prepended = Math.max(0, data.historyPrepended || 0);
+  if (prepended) runsOf(id, viewKey(id)).forEach(run => {
+    if (Number.isInteger(run.historyStart)) run.historyStart += prepended;
+  });
   if (syncing && (sig === st.loadedSig || viewBusy(id))) return;   // 后台同步：没变化（或正在回答）就不动
   // 没人在这里答，内容却变了：它在别处跑着（chat/elsewhere.js）。
   // 例外：这里自己刚答完一轮之后的第一次同步——记录里多出来的就是刚才那一轮，只是对一下账
@@ -47,10 +58,14 @@ window.onConversationLoaded = data => {
   else { st.elsewhereAt = 0; noteListedStamp(id); }
   st.loadedSig = sig;
   const box = st.msgEl;
-  if (syncing && syncAppend(id, messages, data.cwd || S[id].workspace || '', data.omitted || 0)) { markElsewhere(id); return; }   // 只多了几条：接在后面，已有的不动
+  if ((syncing || mode === 'steer') &&
+      syncAppend(id, messages, data.cwd || st.workspace || '', data.omitted || 0, !!data.hasMore, mode === 'steer')) {
+    markElsewhere(id);
+    return;
+  }
   const keepScroll = syncing && !nearBottom(box) ? box.scrollTop : null;   // 正在往上翻看时，同步后留在原处
   st.shownLimit = data.limit || 300;
-  renderMessages(id, messages, data.cwd || S[id].workspace || '', data.omitted || 0);
+  renderMessages(id, messages, data.cwd || S[id].workspace || '', data.omitted || 0, !!data.hasMore);
   if (keepScroll !== null) box.scrollTop = keepScroll;
   if (st.keepFromBottom) { box.scrollTop = box.scrollHeight - st.keepFromBottom; st.keepFromBottom = 0; }   // 刚点了「显示更早的」
   markElsewhere(id);
@@ -62,7 +77,7 @@ window.onConversationDeleted = data => {
   const id = data.agent;
   const st = S[id];
   if (!st) return;
-  if (!data.ok) { pets[id].say('删除失败了…', 1800); return; }
+  if (!data.ok) { pets[id].say(data.reason || '删除失败了…', data.reason ? 6000 : 1800); return; }
   if (st.conversations) st.conversations = st.conversations.filter(c => c.id !== data.conversationId);
   st.unreadConvs.delete(data.conversationId);
   if (st.conversationId === data.conversationId) {
@@ -117,14 +132,16 @@ window.onAgentResponse = data => {
   st.runs.delete(run.reqId);
   const cwd = data.cwd || run.workspace || '';
   const shown = !!run.live?.el.isConnected;   // 这个会话正显示着（没有切走）
+  if (shown) discardHistoryRefreshes(st);
   const extra = rememberTurn(id, run, data, cwd);   // 这一轮改了哪些文件记下来：会话重新读一遍后改动卡片还在（live.js）
   const reply = (data.reply || '').trim();
-  if (shown && isCompactCommand(run.text) && !data.cancelled && !/^⚠️/.test(reply)) {
+  if (shown && isCompactCommand(run.text) && !data.cancelled && data.outcome !== 'failed' && !/^⚠️/.test(reply)) {
     // 压缩上下文不是一轮对话（CLI 的记录里也没有这一问一答）：收起成一条提示，留在压缩发生的地方
     const note = document.createElement('div');
     note.className = 'msg sys fork-note compact-note';
     note.textContent = reply.split('\n')[0] || '前面的对话已经压缩成摘要';
     note.title = reply;
+    if (id === 'gemini') { note.dataset.historyCompact = '1'; note._answeredHere = true; }
     run.live.el.replaceWith(note);
     (run.nodes || []).filter(n => n.classList && n.classList.contains('user')).forEach(n => n.remove());
     if (nearBottom(st.msgEl)) scrollToBottom(st.msgEl);
@@ -137,9 +154,10 @@ window.onAgentResponse = data => {
       files: Array.isArray(data.files) ? data.files : [],
       duration: data.duration,
     }, cwd);
+    turn._answeredHere = true;   // 之后和记录对账时不重画这一轮（messages.js 的 syncAppend），重试按钮、展开状态都留着
     run.live.el.replaceWith(turn);
     verifyFileChips(turn, cwd);
-    if (data.cancelled || /^⚠️/.test((data.reply || '').trim())) addRetry(turn, id, run.text);
+    if (data.cancelled || data.outcome === 'failed' || /^⚠️/.test((data.reply || '').trim())) addRetry(turn, id, run.text, run.images);
     if (extra) decorateTurn(turn, id, extra);   // 这一轮改了文件：可以「查看全部改动」（live.js）
     if (data.cancelled) appendMessage(id, 'sys', '已停止');
     if (stick) scrollToBottom(box);
@@ -167,7 +185,7 @@ window.onAgentResponse = data => {
   // 中途补充过话的回答：CLI 的记录里它是「提问 → 回答 → 补充 → 回答」，按记录重读一遍，现在看到的就和以后重开时一样
   if (run.steered && shown && data.conversationId && viewKey(id) === data.conversationId) {
     st.loadedSig = '';
-    postNative('loadConversation', { agent: id, conversationId: data.conversationId });
+    postNative('loadConversation', { agent: id, conversationId: data.conversationId, afterSteer: true });
   }
   flushQueue(id, run, data);   // 回答期间排着的话：接着发（live.js）
   if (id === active) setTimeout(() => prewarm(id), 400);   // 多半还要接着问：先把下一轮的进程起好（live.js）
@@ -182,7 +200,6 @@ function restoreDraft(id, text) {
   const cur = id === active ? els.input.value : S[id].draft;
   if (cur.includes(text)) return;
   const next = cur.trim() ? `${text}\n\n${cur}` : text;
-  S[id].draft = next;
-  lsSet(`${id}_draft`, next);
-  if (id === active) { els.input.value = next; autosize(); updateSendUI(); }
+  setDraft(id, next);   // 和别处一样走统一的草稿入口（ui/composer.js），不另写一套保存
+  if (id === active) { autosize(); updateSendUI(); }
 }

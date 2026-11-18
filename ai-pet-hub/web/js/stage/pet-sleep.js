@@ -7,7 +7,7 @@ Pet.prototype.goToSleep = function () {
   // 打哈欠 / 伸懒腰的过渡帧用到时才加载：还没好就等它好了再去睡（本地文件，很快）
   if (loadNap(this.id) === null) {
     const from = this.state;
-    loadNap(this.id, () => { if (this.state === from && !this.dragging && !this.falling && !isBusy(this.id)) this.goToSleep(); });
+    loadNap(this.id, () => { if (this.state === from && !this.dragging && !this.falling && !petBusy(this.id)) this.goToSleep(); });
     return;
   }
   if (Math.abs(this.x) < 6) { this.walkingToBed = false; this.setState('sleep'); return; }
@@ -23,7 +23,7 @@ Pet.prototype.toggleSleep = function () {
   this.demoPhase = null;
   if (this.state === 'sleep') {
     this.setState(this.restingState());
-  } else if (!isBusy(this.id)) {
+  } else if (!petBusy(this.id)) {
     this.goToSleep();
   } else {
     this.say('正在忙活中，不能睡哦', 1800);
@@ -79,14 +79,14 @@ Pet.prototype.tick = function () {
   const st = S[this.id];
   const idleSec = (Date.now() - this.lastInteraction) / 1000;
   // 当前选中的那位也会困：在输入框里打字算互动（boot.js），会把她叫醒
-  if (st.autoSleep > 0 && idleSec >= st.autoSleep && !isBusy(this.id) &&
+  if (st.autoSleep > 0 && idleSec >= st.autoSleep && !petBusy(this.id) &&
       (this.state === 'idle' || this.state === 'walk')) {
     this.goToSleep();
     this.say('困啦…眯一会儿 💤', 2600);
     return;
   }
   if (this.walkingToBed) return;   // 正在走回中间准备睡觉
-  if (!st.roam || isBusy(this.id) || this.dockHover) {
+  if (!st.roam || petBusy(this.id) || this.dockHover) {
     if (this.state === 'walk') this.setState(this.restingState());
     return;
   }

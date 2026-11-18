@@ -155,7 +155,7 @@ Pet.prototype.toggleRoam = function () {
   lsSet(`${this.id}_roam`, st.roam ? '1' : '0');
   this.touch();
   this.boutTicks = 0;
-  if (st.roam && !isBusy(this.id)) {
+  if (st.roam && !petBusy(this.id)) {
     this.walking = true;
     this.setState('walk');
     this.walking = true;

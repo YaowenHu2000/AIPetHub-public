@@ -27,7 +27,7 @@ svg.spin { animation-duration: 0.65s; }   /* 转得快一点，等的时候感�
 
 /* ---------- 滚动边缘：内容滚到顶栏下面时渐渐淡出，不是被一条线切断 ----------
    做法是在聊天区顶上盖一条从底色到透明的渐变。不能给滚动区加遮罩（mask）：遮罩会让整块内容每次重画都重新合成，
-   回答进行中每秒更新一次计时，我发的那条气泡四周的光晕就跟着一明一暗地闪。 */
+   回答进行中每秒更新一次计时，用户发的那条气泡四周的光晕就跟着一明一暗地闪。 */
 #chat-stack::before {
   content: ''; position: absolute; left: 0; right: 8px; top: 0; height: 20px; z-index: 2; pointer-events: none;
   background: linear-gradient(to bottom, var(--bg-chat), transparent);

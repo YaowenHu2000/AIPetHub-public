@@ -6,6 +6,8 @@ final class CodexStreamParser {
     var threadId = ""
     var lastAgentMessage = ""
     var errors: [String] = []
+    var status: String?
+    var wasCancelled: (() -> Bool)?
 
     init(turn: TurnBuilder) { self.turn = turn }
 
@@ -16,7 +18,10 @@ final class CodexStreamParser {
         case "item.started", "item.updated", "item.completed":
             guard let item = obj["item"] as? [String: Any] else { return }
             handle(item, completed: obj["type"] as? String == "item.completed")
+        case "turn.completed":
+            status = "completed"
         case "turn.failed":
+            status = "failed"
             let msg = readableError(((obj["error"] as? [String: Any])?["message"] as? String) ?? "本轮失败")
             if !errors.contains(msg) { errors.append(msg) }
             turn.add(makeStep("error", "出错", detail: msg, status: "error"))
@@ -50,6 +55,7 @@ final class CodexStreamParser {
         case "command_execution":
             let status = completed ? ((item["status"] as? String) == "failed" || ((item["exit_code"] as? NSNumber)?.intValue ?? 0) != 0 ? "error" : "ok") : "running"
             var step = makeStep("command", "运行命令", detail: item["command"] as? String, status: status)
+            if completed, item["exit_code"] as? Int == -1, wasCancelled?() == true { step["status"] = "interrupted" }
             let out = trimmed(item["aggregated_output"] as? String)
             if completed, !out.isEmpty { step["output"] = clip(out, maxOutput) }
             if turn.step(id) == nil { turn.add(step, key: id) } else { turn.update(id, step) }
@@ -150,6 +156,23 @@ final class CodexAppParser {
         var detail = busy ? "所选模型现在满载。Codex 每次要等 5 分钟左右才再试，可以点停止、换一个模型再发。" : "连接断了，Codex 正在自动重连。"
         if !why.isEmpty { detail += "\n" + why }
         let step = makeStep("error", (busy ? "模型满载，等待重试" : "连接中断，正在重试") + count, detail: detail, status: "error")
+        putRetry(step)
+    }
+
+    /// 静默期间从 CLI 日志读到的重试，沿用通知的同一个步骤及其收尾行为。
+    func noteRetry(_ record: CodexRetryRecord) {
+        let seconds = record.waitSeconds
+        let unit = seconds >= 3600 ? "小时" : (seconds >= 60 ? "分钟" : "秒")
+        let amount = max(1, (seconds / (seconds >= 3600 ? 3600 : (seconds >= 60 ? 60 : 1))).rounded())
+        let title = record.statusCode == 429
+            ? "被限流，约 \(String(format: "%.0f", amount)) \(unit)后自动重试"
+            : "连接中断，正在重试"
+        var step = makeStep("error", title, status: "error")
+        step["detail"] = record.message
+        putRetry(step)
+    }
+
+    private func putRetry(_ step: [String: Any]) {
         if turn.step("retry") == nil { turn.add(step, key: "retry") } else { turn.update("retry", step) }
     }
 

@@ -38,7 +38,7 @@ function inlineMathEnd(s, i) {
 }
 
 /** 把行内的公式换成占位：\(…\)、\[…\]、$$…$$、$…$。 */
-function protectMath(s, keep) {
+function protectMath(s, keep, source = false) {
   let out = '';
   for (let i = 0; i < s.length; i++) {
     const c = s[i];
@@ -47,24 +47,29 @@ function protectMath(s, keep) {
       const end = s.indexOf(display ? '\\]' : '\\)', i + 2);
       const tex = end > i + 2 ? s.slice(i + 2, end) : '';
       // \[…\] 也可能只是转义的方括号（如「\[1\]」），里面像公式才当公式
-      if (tex && (!display || /[\\^_={}]/.test(tex))) { out += keep(renderMath(tex, display)); i = end + 1; continue; }
+      if (tex && (!display || /[\\^_={}]/.test(tex))) { out += keep(source ? s.slice(i, end + 2) : renderMath(tex, display)); i = end + 1; continue; }
     }
     if (c === '\\' && s[i + 1] === '$') { out += '\\$'; i++; continue; }   // 交给后面的转义处理
     if (c === '$') {
       if (s[i + 1] === '$') {
         const end = s.indexOf('$$', i + 2);
-        if (end > i + 2) { out += keep(renderMath(s.slice(i + 2, end), true)); i = end + 1; continue; }
+        if (end > i + 2) { out += keep(source ? s.slice(i, end + 2) : renderMath(s.slice(i + 2, end), true)); i = end + 1; continue; }
         out += '$$';
         i++;
         continue;
       }
       const end = inlineMathEnd(s, i);
-      if (end > 0) { out += keep(renderMath(s.slice(i + 1, end), false)); i = end; continue; }
+      if (end > 0) { out += keep(source ? s.slice(i, end + 1) : renderMath(s.slice(i + 1, end), false)); i = end; continue; }
     }
     out += c;
   }
   return out;
 }
+
+// 文字里的文件名：一串不含空白、括号、引号、中文标点的字，以「.扩展名」（可带 :行号）结尾；
+// 后面可以紧跟中文（「打开README.md看看」），不能紧跟字母数字（那是别的词）。只从这一串的开头找起。
+const PLAIN_FILE_STOP = '\\s\u0000:，。、；：！？（）【】《》「」『』“”‘’<>|*?"\'`()\\[\\]{}=,;!';
+const PLAIN_FILE_RE = new RegExp(`(?<![^${PLAIN_FILE_STOP}])[^${PLAIN_FILE_STOP}]+\\.[A-Za-z0-9]{1,6}(?::\\d+(?::\\d+)?)?(?![A-Za-z0-9_\\-/]|\\.[A-Za-z0-9])`, 'g');
 
 function mdLink(label, target, opts) {
   if (/^https?:/i.test(target)) return `<a class="ext-link" data-url="${target}">${label}</a>`;
@@ -96,8 +101,8 @@ function mdInline(text, opts = {}) {
   // 3. 反斜杠转义：\* \_ \| \$ 等按原字符显示
   s = s.replace(/\\([\\`*_{}[\]()#+\-.!|~$<>])/g, (m, ch) => keep(escapeHtml(ch)));
   // 4. 图片、链接（在转义之前处理，文字和地址各自转义）
-  s = s.replace(/!\[([^\]]*)\]\(([^)\s]+)(?:\s+"[^"]*")?\)/g, (m, alt, src) => keep(mdImage(escapeHtml(alt), escapeHtml(src), opts)))
-    .replace(/\[([^\]\n]+)\]\(([^)\s]+)(?:\s+"[^"]*")?\)/g, (m, label, target) => keep(mdLink(emphasize(escapeHtml(label)), escapeHtml(target), opts)));
+  s = s.replace(/!\[([^\]]*)\]\((?:<([^>\n]+)>|([^)\s]+))(?:\s+"[^"]*")?\)/g, (m, alt, angle, src) => keep(mdImage(escapeHtml(alt), escapeHtml(angle ?? src), opts)))
+    .replace(/\[([^\]\n]+)\]\((?:<([^>\n]+)>|([^)\s]+))(?:\s+"[^"]*")?\)/g, (m, label, angle, target) => keep(mdLink(emphasize(escapeHtml(label)), escapeHtml(angle ?? target), opts)));
   // 5. 裸网址：只认网址里合法的 ASCII 字符，遇到中文、全角标点、* 就结束（中文里网址后面常常不空格）
   s = s.replace(/(^|[^\w/@.-])(https?:\/\/[A-Za-z0-9\-._~:/?#@!$&'+,;=%]+)/g, (m, pre, url) => {
     const tail = url.match(/[.,;:!?']+$/);
@@ -105,6 +110,11 @@ function mdInline(text, opts = {}) {
     const safe = escapeHtml(clean);
     return pre + keep(`<a class="ext-link" data-url="${safe}">${safe}</a>`) + (tail ? tail[0] : '');
   });
+  // 5.5 没加反引号、直接写在文字里的文件名（「COF项目系统学习指南.md」）：先标成候选，样子还是普通文字；
+  //      回答写完后核对到本机真有这个文件，才换成能点的文件标签（messages.js 的 verifyFileChips）
+  if (opts.chips) {
+    s = s.replace(PLAIN_FILE_RE, m => (looksLikeFile(m) ? keep(`<span class="file-maybe" data-path="${escapeHtml(m)}">${escapeHtml(m)}</span>`) : m));
+  }
   // 6. 其余文字转义；<br> 是表格里常见的换行写法，单独放行
   s = escapeHtml(s).replace(/&lt;br\s*\/?&gt;/gi, '<br/>');
   // 7. 强调：代码、公式、链接都已占位，可以被包在粗体里
@@ -153,23 +163,24 @@ function splitRow(line) {
   let t = line.trim();
   if (t.startsWith('|')) t = t.slice(1);
   if (t.endsWith('|') && !t.endsWith('\\|')) t = t.slice(0, -1);
+  // 与行内渲染使用同一套定界规则；分列时只保护原文，留给 mdInline 排版。
+  const slots = [];
+  const keep = value => `\u0000${slots.push(value) - 1}\u0000`;
+  t = t.replace(/\u0000/g, '').replace(/(`+)([^`]|[^`][\s\S]*?[^`])\1(?!`)/g, keep);
+  t = protectMath(t, keep, true);
   const cells = [];
   let cur = '';
   for (let k = 0; k < t.length; k++) {
     const c = t[k];
     if (c === '\\' && t[k + 1] === '|') { cur += '\\|'; k++; continue; }
-    if (c === '`') {
-      const end = t.indexOf('`', k + 1);
-      if (end > k) { cur += t.slice(k, end + 1); k = end; continue; }
-    }
-    if (c === '$' && t[k + 1] !== '$') {
-      const end = inlineMathEnd(t, k);
-      if (end > 0) { cur += t.slice(k, end + 1); k = end; continue; }
-    }
     if (c === '|') { cells.push(cur.trim()); cur = ''; continue; }
     cur += c;
   }
   cells.push(cur.trim());
+  for (let i = 0; i < cells.length; i++) {
+    // 公式里可能还嵌着代码占位，按占位的逆序恢复。
+    for (let n = slots.length - 1; n >= 0; n--) cells[i] = cells[i].replaceAll(`\u0000${n}\u0000`, () => slots[n]);
+  }
   return cells;
 }
 
