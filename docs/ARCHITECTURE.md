@@ -122,7 +122,7 @@ cd ai-pet-hub
 tools/test.sh
 ```
 
-它把产品源码和 `tools/tests/` 编译成一个 `build/selftest`（只编译一次，先写到临时名再换上），然后**同时**跑下面这些（各步没有共享状态：临时目录带 UUID / pid、端口由系统分配、WebKit 不落盘），每步输出进自己的日志、最后汇总，失败的步骤把日志打出来。离线主体按各组实测耗时均衡拆成 8 份（`AIPETHUB_OFFLINE_SHARD=i/N`，耗时表在 `offline.swift`）：
+它把产品源码和 `tools/tests/` 编译成一个 `build/selftest`（只编译一次，先写到临时名再换上），然后**同时**跑下面这些（各步没有共享状态：临时目录带 UUID / pid、端口由系统分配、WebKit 不落盘），每步输出进自己的日志、最后汇总，失败的步骤把日志打出来。离线主体按各组实测耗时均衡拆成 8 份、核数少于 8 时按核数（CI 的 3 核机器拆 3 份；`AIPETHUB_OFFLINE_SHARD=i/N`，耗时表在 `offline.swift`）：
 
 - `selftest offline`：事件解析、历史读取、进程生命周期、预热、用量 / git / 预览（`--only` 只筛这一步）
 - `selftest preview-bridge`：预览和网页桥（无窗口）

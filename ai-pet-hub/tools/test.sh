@@ -35,7 +35,10 @@ if [[ ${1:-} == --only ]]; then
 fi
 # --only 走不到最后的 rm，所以日志目录在它之后才建，免得每次在 $TMPDIR 留一个空目录
 LOG=$(mktemp -d "${TMPDIR:-/tmp}/aipethub-test.XXXXXX")
-SHARDS=${OFFLINE_SHARDS:-8}
+# 份数不超过核数：CI 的 macOS 机器只有 3 核，8 份再加上同时跑的预览、DeepSeek、前端几步会把机器压满，
+# 带时限的用例（打开历史 15 秒、桥消息补发等）每次随机挑一条超时；本机核多，仍是 8 份
+CORES=$(sysctl -n hw.ncpu)
+SHARDS=${OFFLINE_SHARDS:-$(( CORES < 8 ? CORES : 8 ))}
 
 if command -v node >/dev/null; then
   frontend() {
