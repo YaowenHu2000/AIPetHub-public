@@ -3,8 +3,11 @@
 #preview-pane[hidden], #resize-preview[hidden] { display: none; }
 body.preview-max #chat-column, body.preview-max #resize-preview { display: none; }
 body.preview-max #preview-pane { flex: 1; width: auto; min-width: 340px; }
+/* 窗口太窄、三栏放不下时自动占满（见 layout.js 的 applyWidths）；去掉最小宽度（写在 preview-max 后面，也盖过它的 340px），侧栏加预览的最小宽度也放不下时预览自己变窄，关闭和放大按钮仍在窗口内 */
+body.preview-squeezed #chat-column, body.preview-squeezed #resize-preview { display: none; }
+body.preview-squeezed #preview-pane { flex: 1; width: auto; min-width: 0; }
 /* 左栏收起、预览又放到最大时，预览的标签栏在窗口最左边：也要让开红绿灯 */
-body.sidebar-hidden.preview-max .ed-tabs { padding-left: var(--lights); }
+body.sidebar-hidden.preview-max .ed-tabs, body.sidebar-hidden.preview-squeezed .ed-tabs { padding-left: var(--lights); }
 .ed-tabs { height: 44px; flex-shrink: 0; display: flex; align-items: stretch; background: #100d1d; border-bottom: 1px solid var(--border); }
 .ed-tabs-list { flex: 1; min-width: 0; display: flex; overflow-x: auto; }
 .ed-tabs-list::-webkit-scrollbar { height: 0; }

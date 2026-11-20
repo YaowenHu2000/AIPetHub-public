@@ -41,9 +41,11 @@ final class CodexStreamParser {
         let id = item["id"] as? String ?? UUID().uuidString
         switch item["type"] as? String {
         case "agent_message":
-            guard completed else { return }
-            let t = trimmed(item["text"] as? String)
-            if !t.isEmpty { lastAgentMessage = t; turn.add(makeStep("text", "说明", detail: t), key: id) }
+            let text = trimmed(item["text"] as? String)
+            guard !text.isEmpty else { return }
+            lastAgentMessage = text
+            let step = makeStep("text", "说明", detail:text, status:completed ? "ok" : "running")
+            if turn.step(id) == nil { turn.add(step, key:id) } else { turn.update(id, step) }
         case "reasoning":
             let detail = trimmed(item["text"] as? String)
             if completed {
@@ -110,6 +112,9 @@ final class CodexAppParser {
     private(set) var changes: [String: [(path: String, kind: String, diff: String)]] = [:]
     private var texts: [String: String] = [:]
     private var lastPush: [String: Date] = [:]
+    /// 正在流式输出、还没收到完成的那段回答：停止或崩溃时历史里没有它，只有界面上显示过。
+    private var streamingId: String?
+    var unfinishedAgentMessage: String { streamingId.map { trimmed(turn.step($0)?["detail"] as? String) } ?? "" }
 
     init(turn: TurnBuilder) { self.turn = turn }
 
@@ -124,6 +129,7 @@ final class CodexAppParser {
         case "item/agentMessage/delta":
             guard let id = p["itemId"] as? String, let delta = p["delta"] as? String else { return }
             texts[id, default: ""] += delta
+            streamingId = id
             pushText(id, final: false)
         case "turn/plan/updated":
             let lines = (p["plan"] as? [[String: Any]] ?? []).map { s -> String in
@@ -205,6 +211,7 @@ final class CodexAppParser {
         case "agentMessage":
             if completed {
                 texts[id] = item["text"] as? String ?? texts[id] ?? ""
+                if streamingId == id { streamingId = nil }
                 if !trimmed(texts[id]).isEmpty { lastAgentMessage = trimmed(texts[id]) }
                 pushText(id, final: true)
             }
@@ -262,6 +269,7 @@ final class CodexAppParser {
 
 /// Codex 的错误常把接口返回的 JSON 原样塞在 message 里：取出其中的 error.message（再附上错误码）。
 func codexReadableError(_ raw: String) -> String {
+    if raw.contains("Incomplete response returned, reason: max_output_tokens") { return outputLimitHint }
     guard raw.hasPrefix("{"), let data = raw.data(using: .utf8),
           let obj = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any] else { return raw }
     let inner = obj["error"] as? [String: Any]

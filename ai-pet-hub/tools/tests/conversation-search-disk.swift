@@ -13,7 +13,8 @@ func testConversationSearchDisk() {
     let first = ConversationSearchCache(disk: disk)
     first.put(key, stamp: "same", texts: ["重启后仍然可见"], item: ["id": "fixture"])
     disk.flush()
-    eq(restarted().get(key, stamp: "same")?.texts, ["重启后仍然可见"], "重建内存缓存后从磁盘读取正文")
+    let firstReader = restarted()
+    eq(firstReader.get(key, stamp: "same")?.texts, ["重启后仍然可见"], "重建内存缓存后从磁盘读取正文")
     check(restarted().get(key, stamp: "changed") == nil, "来源指纹变化后不得复用磁盘正文")
     let dependent = root.appendingPathComponent("image.png").path
     let dependencies = [dependent: conversationSearchFileStamp(dependent)]
@@ -26,6 +27,8 @@ func testConversationSearchDisk() {
     check(restarted().get("dependencies", stamp: "same") == nil, "图片或引用文件创建后磁盘正文失效")
     check(restarted().revalidationCandidate("dependencies", individualStamp: "individual") == nil, "依赖变化时也不能走数据库摘要复用")
 
+    // 命中会延迟更新文件时间；先等旧读者写完，否则损坏检测取得的指纹可能在删除前变化。
+    firstReader.disk?.flush()
     let original = try! Data(contentsOf: disk.file(key))
     for field in ["formatVersion", "renderVersion", "key", "sha256"] {
         var header = try! PropertyListSerialization.propertyList(from: original, format: nil) as! [String: Any]
@@ -55,10 +58,10 @@ func testConversationSearchDisk() {
     TestHooks.conversationSearchDiskWillWrite = { candidate in
         guard candidate == "blocked" else { return }
         writeLock.lock(); let shouldBlock = !blocked; blocked = true; writeLock.unlock()
-        if shouldBlock { entered.signal(); _ = release.wait(timeout: .now() + 10) }
+        if shouldBlock { entered.signal(); _ = release.wait(timeout: .now() + testHoldLimit) }
     }
     first.put("blocked", stamp: "same", texts: ["旧正文"], item: [:])
-    check(entered.wait(timeout: .now() + 2) == .success, "后台写盘停在确定位置")
+    check(waitSignal(entered), "后台写盘停在确定位置")
     let readDone = DispatchSemaphore(value: 0)
     var unblocked = false
     DispatchQueue.global().async {
@@ -67,8 +70,8 @@ func testConversationSearchDisk() {
             && restarted().get(key, stamp: "same")?.texts == ["新正文"]
         readDone.signal()
     }
-    // 被写盘卡住的话要等满 10 秒（上面 release 的期限），5 秒足以区分；并行跑测试时磁盘很忙，2 秒会偶发来不及
-    check(readDone.wait(timeout: .now() + 5) == .success && unblocked, "后台写盘阻塞时，内存和其它磁盘读取仍完成")
+    // 被写盘卡住的话要等到测试放行（上面 release 的期限比等待上限长），所以等不到就说明被卡住了
+    check(waitSignal(readDone) && unblocked, "后台写盘阻塞时，内存和其它磁盘读取仍完成")
     release.signal(); disk.flush(); TestHooks.conversationSearchDiskWillWrite = nil
     eq(restarted().get("blocked", stamp: "same")?.texts, ["最终正文"], "同键的连续更新和访问合并后仍保存最后正文")
 
@@ -114,12 +117,12 @@ private func testConversationSearchDiskInvalidation(_ root: URL) {
         let disk = ConversationSearchDiskCache(root: diskRoot)
         app.hooks.conversationSearchCache = ConversationSearchCache(disk: disk)
         let done = DispatchSemaphore(value: 0); var result: [String: Any] = [:]
-        app.jsSink = { name, payload in
+        app.hooks.jsSink = { name, payload in
             if name == "onConversationsSearched", payload["complete"] as? Bool == true { result = payload; done.signal() }
         }
         app.searchConversations(agent: "gpt", query: query, files: [("db-only", path)])
-        check(done.wait(timeout: .now() + 10) == .success, "重启后的搜索及时返回")
-        disk.flush(); app.jsSink = nil
+        check(waitSignal(done), "重启后的搜索及时返回")
+        disk.flush(); app.hooks.jsSink = nil
         check(result["unavailable"] == nil, "磁盘缓存问题不报告为来源读取失败")
         return result
     }
@@ -160,12 +163,12 @@ private func testConversationSearchDiskDependencies(_ root: URL) {
             let disk = ConversationSearchDiskCache(root: diskRoot)
             app.hooks.conversationSearchCache = ConversationSearchCache(disk: disk)
             let done = DispatchSemaphore(value: 0); var ids: [String] = []
-            app.jsSink = { name, payload in
+            app.hooks.jsSink = { name, payload in
                 if name == "onConversationsSearched", payload["complete"] as? Bool == true { ids = payload["ids"] as? [String] ?? []; done.signal() }
             }
             app.searchConversations(agent: "claude", query: "unique-cache-reference-directory", files: [("dependency", history.path)])
-            check(done.wait(timeout: .now() + 10) == .success, "外部依赖重启搜索及时完成")
-            disk.flush(); app.jsSink = nil
+            check(waitSignal(done), "外部依赖重启搜索及时完成")
+            disk.flush(); app.hooks.jsSink = nil
             return ids
         }
         eq(search(), [], "\(name) 存在时页面短标签隐藏父目录")

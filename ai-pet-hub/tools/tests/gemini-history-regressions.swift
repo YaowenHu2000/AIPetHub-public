@@ -6,29 +6,23 @@ func testGeminiHistoryRegressions() {
     testGeminiProbeCache()
     testGeminiDesktopIndex()
     testGeminiDesktopHistory()
+    testGeminiDatabaseHistory()
     print("· Gemini 工具结果状态与子会话步骤隔离")
-    func varint(_ value: Int) -> Data {
-        var value = value, data = Data()
-        repeat { let byte = value & 127; value >>= 7; data.append(UInt8(byte | (value == 0 ? 0 : 128))) } while value > 0
-        return data
-    }
-    func field(_ number: Int, _ data: Data) -> Data { varint(number * 8 + 2) + varint(data.count) + data }
-    func text(_ number: Int, _ value: String) -> Data { field(number, Data(value.utf8)) }
     func tool(_ status: Int, error: String = "") -> Data {
-        var data = varint(4 * 8) + varint(status)
-        data += field(5, field(4, text(2, "write_to_file") + text(3, #"{"TargetFile":"/tmp/fixture.txt","CodeContent":"new"}"#)))
-        data += field(140, field(2, text(1, "工具输出")))
-        if !error.isEmpty { data += field(31, text(2, error)) }
+        var data = protoVarint(4 * 8) + protoVarint(status)
+        data += protoField(5, protoField(4, protoText(2, "write_to_file") + protoText(3, #"{"TargetFile":"/tmp/fixture.txt","CodeContent":"new"}"#)))
+        data += protoField(140, protoField(2, protoText(1, "工具输出")))
+        if !error.isEmpty { data += protoField(31, protoText(2, error)) }
         return data
     }
-    let recordedError = field(24, field(3, text(2, "API error (attempt 1)")))
-    let question = field(19, text(2, "问题"))
+    let recordedError = protoField(24, protoField(3, protoText(2, "API error (attempt 1)")))
+    let question = protoField(19, protoText(2, "问题"))
     let onlyError = agyDbTurns([(14, question), (17, recordedError)], cleanUser: { $0 })
     eq(onlyError.map { str($0, "role") }, ["user", "bot"], "只有 ERROR_MESSAGE 的一轮也要还原")
-    let recovered = agyDbTurns([(14, question), (17, recordedError), (15, field(20, text(1, "OK")))], cleanUser: { $0 }).last
+    let recovered = agyDbTurns([(14, question), (17, recordedError), (15, protoField(20, protoText(1, "OK")))], cleanUser: { $0 }).last
     eq(str((recovered?["steps"] as? [[String: Any]])?.first, "detail"), "API error (attempt 1)", "随后成功仍保留原始错误说明")
     eq(str(recovered, "text"), "OK", "重试成功保留回答")
-    let nextError = field(24, field(3, text(2, "API error (attempt 2)")))
+    let nextError = protoField(24, protoField(3, protoText(2, "API error (attempt 2)")))
     let retriesOnly = [(14, question), (17, recordedError), (17, nextError)]
     func retrySteps(_ message: [String: Any]?) -> [[String: Any]] {
         (message?["steps"] as? [[String: Any]] ?? []).filter { str($0, "kind") == "error" }
@@ -38,17 +32,17 @@ func testGeminiHistoryRegressions() {
     eq(retrySteps(closed).map { str($0, "title") }, ["连接出错，重试 2 次后放弃"], "放弃时只留同一步，不重复添加通用错误")
     check(["attempt 1", "attempt 2"].allSatisfy { str(retrySteps(closed).first, "detail").contains($0) }, "连续重试的原始说明留在详情中")
     eq(str(retrySteps(closed).first, "status"), "error", "放弃的重试显示失败")
-    let longFirst = field(24, field(3, text(2, String(repeating: "x", count: maxDetail))))
+    let longFirst = protoField(24, protoField(3, protoText(2, String(repeating: "x", count: maxDetail))))
     let finalReason = agyDbTurns([(17, longFirst), (17, nextError)], cleanUser: { $0 }).last
     check(str(retrySteps(finalReason).first, "detail").contains("attempt 2"), "详情达到上限仍保留最终失败原因")
     let active = agyDbTurns(retriesOnly, isHeld: { true }, cleanUser: { $0 }).last
     eq(retrySteps(active).map { str($0, "title") }, ["连接出错，正在重试（第 2 次）"], "仍在重试时保留实时标题")
     eq(str(retrySteps(active).first, "status"), "running", "仍持库时不提前报放弃")
-    let separated = agyDbTurns(retriesOnly + [(132, tool(7)), (17, recordedError), (15, field(20, text(1, "OK")))], cleanUser: { $0 }).last
+    let separated = agyDbTurns(retriesOnly + [(132, tool(7)), (17, recordedError), (15, protoField(20, protoText(1, "OK")))], cleanUser: { $0 }).last
     eq(retrySteps(separated).map { str($0, "title") }, ["连接出错 2 次，重试后恢复", "连接出错 1 次，重试后恢复"], "新工具说明连接已恢复，再次出错另起一组")
     eq(retrySteps(separated).map { str($0, "status") }, ["ok", "ok"], "恢复后两组状态和实时一致")
     eq(str((separated?["steps"] as? [[String: Any]])?.first { str($0,"kind") == "write" }, "status"), "error", "工具本身的错误保持独立")
-    let twoTurns = agyDbTurns(retriesOnly + [(14, question), (15, field(20, text(1, "OK")))], isHeld: { true }, cleanUser: { $0 })
+    let twoTurns = agyDbTurns(retriesOnly + [(14, question), (15, protoField(20, protoText(1, "OK")))], isHeld: { true }, cleanUser: { $0 })
     eq(str(twoTurns[1], "outcome"), "failed", "后面另起一轮不能让上一轮的重试继续转圈")
     // 空闲的 ACP 客户端也会持库。只有覆盖本条错误的空闲摘要能证明这组重试已经结束。
     let app = AppDelegate(), fm = FileManager.default
@@ -60,11 +54,11 @@ func testGeminiHistoryRegressions() {
     try! installFakeCLI(at: cli, behavior: "backend")
     try! "retry-abandoned".write(to: root.appendingPathComponent("mode"), atomically: true, encoding: .utf8)
     app.hooks.cliExecutable = cli
-    app.jsSink = { _, _ in }
+    app.hooks.jsSink = { _, _ in }
     let ask = AskRequest(agent: "gemini", reqId: 72, prompt: "test", model: "fixture", effort: "low",
                          permissionMode: "default", workspace: root.path, conversationId: "", browserTools: false)
     let reply = withTestAsk(app, ask.key) { app.runGemini(ask) }
-    let failedHistory = agyDbTurns([(14, question), (15, field(20, text(1, "先检查")))] + Array(retriesOnly.dropFirst()),
+    let failedHistory = agyDbTurns([(14, question), (15, protoField(20, protoText(1, "先检查")))] + Array(retriesOnly.dropFirst()),
                                    isHeld: { false }, cleanUser: { $0 }).last
     eq(retrySteps(reply.turn).map { str($0, "title") }, retrySteps(failedHistory).map { str($0, "title") }, "agy -p 放弃后只留同一个失败步骤")
     check(str(retrySteps(reply.turn).first, "detail").contains("API error (attempt 2)"), "实时放弃详情也保留 result 的原始原因")
@@ -90,14 +84,23 @@ func testGeminiHistoryRegressions() {
         let last = (app.readGeminiConversation(cid: "test")["messages"] as? [[String: Any]])?.last
         return str(retrySteps(last).first, "status")
     }
+    var rechecks = 0
+    app.hooks.geminiHeldRecheck = { rechecks += 1 }
     eq(storedRetry(), "running", "落后的空闲摘要不能结束新重试")
+    eq(rechecks, 0, "B2-05 只读历史只采样一次持库状态")
     _ = app.withSQLite(root.appendingPathComponent("conversation_summaries.db").path, readOnly: false) { handle in
         sqlite3_exec(handle, "UPDATE conversation_summaries SET step_count=1", nil, nil, nil)
     }
     eq(storedRetry(), "error", "持库客户端已经空闲时显示已放弃")
-    let checkpoint = agyDbTurns([(14, field(19, text(2, "/compact"))), (23, varint(32) + varint(3))], cleanUser: { $0 })
+    let activity = app.readGeminiConversation(cid:"test")["lastTurn"] as? [String:Any]
+    eq(activity?["running"] as? Bool,false,"Gemini 的空闲摘要与步数吻合时撤掉外部运行标记")
+    func stamp(_ fieldNo: Int, _ seconds: Int) -> Data { protoField(fieldNo, protoVarint(8) + protoVarint(seconds)) }
+    let timed = agyDbTurns([(14, protoField(5, stamp(1, 100)) + protoField(19, protoText(2, "问题"))),
+                            (15, protoField(5, stamp(1, 101) + stamp(8, 107)) + protoField(20, protoText(1, "回答")))], cleanUser: { $0 })
+    eq(timed.last?["duration"] as? Double, 7, "B4-7 Gemini 从提问到回答完成")
+    let checkpoint = agyDbTurns([(14, protoField(19, protoText(2, "/compact"))), (23, protoVarint(32) + protoVarint(3))], cleanUser: { $0 })
     eq(str(checkpoint.last, "role"), "compact", "完成的 checkpoint 在原位置显示压缩提示")
-    check(!agyDbTurns([(23, varint(32) + varint(7))], cleanUser: { $0 }).contains { str($0, "role") == "compact" }, "失败的 checkpoint 不报成功")
+    check(!agyDbTurns([(23, protoVarint(32) + protoVarint(7))], cleanUser: { $0 }).contains { str($0, "role") == "compact" }, "失败的 checkpoint 不报成功")
     let acp = AcpParser(turn: TurnBuilder())
     acp.update(["sessionUpdate":"tool_call", "toolCallId":"c", "title":"run_command", "rawInput":["CommandLine":"printf SUN"], "status":"in_progress"])
     acp.update(["sessionUpdate":"tool_call_update", "toolCallId":"c", "status":"completed", "content":[["type":"content","content":["type":"text","text":"SUN"]]]])
@@ -121,7 +124,7 @@ func testGeminiHistoryRegressions() {
     let canceled = agyDbTurns([(132, tool(6))], cleanUser: { $0 }).first
     eq(str((canceled?["steps"] as? [[String: Any]])?.first, "status"), "interrupted", "CANCELED=6 和实时停止的工具同色")
     eq(str((canceled?["steps"] as? [[String: Any]])?.last, "title"), "已中断", "重开被停止的 agy 回合也有末尾说明")
-    let resumed = agyDbTurns([(132, tool(12)), (15, field(20, text(1, "OK")))], cleanUser: { $0 }).first
+    let resumed = agyDbTurns([(132, tool(12)), (15, protoField(20, protoText(1, "OK")))], cleanUser: { $0 }).first
     eq(str(resumed, "outcome"), "completed", "一个工具中断后仍继续回答，不把整轮算成中断")
 
     let turn = TurnBuilder(), parser = AgyStreamParser(turn: TurnBuilder())
@@ -185,7 +188,7 @@ private func testGeminiDesktopHistory() {
     }
     func listed() -> [String] {
         var ids: [String] = []
-        d.jsSink = { fn, data in
+        d.hooks.jsSink = { fn, data in
             if fn == "onConversationsListed" { ids = (data["items"] as? [[String: Any]] ?? []).compactMap { $0["id"] as? String } }
         }
         d.listGemini(); d.geminiQueue.sync {}
@@ -206,6 +209,32 @@ private func testGeminiDesktopHistory() {
     let key = "desktop:both"
     eq(listed(), ["both", key], "同 ID 的两个独立库都可打开")
     eq(d.geminiIds(inWorkspace: "/fixture").sorted(), ["both", key], "项目枚举保留来源")
+    defer { UserDefaults.standard.removeObject(forKey: cli + ".geminiScript.both") }
+    let cliLogs = cli + "/log"
+    try! fm.createDirectory(atPath: cliLogs, withIntermediateDirectories: true)
+    let created = "I1118 10:00:00.000001       1 server.go:1258] Created conversation both (backend=X)\n"
+    let sending = "I1118 10:00:00.000002       1 session.go:201] Print mode: conversation=both, sending message\n"
+    func taskIds(_ callback: String) -> [String] {
+        var result = [String]()
+        d.hooks.jsSink = { name, payload in
+            guard name == callback else { return }
+            result = payload["taskIds"] as? [String] ?? (payload["items"] as? [[String: Any]] ?? []).filter { $0["task"] as? Bool == true }.compactMap { $0["id"] as? String }
+        }
+        if callback == "onProjectConversations" { d.projectConversations(agent:"gemini", workspace:"/fixture") }
+        else { d.listGemini() }
+        d.geminiQueue.sync {}
+        return result
+    }
+    try! sending.write(toFile:cliLogs + "/cli-resume.log", atomically:true, encoding:.utf8)
+    eq(taskIds("onConversationsListed"), [], "Gemini 仅用单次模式续写不改会话来源")
+    try! (created + sending).write(toFile:cliLogs + "/cli-create.log", atomically:true, encoding:.utf8)
+    eq(taskIds("onConversationsListed"), ["both"], "B4-23 Gemini 列表仅标记单次模式新建的 CLI 会话")
+    eq(taskIds("onProjectConversations"), ["both"], "B4-23 Gemini 删除项目排除同一脚本会话")
+    try! fm.removeItem(atPath: cliLogs + "/cli-create.log")
+    eq(taskIds("onProjectConversations"), ["both"], "启动日志清理后仍保护已确认的 Gemini 脚本会话")
+    eq(taskIds("onConversationsListed"), ["both"], "启动日志清理后仍保留任务分组")
+
+
     eq(d.searchSources(agent: "gemini", files: nil).sources.map(\.cid).sorted(), ["both", key], "正文搜索覆盖两份历史")
     let found = d.searchSources(agent: "gemini", files: nil).sources
     for entry in found {
@@ -236,14 +265,13 @@ private func testGeminiDesktopHistory() {
                   "桌面仍可能缓存会话时拦住发送并解释覆盖风险")
         } else { eq(sent.reply, "fixture-ok", "桌面退出后照常通过 ACP 续聊") }
         var live: [String: Any]?
-        d.jsSink = { fn, data in if fn == "onSessionLive" { live = data } }
+        d.hooks.jsSink = { fn, data in if fn == "onSessionLive" { live = data } }
         d.checkSessionLive(agent: "gemini", cid: key)
-        let until = Date().addingTimeInterval(3)
-        while live == nil && Date() < until { RunLoop.current.run(until: Date().addingTimeInterval(0.01)) }
+        waitUntil(runLoop: true) { live != nil }
         eq(live?["live"] as? Bool, blocked, "输入框提示随桌面运行状态更新")
         if blocked { eq(str(live, "status"), "readOnly", "没有持库也能区分桌面只读提示") }
         var deleted: [String: Any]?
-        d.jsSink = { fn, data in if fn == "onConversationDeleted" { deleted = data } }
+        d.hooks.jsSink = { fn, data in if fn == "onConversationDeleted" { deleted = data } }
         d.deleteConversation(agent: "gemini", cid: ask.conversationId)
         d.geminiQueue.sync {}; d.geminiQueue.sync {}
         eq(deleted?["ok"] as? Bool, !blocked, "桌面版开着（或查不清）时不能从 App 删，关着时可以")
@@ -255,7 +283,7 @@ private func testGeminiDesktopHistory() {
             let localAsk = request(local)
             let localReply = withTestAsk(d, localAsk.key) { d.runGemini(localAsk) }
             eq(localReply.reply, "fixture-ok", "同 ID 的 CLI 会话照常续聊")
-            d.jsSink = { fn, data in if fn == "onConversationsDeleted" { deleted = data } }
+            d.hooks.jsSink = { fn, data in if fn == "onConversationsDeleted" { deleted = data } }
             d.deleteConversations(agent: "gemini", ids: ["desktop:" + local, local])
             d.geminiQueue.sync {}; d.geminiQueue.sync {}
             eq(deleted?["deleted"] as? [String], [local], "批量删除仍能删除同 ID 的 CLI 库")
@@ -277,8 +305,54 @@ private func testGeminiDesktopHistory() {
     check(d.geminiResumeBlock(key) != nil && d.geminiResumeBlock("both") == nil, "只拦截桌面正在持有的同一份库")
     check(!d.deleteOne(agent: "gemini", cid: key), "持库时禁止删除")
     release.fileHandleForWriting.closeFile(); p.waitUntilExit()
+    let reader = AppDelegate()
+    reader.hooks.geminiCliDir = cli
+    defer { for store in d.geminiStores { for id in ["both","fixture-session","older"] { UserDefaults.standard.removeObject(forKey:store.deletedIndexKey(id)) } } }
+    for dir in [cli,desktop] {
+        _ = d.withSQLite(dir + "/conversation_summaries.db", readOnly:false) { db in
+            sqlite3_exec(db, """
+                CREATE VIRTUAL TABLE conversations_fts USING fts5(conversation_id,chunk_index,user_step_byte_offsets,agent_step_byte_offsets,user_body,agent_body);
+                INSERT INTO conversations_fts VALUES('both',0,'[[0,0]]','[[1,0]]','原问','旧回答'),('legacy',0,'[[0,0]]','[]','旧版仅有索引','');
+                """, nil,nil,nil)
+        }
+    }
+    func missing(_ cid: String) -> Bool { reader.readGeminiConversation(cid:cid)["missing"] as? Bool == true }
+    check(!missing(key) && !missing("both"), "两个独立来源的索引正文可读")
+    // 外部 CLI 移走一个此前打开过的源库，没有本窗口的删除回执，全文索引仍可能保留正文。
+    for store in reader.geminiStores {
+        let id = "external-index", key = store.key(id), file = store.database(id)
+        defer { UserDefaults.standard.removeObject(forKey:store.deletedIndexKey(id)) }
+        try! Data().write(to:URL(fileURLWithPath:file))
+        _ = d.withSQLite(store.summaries,readOnly:false) { db in
+            sqlite3_exec(db, "INSERT INTO conversations_fts VALUES('external-index',0,'[[0,0]]','[]','外部删除夹具','');",nil,nil,nil)
+        }
+        reader.hooks.jsSink = { _,_ in }
+        reader.loadGemini(cid:key); reader.geminiQueue.sync {}
+        try! fm.moveItem(atPath:file,toPath:file+".moved")
+        eq(missing(key),true,"外部删除已打开的源库后，全文索引不再维持旧页 "+key)
+        try! fm.moveItem(atPath:file+".moved",toPath:file)
+        eq(missing(key),false,"外部恢复源库后，同一实例重新读到正文 "+key)
+        try! fm.removeItem(atPath:file)
+    }
     check(d.deleteOne(agent: "gemini", cid: key), "桌面版关着、库也释放后，桌面会话可以删除")
+    eq(missing(key), true, "另一实例同步后桌面版已删会话消失")
+    check(!missing("both") && !missing("desktop:legacy"), "保留另一来源的同名会话和仅存索引的旧记录")
     check(fm.fileExists(atPath: cli + "/conversations/both.db"), "删除桌面记录保留同 ID 的 CLI 记录")
+    for store in d.geminiStores {
+        let id = "late-index", key = store.key(id), file = store.database(id)
+        defer { UserDefaults.standard.removeObject(forKey:store.deletedIndexKey(id)) }
+        try! Data().write(to:URL(fileURLWithPath:file))
+        check(d.deleteOne(agent:"gemini", cid:key), "Gemini 延迟索引夹具删除成功")
+        _ = d.withSQLite(store.summaries,readOnly:false) { db in
+            sqlite3_exec(db, "INSERT INTO conversations_fts VALUES('late-index',0,'[[0,0]]','[]','迟到的索引','');",nil,nil,nil)
+        }
+        for restore in [false,true] {
+            if restore { try! Data().write(to:URL(fileURLWithPath:file)) }
+            let absent = missing(key)
+            eq(absent, !restore, "另一实例读取删除后才写入的全文索引 \(key)，恢复=\(restore)")
+        }
+        try! fm.removeItem(atPath:file)
+    }
     // 模拟单库多入口，再次列出时应合并。
     let alias = desktop + "/conversations/both.db"
     if fm.fileExists(atPath: alias) { try! fm.removeItem(atPath: alias) }
@@ -286,6 +360,8 @@ private func testGeminiDesktopHistory() {
     eq(listed(), ["both"], "同一文件只列一次")
     eq(d.searchSources(agent: "gemini", files: nil).sources.map(\.cid), ["both"], "共享库只搜索一次")
     check(d.deleteOne(agent: "gemini", cid: "both"), "共享库和链接一起进入废纸篓")
+    eq(missing("both"), true, "另一实例同步后 CLI 已删会话消失")
+    check(!missing("legacy"), "删除只影响对应编号的索引正文")
     check(!fm.fileExists(atPath: cli + "/conversations/both.db") && (try? fm.destinationOfSymbolicLink(atPath: alias)) == nil,
           "共享会话删除后不留真库或悬空链接")
 }
@@ -301,13 +377,7 @@ func testGeminiDesktopIndex() {
     try! fm.createDirectory(atPath: root, withIntermediateDirectories: true)
     TestHooks.geminiIndexBackupRoot = backups
     defer { TestHooks.geminiIndexBackupRoot = nil }
-    func varint(_ value: Int) -> Data {
-        var value = value, data = Data()
-        repeat { let byte = value & 127; value >>= 7; data.append(UInt8(byte | (value == 0 ? 0 : 128))) } while value > 0
-        return data
-    }
-    func field(_ number: Int, _ data: Data) -> Data { varint(number * 8 + 2) + varint(data.count) + data }
-    func entry(_ map: Int, _ id: String, _ summary: String) -> Data { field(map, field(1, Data(id.utf8)) + field(2, Data(summary.utf8))) }
+    func entry(_ map: Int, _ id: String, _ summary: String) -> Data { protoField(map, protoField(1, Data(id.utf8)) + protoField(2, Data(summary.utf8))) }
     let gone = "11111111-1111-4111-8111-111111111111", kept = "22222222-2222-4222-8222-222222222222"
     let agyhub = entry(1, kept, "留下") + entry(1, gone, "删掉") + entry(2, gone, "删掉") + entry(2, kept, "留下")
     let jetbox = entry(1, gone, "删掉") + entry(1, kept, "留下")
@@ -349,4 +419,82 @@ func testGeminiProbeCache() {
     check(!d.geminiDesktopReadOnly(cid, fresh: false), "PC 2 秒内沿用上次结果（打字预热晚一两秒知道无妨）")
     check(d.geminiDesktopReadOnly(cid), "PC 发送前现查，反重力刚启动也能拦住")
     eq(scans, 2, "PC 现查才再扫一次")
+}
+
+/// 打开旧会话打过字、没发送就删除：App 自己的空闲预热进程持着库，删除要先释放它；正在回答的进程和发送中的会话仍然拦住。
+/// 持库的进程用 selftest 自己冒充 agy（hold-session-file），不用真 CLI。
+func testGLGeminiDeleteReleasesWarm() {
+    print("· Gemini 删除：先释放本会话的空闲预热，正在回答的仍拦住")
+    let d = AppDelegate(), fm = FileManager.default
+    let root = NSTemporaryDirectory() + "aipethub-gl-delete-" + UUID().uuidString
+    defer { d.dropWarm(); try? fm.removeItem(atPath: root) }
+    d.hooks.geminiCliDir = root + "/antigravity-cli"
+    d.hooks.geminiDesktopRunning = { false }   // 模拟桌面版已退出：桌面会话也可以删
+    let agy = root + "/bin/agy"
+    try! fm.createDirectory(atPath: root + "/bin", withIntermediateDirectories: true)
+    try! fm.copyItem(atPath: CommandLine.arguments[0], toPath: agy)
+    for store in d.geminiStores { try! fm.createDirectory(atPath: store.root + "/conversations", withIntermediateDirectories: true) }
+
+    func request(_ cid: String) -> AskRequest {
+        AskRequest(agent: "gemini", reqId: 91, prompt: "test", model: "model", effort: "low",
+                   permissionMode: "default", workspace: root, conversationId: cid, browserTools: false)
+    }
+    /// 起一个持库的 agy，等它真的打开了库再返回（期限只防卡死）。
+    func holder(_ key: String) -> CLIProcess {
+        let cli = CLIProcess(input: LiveInput())
+        try! cli.start(executable: agy, arguments: ["hold-session-file", d.geminiConversationDb(key)], cwd: root, environment: d.cliEnvironment())
+        waitUntil { d.geminiSessionHeld(key, includingOwn: true) == true }
+        return cli
+    }
+    func delete(_ key: String) -> [String: Any]? {
+        var result: [String: Any]?
+        d.hooks.jsSink = { fn, data in if fn == "onConversationDeleted" { result = data } }
+        d.deleteConversation(agent: "gemini", cid: key)
+        d.geminiQueue.sync {}; d.geminiQueue.sync {}
+        return result
+    }
+
+    for key in ["gl-cli", "desktop:gl-desktop"] {
+        let db = d.geminiConversationDb(key)
+        try! Data().write(to: URL(fileURLWithPath: db))
+        let otherKey = key + "-other"
+        try! Data().write(to: URL(fileURLWithPath: d.geminiConversationDb(otherKey)))
+
+        let warm = holder(key)
+        warm.warmKey = d.warmKey(request(key)); d.keepWarm("gemini", warm)
+        eq(d.geminiSessionHeld(key), false, "GL \(key) 预热持库：外部持库为 false")
+        eq(d.geminiSessionHeld(key, includingOwn: true), true, "GL \(key) 预热持库：计入本 App 后为 true")
+        let deleted = delete(key)
+        eq(deleted?["ok"] as? Bool, true, "GL \(key) 删除先释放空闲预热再删成功（reason：\(str(deleted, "reason"))）")
+        check(!fm.fileExists(atPath: db), "GL \(key) 库已移走")
+        check(!warm.proc.isRunning, "GL \(key) 空闲预热进程已结束")
+        d.procLock.lock(); let left = d.warmProcs["gemini"]; d.procLock.unlock()
+        check(left == nil, "GL \(key) 释放的预热从缓存移除")
+        d.dropWarm(); warm.input?.close(); _ = warm.waitForExit()
+
+        // 别的会话的空闲预热：删除本会话时不动它。
+        try! Data().write(to: URL(fileURLWithPath: db))
+        let otherWarm = holder(otherKey)
+        otherWarm.warmKey = d.warmKey(request(otherKey)); d.keepWarm("gemini", otherWarm)
+        eq(delete(key)?["ok"] as? Bool, true, "GL \(key) 别的会话有预热时照常删除")
+        check(otherWarm.proc.isRunning, "GL \(key) 别的会话的预热保留")
+        d.dropWarm(); otherWarm.input?.close(); _ = otherWarm.waitForExit()
+
+        // 正在回答的进程已从预热缓存取走：仍按持库拦住，并说明原因。
+        try! Data().write(to: URL(fileURLWithPath: db))
+        let answering = holder(key)
+        let blocked = delete(key)
+        eq(blocked?["ok"] as? Bool, false, "GL \(key) 正在回答的进程持库时拦住删除")
+        check(str(blocked, "reason").hasPrefix("⚠️"), "GL \(key) 持库拦住时带上具体原因（实际：\(str(blocked, "reason"))）")
+        check(fm.fileExists(atPath: db) && answering.proc.isRunning, "GL \(key) 拦住时库和回答进程都不动")
+        answering.input?.close(); _ = answering.waitForExit()
+
+        // 这个会话正有一轮在发送（发送占用还没放）：拦住并说明原因。
+        d.procLock.lock(); d.geminiResuming.insert(key); d.procLock.unlock()
+        let sending = delete(key)
+        d.procLock.lock(); d.geminiResuming.remove(key); d.procLock.unlock()
+        eq(sending?["ok"] as? Bool, false, "GL \(key) 正在发送时拦住删除")
+        check(str(sending, "reason").hasPrefix("⚠️"), "GL \(key) 正在发送时带上具体原因（实际：\(str(sending, "reason"))）")
+        eq(delete(key)?["ok"] as? Bool, true, "GL \(key) 回答结束后可以删除")
+    }
 }

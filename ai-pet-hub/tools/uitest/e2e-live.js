@@ -18,13 +18,13 @@ try {
   const evidence = reqId => events.filter(e => e.data.reqId === reqId).map(e => ({ event: e.name, ...e.data }));
   const start = async text => {
     els.input.value = text; send();
-    const run = await until(() => runsOf(id, viewKey(id))[0], 5000, '开始回答');
+    const run = await until(() => runsOf(id, viewKey(id))[0], '开始回答');
     check('发出问题后进入忙碌状态', viewBusy(id));
     return run.reqId;
   };
   const done = async reqId => {
-    const r = await until(() => response(reqId), 180000, '收到回答');
-    await until(() => !isBusy(id) && !box.querySelector('.msg.user.queued'), 240000, '所有排队消息结束');
+    const r = await until(() => response(reqId), '收到回答');
+    await until(() => !isBusy(id) && !box.querySelector('.msg.user.queued'), '所有排队消息结束');
     check('回答结束后没有 CLI 错误', !/^⚠️/.test((r.reply || '').trim()), r.reply);
     note('实际回答', r.reply);
     return r;
@@ -33,7 +33,7 @@ try {
     const previous = window.onConversationLoaded, cid = S[id].conversationId;
     let loaded;
     window.onConversationLoaded = d => { previous(d); if (d.agent === id && d.conversationId === cid) loaded = d; };
-    try { S[id].loadedSig = ''; postNative('loadConversation', { agent: id, conversationId: cid }); await until(() => loaded, 15000, '历史读取回调'); }
+    try { S[id].loadedSig = ''; postNative('loadConversation', { agent: id, conversationId: cid }); await until(() => loaded, '历史读取回调'); }
     finally { window.onConversationLoaded = previous; }
   };
   // 只有正常回答却没用工具才重试/跳过；超时、CLI 错误、原生已有事件而 UI 没有卡片都失败。
@@ -41,7 +41,7 @@ try {
     const attempts = [];
     for (let attempt = 0; attempt < 2; attempt++) {
       const reqId = await start(prompt);
-      const e = await until(() => events.find(e => e.data.reqId === reqId && e.name === eventName && accepts(e.data)) || response(reqId), 120000, name);
+      const e = await until(() => events.find(e => e.data.reqId === reqId && e.name === eventName && accepts(e.data)) || response(reqId), name);
       if (!response(reqId)) return { reqId, event: e.data };
       const r = await done(reqId); attempts.push({ reply: r.reply, events: evidence(reqId) });
       if (/^⚠️/.test((r.reply || '').trim())) return null;
@@ -59,15 +59,15 @@ try {
       card.querySelector('.req-btn.primary').click();
       check('允许按钮把决定发给原生', sent.some(e => e.action === 'answerAgentRequest' && e.payload.reqId === allow.reqId && e.payload.decision === 'allow'));
       const r = await done(allow.reqId);
-      await until(() => !box.querySelector('.req-card'), 5000, '审批卡片收走');
+      await until(() => !box.querySelector('.req-card'), '审批卡片收走');
       check('允许后审批卡片收走', !box.querySelector('.req-card'));
       check('允许后有非空回答', !!lastTurn()?.querySelector('.answer')?.textContent.trim(), r.reply);
       const used = evidence(allow.reqId).filter(e => e.event === 'onAgentStep').map(e => JSON.stringify(e.step)).join('\n');
       if (['made1.txt', 'made2.txt', 'keep.txt'].every(name => used.includes(name))) {
-        const files = await until(() => lastTurn()?.querySelector('.files-all'), 5000, '查看全部改动按钮');
+        const files = await until(() => lastTurn()?.querySelector('.files-all'), '查看全部改动按钮');
         check('回答保留改动卡片', !!lastTurn().querySelector('.files-head'));
         files.click();
-        await until(() => document.querySelectorAll('.chg-file').length, 5000, '全部改动面板');
+        await until(() => document.querySelectorAll('.chg-file').length, '全部改动面板');
         const names = [...document.querySelectorAll('.chg-file .chg-name')].map(e => e.textContent);
         check('全部改动恰好包含三个目标文件', names.length === 3 && ['made1.txt', 'made2.txt', 'keep.txt'].every(n => names.some(s => s.includes(n))), names);
         check('全部改动有新增 diff 行', document.querySelectorAll('.chg-file .cl.add').length > 0);
@@ -80,10 +80,12 @@ try {
       const card = box.querySelector('.req-card.req-permission');
       check('第二次权限请求显示审批卡片', !!card);
       if (!card) throw new Error('原生已发第二次权限请求，界面没有审批卡片');
-      card.querySelector('.req-input').value = '不要建这个文件'; card.querySelector('.req-btn.danger').click();
-      check('拒绝按钮传递拒绝及说明', sent.some(e => e.action === 'answerAgentRequest' && e.payload.reqId === deny.reqId && e.payload.decision === 'deny' && e.payload.message === '不要建这个文件'));
+      const reason = card.querySelector('.req-input');
+      if (reason) reason.value = '不要建这个文件';
+      card.querySelector('.req-btn.danger').click();
+      check('拒绝按钮传递拒绝及说明', sent.some(e => e.action === 'answerAgentRequest' && e.payload.reqId === deny.reqId && e.payload.decision === 'deny' && e.payload.message === (reason ? '不要建这个文件' : '')));
       await done(deny.reqId);
-      await until(() => !box.querySelector('.req-card'), 5000, '拒绝卡片收走');
+      await until(() => !box.querySelector('.req-card'), '拒绝卡片收走');
       check('拒绝后卡片收走且回答结束', !box.querySelector('.req-card') && !viewBusy(id));
     }
   }
@@ -112,8 +114,16 @@ try {
     check('补充结束后队列清空', box.querySelectorAll('.msg.user.queued').length === 0);
     const steers = events.filter(e => e.name === 'onAgentSteer' && e.data.reqId === round.reqId);
     if (steers.some(e => e.data.state === 'consumed')) {
-      await until(() => !!box.querySelector('.step-user'), 5000, '补充步骤');
-      check('CLI 收到补充后显示你补充说', !!box.querySelector('.step-user'));
+      check('CLI 收到补充时工作过程里实时记下你补充说', events.some(e => e.name === 'onAgentStep' && e.data.reqId === round.reqId && e.data.step?.kind === 'user' && e.data.step.detail === text1));
+      if (id === 'gemini') {
+        // agy 的记录里补充是单独一句提问（提问 → 回答 → 补充 → 回答）；答完按记录重读，页面就和以后重开时一样
+        const asked = () => [...box.querySelectorAll('.msg.user:not(.queued)')].some(e => e.textContent.includes(text1));
+        await until(asked, '按记录重读后的补充');
+        check('答完按记录重读后补充显示成一句提问', asked());
+      } else {
+        await until(() => !!box.querySelector('.step-user'), '补充步骤');
+        check('CLI 收到补充后显示你补充说', !!box.querySelector('.step-user'));
+      }
     } else {
       const users = [...box.querySelectorAll('.msg.user:not(.queued)')].map(e => e.textContent);
       check('不能实时补充时两句话分别发出且顺序不变', users.findIndex(s => s.includes(text1)) >= 0 && users.findIndex(s => s.includes(text1)) < users.findIndex(s => s.includes(text2)), users.slice(-3));
@@ -130,14 +140,14 @@ try {
   if (jump) {
     els.input.value = '算了，直接回答：1+1 等于几？只答数字。'; send();
     check('插队消息即时显示排队气泡', !!box.querySelector('.msg.user.queued'));
-    const q = await until(() => box.querySelector('.msg.user.queued.can-jump') || response(jump.reqId), 8000, '可立即发送的气泡');
+    const q = await until(() => box.querySelector('.msg.user.queued.can-jump') || response(jump.reqId), '可立即发送的气泡');
     if (response(jump.reqId)) {
       skip('立即发送', '模型没照做', { reply: response(jump.reqId).reply, events: evidence(jump.reqId) });
-      await until(() => !isBusy(id), 180000, '自动续发完成');
+      await until(() => !isBusy(id), '自动续发完成');
     } else {
       const at = Date.now(); q.querySelector('.queued-now').click();
       check('立即发送会取消旧请求', sent.some(e => e.action === 'cancelAgent' && e.payload.reqId === jump.reqId));
-      await until(() => [...box.querySelectorAll('.msg.user:not(.queued)')].some(e => e.textContent.includes('1+1')), 15000, '插队消息正式发出');
+      await until(() => [...box.querySelectorAll('.msg.user:not(.queued)')].some(e => e.textContent.includes('1+1')), '插队消息正式发出');
       note('立即发送耗时秒', (Date.now() - at) / 1000);
       await done(jump.reqId);
       check('立即发送完成后输入与队列都清空', els.input.value === '' && !box.querySelector('.msg.user.queued'));

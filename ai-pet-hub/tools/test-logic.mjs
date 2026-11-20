@@ -7,8 +7,8 @@ import vm from 'node:vm';
 
 const src = readFileSync(join(dirname(fileURLToPath(import.meta.url)), '..', 'web', 'js', 'core', 'logic.js'), 'utf8');
 const L = vm.createContext({});
-vm.runInContext(src + '\nglobalThis.api = { matchExtras, syncPlan, pushPrompt, promptStep, slashQuery, mentionQuery, rankCommands, mergeCommands, revealStep, queueAction, queuedLabel, mergeModels, migrateModel, splitModels, fitSections };', L);
-const { matchExtras, syncPlan, pushPrompt, promptStep, slashQuery, mentionQuery, rankCommands, mergeCommands, revealStep, queueAction, queuedLabel, mergeModels, migrateModel, splitModels, fitSections } = L.api;
+vm.runInContext(src + '\nglobalThis.api = { matchExtras, planHistoryRows, localAsksInHistory, pushPrompt, promptStep, slashQuery, mentionQuery, rankCommands, mergeCommands, revealStep, queueAction, queuedLabel, mergeModels, migrateModel, splitModels, fitSections };', L);
+const { matchExtras, planHistoryRows, localAsksInHistory, pushPrompt, promptStep, slashQuery, mentionQuery, rankCommands, mergeCommands, revealStep, queueAction, queuedLabel, mergeModels, migrateModel, splitModels, fitSections } = L.api;
 
 let failures = 0, checks = 0;
 const same = (a, b) => JSON.stringify(a) === JSON.stringify(b);
@@ -23,16 +23,112 @@ console.log('· 会话重读后把这次运行里的改动接回去');
   eq('记录里找不到那句提问的就不配', matchExtras([{ text: '没有这句' }], msgs).size, 0);
   eq('提问后面还没有回答（正在答）的不配', matchExtras([{ text: '新问的' }], [u('新问的')]).size, 0);
   eq('提问前后的空白不影响', matchExtras([{ text: '改一下' }], [u('  改一下\n'), b('好')]).size, 1);
+  const img = {role:'user',text:'',images:[{ref:{agent:'claude',id:'行#0'}}]};
+  for (const [label,entry,user] of [
+    ['最早的纯图卡只保存空提问',{text:'',at:0},img],
+    ['旧纯图卡有原路径而历史只剩内嵌引用',{text:'请看这张图片。',images:['/旧图.png'],at:0},img],
+    ['旧纯图卡和单次模式的路径文字',{text:'请看这张图片。',images:['/旧图.png'],at:0},u('请看这张图片。\n\n/旧图.png')],
+    ['旧记录的警告前缀',{text:'问',replyKey:L.replyFingerprint('⚠️ 完成'),at:0},u('问')],
+  ]) eq(label,[...matchExtras([entry],[user,b('完成')]).keys()],[1]);
+
+}
+
+// 从真实收尾入口写入缓存，再用持久化的副本认领历史；同一张卡只允许出现在期望的回答上。
+console.log('· 四位助手的改动卡按原问与回答认领');
+const changesSource = readFileSync(new URL('../web/js/chat/changes.js', import.meta.url), 'utf8');
+for (const agent of ['claude','gpt','gemini','deepseek']) {
+  let storage = '';
+  const cid = '改动矩阵';
+  const env = vm.createContext({window:{}, S:{[agent]:{conversationId:cid}},
+    lsJson:(_,fallback)=>storage ? JSON.parse(storage) : fallback, lsSet:(_,v)=>{ storage = v; }});
+  vm.runInContext(src + changesSource,env);
+  const ask = u('继续'), done = b('完成'), pic = '/图.png', file = {path:'命令.txt',diff:'+一行'};
+  const step = {kind:'user',detail:'补充'};
+  const rows = [
+    ['实时收尾，重开保留命令补丁',{}, {}, [ask,done], [1]],
+    ['连续同文，只有首轮有卡',{}, {}, [ask,done,ask,done], [1]],
+    ['压缩提示后的分页', {historyStart:4}, {}, [{role:'compact'},ask,done], [2],3],
+    ['只发图', {text:'',prompt:'请看这张图片。',images:[pic]}, {}, [{...u(''),images:[{path:pic}]},done], [1]],
+    ['单次模式实际发送的图片副本', {images:[pic],sentPaths:{[pic]:'/副本.png'}}, {}, [u('继续\n\n/副本.png'),done], [1]],
+    ['编辑同文换图', {images:[pic],imageKeys:['首图']}, {}, [{...ask,images:[{path:pic,imageKey:'新图'}]},done], []],
+    ['重试历史图片引用', {imageRefs:[{id:'old',agent}],restoredPaths:['/恢复.png']}, {},
+      [{...ask,images:[{path:'/恢复.png'}]},done], [1]],
+    ['旧分支原位同问异答',{}, {}, [ask,b('新答')], []],
+    ['未同步就切走，另一实例原位同问同答',{}, {}, [{...ask,createdAt:12},done], []],
+    ['只读到提问，下一问同答',{}, {}, [ask,u('另一问'),done], []],
+    ['压缩失败后只留下带重试的回答', {text:'/compact',prompt:'/compact'}, {outcome:'failed'},
+      [{...done,outcome:'failed',retryPrompt:'/compact'}], [0]],
+    ['成功压缩只显示一条提示', {text:'/compact',prompt:'/compact'}, {}, [{role:'compact',text:'完成'}], []],
+    ['压缩行不是回答',{}, {reply:''}, [ask,{role:'compact'}], []],
+    ['停止与重试同答',{}, {cancelled:true}, [ask,{...done,outcome:'completed'}], []],
+    ['崩溃补记同请求后来写全',{}, {outcome:'failed'}, [ask,{...b('完整回答'),outcome:'failed',endingReqId:42}], [1]],
+    ['外部写了不同请求的同文失败',{}, {outcome:'failed'}, [ask,{...done,outcome:'failed',endingReqId:99}], []],
+    ['同轮补充再接独立同文后问',{}, {steps:[step]}, [ask,{...done,steps:[step]},u('补充'),done], [1]],
+    ['重新挂接活动请求，原位置未知且两问两答完全相同', {historyStart:null}, {}, [ask,done,ask,done], []],
+    ['切回时历史仅有更早的同问同答', {}, {}, [{...ask,createdAt:7},done], []],
+    ['协议已给原问编号，同毫秒发生同问同答', {}, {turnKey:'原问'}, [{...ask,turnKey:'新问'},done], []],
+    ['已知位置被编辑，前面同文同答不能认领',{historyStart:2},{},[ask,done,u('改问'),done],[]],
+    ['页首同文但缺编号，原问编号已移到后面',{}, {turnKey:'原问'},[ask,done,{...ask,turnKey:'原问'},done],[3]],
+    ['原位置无编号，同文末轮有本次失败补记',{}, {outcome:'failed'},
+      [ask,{...done,outcome:'failed'},ask,{...done,outcome:'failed',endingReqId:42}],[3]],
+    ['命令仅有工具步骤，外部改写成有正文的回答', {}, {reply:''}, [ask,done], []],
+    ['分支变化后较早的原问仍在窗口内', {historyStart:4}, {turnKey:'原问'}, [{...ask,turnKey:'原问'},done], [1]],
+    ['读取期间发送的新问还在页尾之外', {historyStart:4}, {}, [ask,done], []],
+    ['只有提问留在分页外',{}, {}, [ask,done], [],2],
+  ];
+  if (agent === 'gemini' || agent === 'deepseek') {
+    const split = agent === 'gemini' ? [u('补充'),done] : [{...done,steps:[step]}];
+    rows.push(['首段未写回答就消费补充',{}, {steps:[step]}, [ask,u('补充'),done], [2]]);
+    rows.push(['连续同文补充分段',{}, {steps:[step,step]}, [ask,{...b('前段'),steps:[step]},...split], [1+split.length]]);
+    rows.push(['补充拆段',{}, {steps:[step]}, [ask,b('前段'),...split], [1+split.length]]);
+    const second = {kind:'user',detail:'再补一句'};
+    rows.push(['实时首段与恢复的末段分别留有补充',{live:{steps:[step]}}, {steps:[second]},
+      [ask,b('前段'),u(step.detail),b('中段'),u(second.detail),done], [5]]);
+    rows.push(['断线回读收尾只有工具，仍认已经消费的补充',{live:{steps:[step]}}, {steps:[{kind:'command'}]}, [ask,b('前段'),...split], [1+split.length]]);
+    rows.push(['收尾缺步骤时从实时步骤恢复补充',{live:{steps:[step]}}, {}, [ask,b('前段'),...split], [1+split.length]]);
+  }
+  for (const [name,fields,data,messages,want,omitted=0] of rows) {
+    vm.runInContext('turnExtras.clear()',env);
+    storage = '';
+    const run = {agent,text:'继续',prompt:'继续',reqId:42,since:9000,endedAt:11000,historyStart:0,...fields};
+    const response = {reqId:42,conversationId:cid,reply:'完成',files:[file],...data};
+    const live = env.rememberTurn(agent,run,response,'/工作');
+    const stored = env.readTurnExtras().get(agent+':'+cid);
+    eq(agent+' '+name,[live.files[0].diff,...env.matchExtras(stored,messages,omitted).keys()],['+一行',...want]);
+  }
+  const longText = '问'.repeat(510000);
+  env.rememberTurn(agent,{text:longText,prompt:longText,historyStart:0},{conversationId:cid,files:[file]},'');
+  eq(agent+' 长提问在原有缓存预算内仍可恢复补丁',env.readTurnExtras().get(agent+':'+cid)?.at(-1)?.text.length, longText.length);
+
 }
 
 console.log('· 切回窗口时的同步');
 {
   const msgs = [u('a'), b('1'), u('b'), b('2')];
-  eq('一模一样：不动', syncPlan([true, false, true, false], msgs), 0);
-  eq('记录里多了两条（在终端里接着聊过）：接在后面', syncPlan([true, false], msgs), 2);
-  eq('页面比记录多：重画', syncPlan([true, false, true, false, true], msgs), -1);
-  eq('角色顺序对不上（中途补充过的回答在记录里是拆开的）：重画', syncPlan([true, false, false], msgs), -1);
-  eq('页面是空的：重画', syncPlan([], msgs), -1);
+  const changes = rows => planHistoryRows(rows.map(m=>({role:m.role, sig:L.messageSignature(m)})),msgs).map(change=>change.kind);
+  eq('一模一样：不动', changes(msgs), []);
+  eq('记录里多了两条（在终端里接着聊过）：接在后面', changes(msgs.slice(0,2)), ['append','append']);
+  eq('页面比记录多：删除记录中已消失的尾部', changes([...msgs,u('旧尾')]), ['remove']);
+  eq('角色顺序对不上：从变化处重画', changes([msgs[0],msgs[1],b('拆段')]), ['remove','append','append']);
+  eq('页面是空的：重画', changes([]), Array(4).fill('append'));
+}
+
+console.log('· 打开历史前就发出的几轮是否已写进记录');
+{
+  const ask = text => ({ text, prompt: text, images: [] });
+  const old = [u('旧问'), b('旧答')];
+  eq('记录里还没有本页的提问：一句都不算', localAsksInHistory([ask('新问')], old), []);
+  eq('答完的一轮已写在末尾：认出它的位置', localAsksInHistory([ask('新问')], [...old, u('新问'), b('新答')]), [2]);
+  eq('两轮都写进去：依次认出', localAsksInHistory([ask('一'), ask('二')], [...old, u('一'), b('1'), u('二')]), [2, 4]);
+  eq('只写进了第一轮：只认第一句', localAsksInHistory([ask('一'), ask('二')], [...old, u('一'), b('1')]), [2]);
+  eq('同一句话以前问过、这次还没写进去：后面还有别的提问，不认旧的那句', localAsksInHistory([ask('旧问')], [u('旧问'), b('旧答'), u('别的'), b('…')]), []);
+  eq('本页没有发过：空', localAsksInHistory([], [...old, u('新问')]), []);
+  // 记录末尾本来就是同一句短话：读取在发问之前开始的回包不可能含这一轮，不能把旧的那句认成本页发的
+  const at = since => ({ ...ask('继续'), since });
+  const cont = [u('开始'), b('旧答一'), u('继续'), b('旧答二')];
+  eq('读取早于发问：同句的旧提问不算', localAsksInHistory([at(2000)], cont, 1000), []);
+  eq('读取晚于发问、记录末尾是这句：认出它', localAsksInHistory([at(1000)], [...cont, u('继续')], 2000), [4]);
+  eq('读取在第一轮之后、第二轮之前：只认第一轮', localAsksInHistory([at(1000), { ...ask('二'), since: 3000 }], [...cont, u('继续'), b('新答')], 2000), [4]);
 }
 
 console.log('· ↑ / ↓ 翻发过的话');

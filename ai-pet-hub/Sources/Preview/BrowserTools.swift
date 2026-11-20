@@ -2,7 +2,7 @@
 // 做法是标准的 MCP 工具（三个 CLI 都支持），不往提问里加任何文字：
 //   · AIPetHub 自己的可执行文件带 `--mcp-browser <端口名>` 启动时，就是一个 stdio 的 MCP 服务器（不开窗口），由 CLI 拉起来；
 //   · 它通过 CFMessagePort 找到正在运行的 AIPetHub，让窗口里的内置浏览器干活，把结果交回给 CLI。
-// 每次提问时把这个服务器告诉 CLI（Claude：--mcp-config；Codex：thread/start 的 config.mcp_servers）。Gemini 的 agy -p 没有按次传 MCP 的参数，没接。
+// 每次提问时把这个服务器告诉 CLI（Claude：--mcp-config；Codex：thread/start 的 config.mcp_servers）。Gemini 交互式在 session/new 的 mcpServers 里带上（GeminiRun.swift 的 acpSessionParams）；只有退回 agy -p 时没有按次传 MCP 的参数，接不上。
 import Cocoa
 import WebKit
 
@@ -81,6 +81,13 @@ extension AppDelegate {
         return Data(id.utf8)
     }
 
+    /// 比较地址用：http://host:8000#/x 和 WebKit 显示的 http://host:8000/#/x 是同一个。
+    func normalizedURL(_ url: URL?) -> String? {
+        guard let url = url, var c = URLComponents(url: url, resolvingAgainstBaseURL: true) else { return nil }
+        if c.host != nil, c.path.isEmpty { c.path = "/" }
+        return c.string
+    }
+
     private func pageInfo(_ b: WKWebView) -> String {
         "地址：\(b.url?.absoluteString ?? "（空）")\n标题：\(b.title ?? "")"
     }
@@ -103,7 +110,9 @@ extension AppDelegate {
     }
 
     /// 等页面载入完（最多 20 秒）。
-    private func whenLoaded(generation: Int, _ then: @escaping (WKWebView?, String?) -> Void) {
+    /// sameDocument：同一文档只换 #片段（#/settings 这类路由）时 WebKit 不走整页载入、不回调 didFinish，地址到了目标就算载入完；
+    /// 网站自己把片段再转走（#/private → #/login，可能正好转回原地址）时地址到不了目标，这一代里地址变过也算导航已发生，返回实际落点。
+    private func whenLoaded(generation: Int, sameDocument: URL? = nil, _ then: @escaping (WKWebView?, String?) -> Void) {
         var ticks = 0
         Timer.scheduledTimer(withTimeInterval: 0.25, repeats: true) { [weak self] t in
             ticks += 1
@@ -112,7 +121,8 @@ extension AppDelegate {
                 t.invalidate(); then(nil, "已被其它导航取代"); return
             }
             let b = self.browser
-            if let b = b, self.browserNavigation.finished, !b.isLoading, self.docPreviewPending == nil {
+            if let b = b, self.browserNavigation.finished || (sameDocument != nil && (self.browserNavigation.moved || self.normalizedURL(b.url) == self.normalizedURL(sameDocument))),
+               !b.isLoading, self.docPreviewPending == nil {
                 t.invalidate(); then(b, nil)
             } else if ticks > 80 { t.invalidate(); then(nil, "等待页面加载超时") }
         }
@@ -127,38 +137,75 @@ extension AppDelegate {
             // 原生同步发起导航才能把回调绑到这一次；网页仍负责切出同一个浏览器面板。
             var target = url
             let http = target.lowercased().hasPrefix("http://") || target.lowercased().hasPrefix("https://")
-            let local = !http && (target.hasPrefix("/") || target.hasPrefix("~/") || target.lowercased().hasPrefix("file://")
+            // 和地址栏（web/js/preview/browser.js 的 navigateBrowser）同一套规则：第一段是明确的主机（localhost/IP、带端口、
+            // 像域名且后面跟路径）就是网址，否则 localhost:5173/index.html 会因为 .html 后缀被当成工作目录下的文件；
+            // 像域名但「顶级域」是常见后缀的（a.md/、Foo.app/）仍按本地目录
+            let host = String(target.split(separator: "/", maxSplits: 1, omittingEmptySubsequences: false).first ?? "")
+            let matches = { (s: String, p: String) in s.range(of: p, options: [.regularExpression, .caseInsensitive]) != nil }
+            let isHost = matches(host, "^(localhost|127\\.0\\.0\\.1|0\\.0\\.0\\.0|\\[::1\\])(:[0-9]{1,5})?$") || matches(host, "^[A-Za-z0-9_.-]+:[0-9]{1,5}$")
+                || (target.contains("/") && matches(host, "^(?:[a-z0-9-]+\\.)+[a-z]{2,}$") && !matches(host, "\\.(md|markdown|txt|json|js|ts|py|sh|html?|css|app)$"))
+            let local = !http && !isHost && (target.hasPrefix("/") || target.hasPrefix("~/") || target.lowercased().hasPrefix("file://")
                 || target.range(of: "\\.(html?|svg|pdf)$", options: [.regularExpression, .caseInsensitive]) != nil || isPreviewDocument(target))
             if !local, !target.lowercased().hasPrefix("http://"), !target.lowercased().hasPrefix("https://") {
                 if target.range(of: "^[0-9]{2,5}$", options: .regularExpression) != nil { target = "localhost:" + target }
                 let loopback = target.range(of: "^(localhost|127\\.0\\.0\\.1|0\\.0\\.0\\.0|\\[::1\\])", options: [.regularExpression, .caseInsensitive]) != nil
                 target = (loopback ? "http://" : "https://") + target
             }
+            // 打开前记下当前地址：目标只比它多换了 #片段时是同文档导航，等不到整页载入完成。
+            // 显示的是「打不开」错误页时不算：那一页是冒充的，要真的再请求一次、等它载入或再报错
+            let before = browserFailedURL.isEmpty ? normalizedURL(browser?.url) : nil
+            let wanted = (local ? browserFileURL(target, path: resolvePath(target, base: ""), base: "") : URL(string: target)).flatMap { ["http", "https", "file"].contains($0.scheme?.lowercased() ?? "") && $0.fragment != nil ? $0 : nil }
+            let sameDocument = wanted.flatMap { w -> URL? in
+                func strip(_ s: String?) -> String? { s.map { String($0.split(separator: "#", maxSplits: 1, omittingEmptySubsequences: false)[0]) } }
+                return before != nil && strip(before) == strip(normalizedURL(w)) ? w : nil
+            }
             openInBrowser([local ? "path" : "url": target])
             let generation = browserNavigation.generation
             // navigateBrowser 会忽略纯空白；仍切出面板，但不会像空字符串那样抢地址栏焦点。
             sendToJS("onBrowserToolOpen", ["url": " "])
-            whenLoaded(generation: generation) { [weak self] b, error in
+            whenLoaded(generation: generation, sameDocument: sameDocument) { [weak self] b, error in
                 if let error = error { fail(error); return }
                 guard let self = self, let b = b else { fail("内置浏览器没有打开"); return }
                 if !self.browserFailedURL.isEmpty { fail("打不开 \(self.browserFailedURL)：\(self.browserFailedTitle)"); return }
                 done(["text": "已打开。\n" + self.pageInfo(b)])
             }
         case "browser_screenshot":
+            // 浏览器关掉了（或从没打开过页面）：切出来也只是一个空标签，等满 3 秒再报错没有意义
+            guard browser?.url != nil else { fail("内置浏览器还没有打开页面，先用 browser_open"); return }
             showBrowser { [weak self] in
                 guard let self = self, let b = self.browser, self.browserShowing else { fail("内置浏览器还没有打开页面，先用 browser_open"); return }
-                let cfg = WKSnapshotConfiguration()
-                if b.bounds.width > 1280 { cfg.snapshotWidth = 1280 }
-                b.takeSnapshot(with: cfg) { image, error in
+                func encode(_ image: NSImage?, _ error: Error?) {
                     guard let tiff = image?.tiffRepresentation, let rep = NSBitmapImageRep(data: tiff) else { fail("截图失败：\(error?.localizedDescription ?? "")"); return }
                     var data = rep.representation(using: .png, properties: [:]) ?? Data()
                     var mime = "image/png"
                     if data.count > 1_500_000, let jpg = rep.representation(using: .jpeg, properties: [.compressionFactor: 0.8]) { data = jpg; mime = "image/jpeg" }
                     done(["text": self.pageInfo(b), "image": data.base64EncodedString(), "mime": mime])
                 }
+                if let view = self.browserPDF, !view.isHidden {
+                    view.layoutSubtreeIfNeeded()
+                    guard let bitmap = view.bitmapImageRepForCachingDisplay(in: view.bounds) else { fail("无法截取 PDF 页面"); return }
+                    view.cacheDisplay(in: view.bounds, to: bitmap)
+                    let image = NSImage(size: view.bounds.size)
+                    image.addRepresentation(bitmap)
+                    encode(image, nil)
+                } else {
+                    let cfg = WKSnapshotConfiguration()
+                    if b.bounds.width > 1280 { cfg.snapshotWidth = 1280 }
+                    b.takeSnapshot(with: cfg, completionHandler: encode)
+                }
             }
         case "browser_console", "browser_text", "browser_eval":
             guard let b = browser, b.url != nil else { fail("内置浏览器还没有打开页面，先用 browser_open"); return }
+            if tool == "browser_text", let document = browserPDF?.document, document.documentURL == b.url {
+                var text = ""
+                for index in 0..<document.pageCount {
+                    guard text.count < 20_000 else { break }
+                    guard let page = document.page(at: index)?.string, !page.isEmpty else { continue }
+                    if !text.isEmpty { text += "\n" }
+                    text += page.prefix(20_000 - text.count)
+                }
+                done(["text": pageInfo(b) + "\n\n" + text]); return
+            }
             let body: String
             switch tool {
             case "browser_console": body = "return (window.__hubConsole || []).join('\\n');"

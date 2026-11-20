@@ -1,172 +1,20 @@
-import Cocoa
-import CryptoKit
-import UniformTypeIdentifiers
-
 // 对话里的图片。
-// 用户消息带的图片有四种来源：Claude Code 记录里内嵌的 base64 图片块、Codex 记录里的本地图片路径（localImage）、
-// dsh 附件目录里的图片（事件里只记附件编号），以及消息文字里写到的图片路径（在 AIPetHub 里粘贴截图，插进输入框的就是路径）。
-// 随历史发给网页的只是缩略图（长边最多 640 像素，小图原样）；点开时再按需读原图，不在别处另存副本。
+// 用户消息带的图片有五种来源：Claude Code 记录里内嵌的 base64 图片块、Codex 记录里的本地图片路径（localImage）、
+// dsh 附件目录里的图片（事件里只记附件编号）、agy 会话库用户步骤里的图片附件，
+// 以及消息文字里写到的图片路径（在 AIPetHub 里粘贴截图，插进输入框的就是路径）。
+// 随历史发给网页的只是缩略图（长边最多 640 像素，小图原样；编码在 ChatThumbnails.swift）；点开时读原图（按 ref 回查记录在 ChatImageOriginals.swift）；
+// 没有可回查编号的附件从同一份数据保留快照。
+//
+// 历史提问、补充与分段失败的原问都在这里生成缩略图。
+// Claude 按行 UUID 和内容块读，Gemini 按步骤和附件序号读，DeepSeek 按对象或回退调用编号读。
+// Codex 在文件指纹与发送时间相符时直接读文件，变化后按回合和附件序号批量查 rollout，回退分段仍可向前找。
+// 外部 Codex 只写内嵌图、没有块编号时，从同一份字节生成缩略图和快照。
+// 点开、编辑与重试共用原图读取规则。
+// 只有路径的旧记录在打开时保留仍能取得的那份，原路径已经换过且 CLI 从未存图时，无法追溯发送时的字节。
+// 搜索只取可见标签，缩略图留在内存，送给前端的原图按需读取。
+import Cocoa
 
-let chatImageExts: Set<String> = ["png", "jpg", "jpeg", "gif", "webp", "heic", "heif", "bmp", "tif", "tiff"]
-private let thumbMaxPixels = 640
 private let maxImagesPerMessage = 12
-
-/// 缩略图缓存（后台同步会反复读同一个会话）：键是内容哈希或「路径 + 修改时间 + 大小」，总量超过上限就整个清空。
-private final class ThumbCache {
-    private var items: [String: [String: Any]] = [:]
-    private var bytes = 0
-    private let lock = NSLock()
-
-    func get(_ key: String) -> [String: Any]? {
-        lock.lock()
-        defer { lock.unlock() }
-        return items[key]
-    }
-
-    func set(_ key: String, _ value: [String: Any]) {
-        lock.lock()
-        defer { lock.unlock() }
-        let size = (value["src"] as? String)?.utf8.count ?? 0
-        if bytes + size > 48_000_000 { items.removeAll(); bytes = 0 }
-        items[key] = value
-        bytes += size
-    }
-}
-
-private let thumbCache = ThumbCache()
-
-/// 最近读过的 Codex rollout 里的附图（会话 ID → 原路径 → base64），见 codexRolloutImages。
-private var rolloutImageCache: [String: (stamp: String, images: [String: String])] = [:]
-private let rolloutImageLock = NSLock()
-
-/// 有没有真正透明的像素：截图大多带 alpha 通道但整张不透明，这种存成 JPEG 能小很多。
-private func hasTransparency(_ image: CGImage) -> Bool {
-    switch image.alphaInfo {
-    case .none, .noneSkipFirst, .noneSkipLast: return false
-    default: break
-    }
-    let w = image.width, h = image.height
-    guard w > 0, h > 0,
-          let ctx = CGContext(data: nil, width: w, height: h, bitsPerComponent: 8, bytesPerRow: w * 4,
-                              space: CGColorSpaceCreateDeviceRGB(), bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue),
-          let base = ctx.data else { return true }
-    ctx.draw(image, in: CGRect(x: 0, y: 0, width: w, height: h))
-    let px = base.assumingMemoryBound(to: UInt8.self)
-    for y in 0..<h {
-        let row = px + y * ctx.bytesPerRow
-        var x = 3
-        while x < w * 4 {
-            if row[x] != 255 { return true }
-            x += 4
-        }
-    }
-    return false
-}
-
-/// 解码好的图 → data URL：有透明像素用 PNG，否则 JPEG。
-private func encodedDataURL(_ image: CGImage, alpha: Bool) -> String? {
-    let out = NSMutableData()
-    let type = alpha ? UTType.png : UTType.jpeg
-    guard let dest = CGImageDestinationCreateWithData(out, type.identifier as CFString, 1, nil) else { return nil }
-    let props: [CFString: Any] = alpha ? [:] : [kCGImageDestinationLossyCompressionQuality: 0.85]
-    CGImageDestinationAddImage(dest, image, props as CFDictionary)
-    guard CGImageDestinationFinalize(dest) else { return nil }
-    return "data:\(alpha ? "image/png" : "image/jpeg");base64,\((out as Data).base64EncodedString())"
-}
-
-/// WebKit 能直接显示的格式（按内容判断，不看扩展名）；HEIC、TIFF、BMP 等要转码。
-private func webMime(_ source: CGImageSource) -> String? {
-    guard let uti = CGImageSourceGetType(source) as String?, let type = UTType(uti) else { return nil }
-    if type.conforms(to: .png) { return "image/png" }
-    if type.conforms(to: .jpeg) { return "image/jpeg" }
-    if type.conforms(to: .gif) { return "image/gif" }
-    if type.conforms(to: .webP) { return "image/webp" }
-    return nil
-}
-
-/// 图片数据 → {src: data URL, w, h}（w、h 是显示方向上的像素）。
-/// maxPixels 是缩略图长边上限；nil 表示原图，只在网页显示不了这种格式时转码。
-func chatImageData(_ data: Data, maxPixels: Int?) -> [String: Any]? {
-    guard let source = CGImageSourceCreateWithData(data as CFData, nil), CGImageSourceGetCount(source) > 0 else { return nil }
-    let props = CGImageSourceCopyPropertiesAtIndex(source, 0, nil) as? [CFString: Any] ?? [:]
-    var w = (props[kCGImagePropertyPixelWidth] as? NSNumber)?.intValue ?? 0
-    var h = (props[kCGImagePropertyPixelHeight] as? NSNumber)?.intValue ?? 0
-    if ((props[kCGImagePropertyOrientation] as? NSNumber)?.intValue ?? 1) >= 5 { swap(&w, &h) }   // 旋转了 90°
-    guard w > 0, h > 0 else { return nil }
-    // 网页能直接显示、而且本来就不大：原样用（动图也还能动；方向 WebKit 会按 EXIF 摆正）
-    if let mime = webMime(source), maxPixels.map({ max(w, h) <= $0 && data.count <= 200_000 }) ?? true {
-        return ["src": "data:\(mime);base64,\(data.base64EncodedString())", "w": w, "h": h]
-    }
-    func scaled(_ limit: Int) -> CGImage? {
-        let opts: [CFString: Any] = [kCGImageSourceCreateThumbnailFromImageAlways: true,
-                                     kCGImageSourceCreateThumbnailWithTransform: true,
-                                     kCGImageSourceThumbnailMaxPixelSize: limit]
-        return CGImageSourceCreateThumbnailAtIndex(source, 0, opts as CFDictionary)
-    }
-    guard var image = scaled(maxPixels ?? max(w, h)) else { return nil }
-    let alpha = hasTransparency(image)
-    // 带透明的只能存 PNG，体积大不少：缩略图再小一档
-    if alpha, let limit = maxPixels, max(image.width, image.height) > limit * 3 / 4, let smaller = scaled(limit * 3 / 4) {
-        image = smaller
-    }
-    guard let src = encodedDataURL(image, alpha: alpha) else { return nil }
-    return ["src": src, "w": image.width, "h": image.height]
-}
-
-/// 内嵌的 base64 图片 → 缩略图。
-func chatThumbnail(base64: String) -> [String: Any]? {
-    TestHooks.chatThumbnailRequested?()
-    let key = "b:" + SHA256.hash(data: Data(base64.utf8)).map { String(format: "%02x", $0) }.joined()
-    if let hit = thumbCache.get(key) { return hit }
-    guard let data = Data(base64Encoded: base64, options: .ignoreUnknownCharacters),
-          let thumb = chatImageData(data, maxPixels: thumbMaxPixels) else { return nil }
-    thumbCache.set(key, thumb)
-    return thumb
-}
-
-/// 本机图片文件 → 缩略图；不是图片或读不到时返回 nil。
-func chatThumbnail(path: String) -> [String: Any]? {
-    TestHooks.chatThumbnailRequested?()
-    let path = (path as NSString).resolvingSymlinksInPath
-    guard chatImageExts.contains((path as NSString).pathExtension.lowercased()),
-          let attrs = try? FileManager.default.attributesOfItem(atPath: path),
-          attrs[.type] as? FileAttributeType == .typeRegular,
-          let size = (attrs[.size] as? NSNumber)?.intValue, size > 0, size <= 80_000_000 else { return nil }
-    let key = "f:\(path)|\((attrs[.modificationDate] as? Date)?.timeIntervalSince1970 ?? 0)|\(size)"
-    if let hit = thumbCache.get(key) { return hit }
-    guard let data = try? Data(contentsOf: URL(fileURLWithPath: path), options: .alwaysMapped),
-          let thumb = chatImageData(data, maxPixels: thumbMaxPixels) else { return nil }
-    thumbCache.set(key, thumb)
-    return thumb
-}
-
-/// 搜索只需判断图片是否可读；不缩放、不检查透明像素，也不编码 data URL。
-private func chatImageLabel(_ data: Data) -> [String: Any]? {
-    guard let source = CGImageSourceCreateWithData(data as CFData, [kCGImageSourceShouldCache: false] as CFDictionary),
-          CGImageSourceGetCount(source) > 0,
-          let props = CGImageSourceCopyPropertiesAtIndex(source, 0, nil) as? [CFString: Any],
-          let w = (props[kCGImagePropertyPixelWidth] as? NSNumber)?.intValue, w > 0,
-          let h = (props[kCGImagePropertyPixelHeight] as? NSNumber)?.intValue, h > 0 else { return nil }
-    if webMime(source) != nil, max(w, h) <= thumbMaxPixels, data.count <= 200_000 { return [:] }
-    // 只有尺寸头、像素数据已损坏的文件也可能报出宽高；沿用解码条件，但不生成缩略图。
-    guard CGImageSourceCreateImageAtIndex(source, 0, [kCGImageSourceShouldCache: false] as CFDictionary) != nil else { return nil }
-    return [:]
-}
-
-private func chatImageLabel(path: String) -> [String: Any]? {
-    let target = (path as NSString).resolvingSymlinksInPath
-    guard chatImageExts.contains((target as NSString).pathExtension.lowercased()),
-          let attrs = try? FileManager.default.attributesOfItem(atPath: target),
-          attrs[.type] as? FileAttributeType == .typeRegular,
-          let size = (attrs[.size] as? NSNumber)?.intValue, size > 0, size <= 80_000_000,
-          let data = try? Data(contentsOf: URL(fileURLWithPath: target), options: .alwaysMapped) else { return nil }
-    return chatImageLabel(data)
-}
-
-/// 原图给查看器：太大的（超过 12 MB）缩到长边 4096，免得一次给网页几十 MB。
-func fullImageDataURL(_ data: Data) -> String? {
-    chatImageData(data, maxPixels: data.count > 12_000_000 ? 4096 : nil)?["src"] as? String
-}
 
 private let imagePathPattern: NSRegularExpression = {
     let ext = "\\.(?:png|jpe?g|gif|webp|heic|heif|bmp|tiff?)"
@@ -241,26 +89,65 @@ extension AppDelegate {
     }
 
     /// 普通提问和「你补充说」走同一缩略图 / 原图机制；原始数据（imageSources）不发出去。
-    /// ref 是「去哪找原图」：{agent, conversationId, id}，id 在 Claude 是「行 uuid#块序号」，在 Codex 是附图原来的路径。
+    /// ref 是「去哪找原图」：{agent, conversationId, id}，id 在 Claude 是「行 uuid#块序号」，
+    /// 在 Codex 是「原路径#这一回合里第几次发送@回合」（codexImageRecordId；没有回合和次序的来源只有原路径，取最后一次）。
     func attachChatImages(_ messages: inout [[String: Any]], payload: [String: Any], labelsOnly: Bool = false) {
         let base = payload["cwd"] as? String ?? ""
         let agent = payload["agent"] as? String ?? ""
         let cid = payload["conversationId"] as? String ?? ""
-        var rollout: [String: String]?   // Codex：有附图文件不在了才去读 rollout
+        // 同一份附件可出现在提问、补充和重试中。一页内只解析一次路径及其显示名，文件内容仍按各次发送校验。
+        var locations = [String:(String,String?)]()
+        func locate(_ raw: String) -> (String,String?) {
+            if let hit = locations[raw] { return hit }
+            let path = resolvePath(raw,base:base)
+            let result = (path,sentImageOrigin(path))
+            locations[raw] = result
+            return result
+        }
+        // Codex：先挑出原文件已不在、或发送之后被改过的附图；真要读 rollout 时只取这几张（读一次，整段历史共用）
+        var wanted = Set<String>()
+        if agent == "gpt" {
+            func collect(_ message: [String: Any]) {
+                for s in message["imageSources"] as? [[String: Any]] ?? [] {
+                    guard let raw = s["path"] as? String else { continue }
+                    let (sentPath, _) = locate(raw)
+                    if let id = codexImageRecordId(s) {
+                        if imageFileStamp(sentPath, sentAt:s["at"] as? Double ?? 0) == nil { wanted.insert(id) }
+                    } else if !fm.fileExists(atPath:sentPath) { wanted.insert(raw) }
+                }
+            }
+            for m in messages {
+                if let ask = m["retryUser"] as? [String:Any] { collect(ask) }
+                if m["role"] as? String == "user" { collect(m) }
+                for step in m["steps"] as? [[String: Any]] ?? [] where step["kind"] as? String == "user" { collect(step) }
+            }
+        }
+        var rollout: [String: String]?
         func attach(_ message: inout [String: Any], textKey: String) {
-            let sources = message.removeValue(forKey: "imageSources") as? [[String: Any]] ?? []
-            var images = chatImages(sources: sources, text: message[textKey] as? String ?? "", base: base, labelsOnly: labelsOnly) { path in
+            restorePathAttachments(&message, textKey:textKey)
+            let sources = message.removeValue(forKey:"imageSources") as? [[String:Any]] ?? []
+            var images = chatImages(sources: sources, text: message[textKey] as? String ?? "", base: base, labelsOnly: labelsOnly, locate:locate) { id in
                 guard agent == "gpt" else { return nil }
-                if rollout == nil { rollout = codexRolloutImages(cid: cid) }
-                return rollout?[path]
+                // 文件也可能在预检后才被替换；实际需要的编号必须参与本次回查。
+                let added = wanted.insert(id).inserted
+                if rollout == nil || added { rollout = codexRolloutImages(cid:cid, wanted:wanted) }
+                return rollout?[id]
             }
             for k in images.indices {
                 guard let id = images[k]["ref"] as? String else { continue }
-                images[k]["ref"] = ["agent": agent, "conversationId": cid, "id": id]
+                var ref: [String: Any] = ["agent": agent, "conversationId": cid, "id": id]
+                if let path = images[k].removeValue(forKey: "sentPath") as? String, let stamp = images[k].removeValue(forKey: "stamp") {
+                    ref["path"] = path
+                    ref["stamp"] = stamp
+                }
+                images[k]["ref"] = ref
             }
             if !images.isEmpty { message["images"] = images }
         }
         for i in messages.indices {
+            if var ask = messages[i]["retryUser"] as? [String:Any] {
+                attach(&ask, textKey:"text"); messages[i]["retryUser"] = ask
+            }
             if messages[i]["role"] as? String == "user" { attach(&messages[i], textKey: "text") }
             if var steps = messages[i]["steps"] as? [[String: Any]] {
                 for j in steps.indices where steps[j]["kind"] as? String == "user" { attach(&steps[j], textKey: "detail") }
@@ -270,38 +157,89 @@ extension AppDelegate {
     }
 
     /// 一条用户消息的图片：附件在前，然后是文字里写到的（同一个文件只出现一次）。
-    /// 每张是 {src, w, h, path?, ref?, name?, match?}；附件文件不在了、也找不回来时是 {missing, path}。
-    /// recover：附件文件不在了时，按原路径从会话记录里找回图片（base64）。
+    /// 每张是 {src, w, h, path?, ref?, name?, match?, changed?}；附件文件不在了、也找不回来时是 {missing, path}。
+    /// changed：路径上的文件在发送之后被改过，显示的是记录里当时那张（重试按 ref 发它，见 message-sync.js 的 historyRetry）。
+    /// recover：按 ref 的 id 从会话记录里取图片（base64）；附件文件不在了、或发送之后被改过时才用。
     func chatImages(sources: [[String: Any]], text: String, base: String, labelsOnly: Bool = false,
+                    locate: ((String) -> (String,String?))? = nil,
                     recover: (String) -> String? = { _ in nil }) -> [[String: Any]] {
-        func local(_ path: String) -> [String: Any]? {
-            labelsOnly ? chatImageLabel(path: path) : chatThumbnail(path: path)
+        func local(_ path: String, stamp: String? = nil, freeze: Bool = false) -> [String: Any]? {
+            if labelsOnly { return chatImageLabel(path:path) }
+            guard freeze else { return chatThumbnail(path:path, stamp:stamp) }
+            // 旧格式只记了路径，缩略图和之后的编辑至少应共用本次打开能读到的那一份。
+            return chatThumbnail(path:path, stamp:imageFileStamp(path)) { data in
+                self.temporaryImageFile(data, ext:(path as NSString).pathExtension, origin:path)
+            }
         }
-        func embedded(_ base64: String) -> [String: Any]? {
-            if !labelsOnly { return chatThumbnail(base64: base64) }
+        func embedded(_ base64: String, freeze: Bool = false) -> [String: Any]? {
+            if !labelsOnly { return chatThumbnail(base64:base64, freeze:freeze ? { self.temporaryImageFile($0) } : nil) }
             return Data(base64Encoded: base64, options: .ignoreUnknownCharacters).flatMap(chatImageLabel)
         }
         var out: [[String: Any]] = []
         var shown: [String: Int] = [:]   // 路径 → 在 out 里的位置
         for s in sources where out.count < maxImagesPerMessage {
             if let b64 = s["data"] as? String {
-                guard var t = embedded(b64) else { continue }
-                if let ref = s["ref"] { t["ref"] = ref }
+                guard var t = embedded(b64, freeze:s["ref"] == nil) else {
+                    if let ref = s["ref"] { out.append(["ref":ref,"missing":true]) }
+                    continue
+                }
+                if let ref = s["ref"] {
+                    t["ref"] = ref
+                    // 发送时缩过的大图：点开、编辑和重试用当时的完整副本，和实时那一轮一样（SentImages.swift 的 fullSentImage）
+                    if !labelsOnly, let key = t["imageKey"] as? String, let full = fullSentImage(key: key) { t["snapshot"] = full }
+                }
+                if let sentPath = s["path"] as? String {
+                    let path = sentImageOrigin(sentPath) ?? sentPath
+                    t["path"] = path; t["name"] = fileBaseName(path); t["changed"] = true
+                    shown[path] = out.count
+                }
                 out.append(t)
             } else if let raw = s["path"] as? String {
-                let path = resolvePath(raw, base: base)
-                guard shown[path] == nil else { continue }
+                // 发给 Codex 前转换过的照片（codexImagePath）：记录里是临时 JPEG，显示和对位都用原来的照片路径
+                let (sentPath, origin) = locate?(raw) ?? {
+                    let path = resolvePath(raw,base:base)
+                    return (path,sentImageOrigin(path))
+                }()
+                let path = origin ?? sentPath
                 shown[path] = out.count
-                if var t = local(path) {
+                shown[sentPath] = out.count
+                // 同一路径的文件可能被覆盖过（Codex 记下了这是哪一回合的第几张，见 CodexTurnGrouper）：文件还在、发送之后没改过就直接用它，
+                // 不读 rollout（几十 MB 的记录每次打开、同步都整份读一遍要零点几秒）；改过或不在了才以记录里当时那张为准。
+                let record = codexImageRecordId(s)
+                let stamp = record == nil ? nil : imageFileStamp(sentPath, sentAt:s["at"] as? Double ?? 0)
+                func recovered(_ id: String) -> [String: Any]? {
+                    guard let b64 = recover(id), var t = embedded(b64) else { return nil }
+                    t["ref"] = id
+                    t["name"] = fileBaseName(path)
+                    return t
+                }
+                if record == nil || stamp != nil, var t = local(sentPath, stamp:stamp, freeze:locate != nil && record == nil && origin == nil && !isSentImageFile(sentPath)),
+                   record == nil || imageFileStamp(sentPath) == stamp {
                     t["path"] = path
+                    if origin != nil && record == nil { t["snapshot"] = sentPath }
+                    if let record, !labelsOnly {
+                        t["ref"] = record
+                        t["sentPath"] = sentPath
+                        t["stamp"] = stamp
+                    }
                     out.append(t)
-                } else if let b64 = recover(raw), var t = embedded(b64) {
-                    t["ref"] = raw
-                    t["name"] = fileBaseName(raw)
+                } else if let id = record, var t = recovered(id) {
+                    // 文件还在就照旧带上路径：「在访达中显示」、实时那一轮和历史对位都用它；点开原图、重试按 ref 用当时那张
+                    if fm.fileExists(atPath: path) { t["path"] = path; t["changed"] = true }
+                    out.append(t)
+                } else if origin != nil, var t = local(sentPath) {
+                    t["path"] = path; t["snapshot"] = sentPath
+                    out.append(t)
+                } else if record == nil, let t = recovered(raw) {
                     out.append(t)
                 } else {
-                    out.append(["missing": true, "path": path])
+                    var missing: [String:Any] = ["missing": true, "path": path]
+                    missing["ref"] = record
+                    if origin != nil { missing["snapshot"] = sentPath }
+                    out.append(missing)
                 }
+            } else if let ref = s["ref"] {
+                out.append(["ref":ref,"missing":true])
             }
         }
         for (match, raw) in imagePathMentions(text) {
@@ -311,6 +249,7 @@ extension AppDelegate {
                 continue
             }
             guard out.count < maxImagesPerMessage, var t = local(path) else { continue }
+            t["mentioned"] = true
             t["path"] = path
             if isAttachmentPath(path) { t["match"] = match }
             shown[path] = out.count
@@ -322,93 +261,45 @@ extension AppDelegate {
     /// 粘贴截图、剪贴板图片这类临时存下的文件：路径本身没有意义，消息文字里显示成短标签（match）。
     func isAttachmentPath(_ path: String) -> Bool {
         let pasted = "\(home)/Library/Application Support/AIPetHub/粘贴的图片/"
-        return path.hasPrefix(pasted) || ["/var/folders/", "/private/var/folders/", "/tmp/", "/private/tmp/"].contains { path.hasPrefix($0) }
+        return path.hasPrefix(pasted) || path.hasPrefix(durableSentImagesDir) || ["/var/folders/", "/private/var/folders/", "/tmp/", "/private/tmp/"].contains { path.hasPrefix($0) }
     }
 
-    /// 点开对话里的图片：文件还在就直接读，否则按 ref 从会话记录里取（见 attachChatImages）。
+    /// 有记录引用时显示路径只用于定位文件，取不到该次原图就交给查看器提示。
     func fullChatImage(_ body: [String: Any]) -> String? {
-        if let raw = body["path"] as? String, !raw.isEmpty {
+        if let ref = body["ref"] as? [String:Any] { return sentImageData(ref).flatMap(fullImageDataURL) }
+        if let raw = (body["snapshot"] ?? body["path"]) as? String, !raw.isEmpty {
             let path = resolvePath(raw, base: "")
             if chatImageExts.contains((path as NSString).pathExtension.lowercased()),
                let data = try? Data(contentsOf: URL(fileURLWithPath: path), options: .alwaysMapped) {
                 return fullImageDataURL(data)
             }
         }
-        guard let ref = body["ref"] as? [String: Any], let cid = ref["conversationId"] as? String, isSafeId(cid),
-              let id = ref["id"] as? String else { return nil }
-        switch ref["agent"] as? String {
-        case "claude":
-            return claudeEmbeddedImage(cid: cid, id: id).flatMap(fullImageDataURL)
-        case "gpt":
-            return codexRolloutImages(cid: cid)[id].flatMap { Data(base64Encoded: $0, options: .ignoreUnknownCharacters) }.flatMap(fullImageDataURL)
-        case "deepseek":   // id 是 dsh 的附件编号（DeepSeekEvents.swift 的 dshImageSources）
-            return dshAttachmentPath(id).flatMap { FileManager.default.contents(atPath: $0) }.flatMap(fullImageDataURL)
-        default:
-            return nil
-        }
-    }
-
-    /// Claude 记录里内嵌的图片原图：id 是「行 uuid#块序号」，按 uuid 找到那一行再取出来。
-    func claudeEmbeddedImage(cid: String, id: String) -> Data? {
-        let parts = id.split(separator: "#")
-        guard parts.count == 2, isSafeId(String(parts[0])), let index = Int(parts[1]),
-              // claudeCache 只在 Claude 的队列上读写（这里在全局后台队列，不会和它互相等待）
-              let file = queue(for: "claude").sync(execute: { findClaudeSession(cid: cid) }),
-              let data = try? Data(contentsOf: URL(fileURLWithPath: file), options: .alwaysMapped) else { return nil }
-        let uuid = String(parts[0])
-        let needle = Data("\"uuid\":\"\(uuid)\"".utf8)
-        var from = data.startIndex
-        while let r = data.range(of: needle, in: from..<data.endIndex) {
-            let lineStart = data[..<r.lowerBound].lastIndex(of: 0x0A).map { $0 + 1 } ?? data.startIndex
-            let lineEnd = data[r.upperBound...].firstIndex(of: 0x0A) ?? data.endIndex
-            if let obj = jsonObject(data[lineStart..<lineEnd]), obj["uuid"] as? String == uuid,
-               let blocks = ((obj["message"] as? [String: Any])?["content"] ?? (obj["attachment"] as? [String: Any])?["prompt"]) as? [[String: Any]], blocks.indices.contains(index),
-               let b64 = (blocks[index]["source"] as? [String: Any])?["data"] as? String {
-                return Data(base64Encoded: b64, options: .ignoreUnknownCharacters)
-            }
-            from = lineEnd
-        }
         return nil
     }
 
-    /// Codex 的 rollout 里每张附图都存了一份（紧跟在 `<image … path="…">` 后面的 input_image）：原路径 → base64。
-    /// 剪贴板截图存在临时目录，几天后会被系统清掉，那时只能从这里找回来。按 rollout 的修改时间缓存最近几个会话。
-    func codexRolloutImages(cid: String) -> [String: String] {
-        var hint = ""
-        _ = withReadableSQLite("\(codexHome)/state_5.sqlite") { db in
-            queryRows(db, "SELECT rollout_path FROM threads WHERE id = ? LIMIT 1;", [cid]) { s in hint = columnText(s, 0) }
+    /// 修改时间可随旧文件一起移回来，ctime 会留下本次替换的时间。时间精度不足时回查记录。
+    private func imageFileStamp(_ path: String, sentAt: Double? = nil) -> String? {
+        var info = stat()
+        guard stat(path, &info) == 0 else { return nil }
+        if let at = sentAt {
+            let m = Double(info.st_mtimespec.tv_sec) + Double(info.st_mtimespec.tv_nsec) / 1e9
+            let c = Double(info.st_ctimespec.tv_sec) + Double(info.st_ctimespec.tv_nsec) / 1e9
+            guard max(m,c) <= at else { return nil }
         }
-        guard let path = findRollout(cid: cid, hint: hint) else { return [:] }
-        let stamp = "\(path)|\(modificationDate(path)?.timeIntervalSince1970 ?? 0)"
-        rolloutImageLock.lock()
-        let cached = rolloutImageCache[cid]
-        rolloutImageLock.unlock()
-        if let c = cached, c.stamp == stamp { return c.images }
+        return "\(info.st_ino):\(info.st_ctimespec.tv_sec):\(info.st_ctimespec.tv_nsec)"
+    }
 
-        var images: [String: String] = [:]
-        let marker = Data("\"input_image\"".utf8)
-        for line in (readRollout(path) ?? "").utf8.split(separator: 0x0A) {
-            let data = Data(line)
-            guard data.range(of: marker) != nil, let obj = jsonObject(data), obj["type"] as? String == "response_item",
-                  let item = obj["payload"] as? [String: Any], item["role"] as? String == "user",
-                  let blocks = item["content"] as? [[String: Any]] else { continue }
-            var pendingPath: String?
-            for b in blocks {
-                if b["type"] as? String == "input_text", let t = b["text"] as? String, t.hasPrefix("<image "),
-                   let r = t.range(of: "path=\"[^\"]+\"", options: .regularExpression) {
-                    pendingPath = String(t[r].dropFirst(6).dropLast())
-                } else if b["type"] as? String == "input_image", let p = pendingPath,
-                          let url = b["image_url"] as? String, let comma = url.firstIndex(of: ",") {
-                    images[p] = String(url[url.index(after: comma)...])
-                    pendingPath = nil
-                }
-            }
-        }
-        rolloutImageLock.lock()
-        if rolloutImageCache.count >= 4 { rolloutImageCache.removeAll() }
-        rolloutImageCache[cid] = (stamp, images)
-        rolloutImageLock.unlock()
-        return images
+    func verifiedImagePath(_ ref: [String: Any]) -> String? {
+        guard let path = ref["path"] as? String, let stamp = ref["stamp"] as? String,
+              imageFileStamp(path) == stamp else { return nil }
+        return path
+    }
+
+    /// 查看、编辑和重试采用同一来源。读完再复核指纹，防止恰好在读取期间替换文件。
+    func sentImageData(_ ref: [String:Any]) -> Data? {
+        if let copy = readableSnapshot(ref), let data = fm.contents(atPath:copy) { return data }
+        if let path = verifiedImagePath(ref), let data = fm.contents(atPath:path), verifiedImagePath(ref) != nil { return data }
+        return chatImageOriginal(ref)
     }
 
     /// 网页的两种请求：chatThumbs（刚发出的消息里写到的图片）、chatImage（查看原图）。
@@ -416,37 +307,23 @@ extension AppDelegate {
         guard let reqId = (body["reqId"] as? NSNumber)?.intValue else { return }
         DispatchQueue.global(qos: .userInitiated).async { [self] in
             if action == "chatThumbs" {
-                let images = chatImages(sources: [], text: body["text"] as? String ?? "", base: body["base"] as? String ?? "")
+                let paths = body["snapshots"] as? [String] ?? []
+                let images = chatImages(sources: paths.map { ["path":$0] }, text: body["text"] as? String ?? "", base: body["base"] as? String ?? "")
                 sendToJS("onChatThumbs", ["reqId": reqId, "images": images])
+            } else if action == "editChatImages" {
+                // freeze：编辑带回的是发送时的副本，再附同一原图时按发送的规则冻结，内容没变就得到同一路径、网页按路径去重。
+                var paths = body["paths"] as? [String] ?? []
+                if body["freeze"] as? Bool == true { paths = paths.map { sentImagePaths([$0])?[$0] ?? $0 } }
+                if let result = resolveImageRefs(body["refs"] as? [[String:Any]] ?? [], among:paths) {
+                    sendToJS("onFilesDropped", ["pasteId":reqId, "paths":result.paths])
+                } else {
+                    sendToJS("onFilesDropped", ["pasteId":reqId, "error":"会话记录里的原图读不到了"])
+                }
             } else if let src = fullChatImage(body) {
                 sendToJS("onChatImage", ["reqId": reqId, "image": src])
             } else {
                 sendToJS("onChatImage", ["reqId": reqId, "error": "原图读不到了（文件可能已被移动或删除）"])
             }
         }
-    }
-}
-
-// MARK: - 随提问一起发的图片（真正的附件）
-
-extension AppDelegate {
-    /// 能当附件发的图片：文件在、是常见图片格式。
-    func isAttachableImage(_ path: String) -> Bool {
-        let ext = (path as NSString).pathExtension.lowercased()
-        return ["png", "jpg", "jpeg", "gif", "webp", "heic", "heif", "bmp", "tiff", "tif"].contains(ext) && fm.fileExists(atPath: path)
-    }
-
-    /// 图片读成 base64。常见格式、不太大的原样发；太大或者模型不认的格式（HEIC、TIFF…）缩到长边 2000 像素、转成 JPEG。
-    func attachmentData(_ path: String) -> (mime: String, base64: String)? {
-        let ext = (path as NSString).pathExtension.lowercased()
-        let mimes = ["png": "image/png", "jpg": "image/jpeg", "jpeg": "image/jpeg", "gif": "image/gif", "webp": "image/webp"]
-        guard let data = fm.contents(atPath: path), !data.isEmpty else { return nil }
-        if let mime = mimes[ext], data.count <= 3_500_000 { return (mime, data.base64EncodedString()) }
-        guard let source = CGImageSourceCreateWithData(data as CFData, nil),
-              let image = CGImageSourceCreateThumbnailAtIndex(source, 0, [
-                  kCGImageSourceCreateThumbnailFromImageAlways: true, kCGImageSourceCreateThumbnailWithTransform: true,
-                  kCGImageSourceThumbnailMaxPixelSize: 2000] as CFDictionary),
-              let jpeg = NSBitmapImageRep(cgImage: image).representation(using: .jpeg, properties: [.compressionFactor: 0.85]) else { return nil }
-        return ("image/jpeg", jpeg.base64EncodedString())
     }
 }

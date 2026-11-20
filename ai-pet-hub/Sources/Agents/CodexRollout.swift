@@ -1,4 +1,8 @@
 // 同一份 rollout 可能经历 CLI 升级；只合并同轮的镜像消息，不能按整份文件择一格式。
+//
+// 普通 Codex rollout 的新旧事件按出现顺序共用回合归组，同轮的两种镜像记录只显示一次；
+//
+// 带 error 的 `task_complete` 是当前 CLI 的失败记录，按失败显示。
 import Foundation
 
 struct CodexRolloutEvent {
@@ -12,6 +16,12 @@ struct CodexRolloutEvent {
 }
 
 extension AppDelegate {
+    /// 当前 CLI 生成失败时只写带 error 的 task_complete，不再写 turn_failed；纯 rollout 和投影补尾共用这一判据，结局才一致。
+    func codexRolloutEnding(_ type: String, _ payload: [String: Any]) -> String {
+        if type == "turn_aborted" { return "interrupted" }
+        return type == "turn_failed" || payload["error"] is [String: Any] ? "failed" : "completed"
+    }
+
     /// 压缩记录可能有数百 MB。侧栏只要身份、目录和标题，读到首问或确认是子线程就结束解压。
     func compressedRolloutSummary(path: String, mtime: Date) -> [String: Any]? {
         guard let zstd = hooks.cliExecutable ?? findExecutable(["/opt/homebrew/bin/zstd", "/usr/local/bin/zstd", "/usr/bin/zstd"]) else { return nil }
@@ -124,23 +134,25 @@ extension AppDelegate {
     func codexRolloutTurns(_ content: String) -> (messages: [[String: Any]], cwd: String, lastTurn: HistoryTurnActivity?) {
         let parsed = rolloutEvents(content)
         var activity: HistoryTurnActivity?, scope: Int?
-        var outcome: String?, error: String?
-        let g = CodexTurnGrouper(app: self, ticksPerSecond: 1) { _, turn, final in
-            defer { outcome = nil; error = nil }
-            return (outcome ?? (final.isEmpty && !turn.isEmpty ? "incomplete" : "completed"), error)
+        var outcome: String?, error: String?, completed = false
+        let g = CodexTurnGrouper(app: self, cid:parsed.meta["id"] as? String ?? parsed.meta["session_id"] as? String ?? "", ticksPerSecond: 1) { _, turn, final in
+            defer { outcome = nil; error = nil; completed = false }
+            return (outcome ?? (final.isEmpty && !turn.isEmpty ? "incomplete" : "completed"), error, completed)
         }
         for event in parsed.events {
             let payload = event.payload, type = payload["type"] as? String ?? ""
-            let id = payload["turn_id"] as? String ?? "", ts = event.timestamp
             if event.scope != scope { activity = nil; scope = event.scope }
+            // 旧版只在 task_started 写编号；同一回合内的正文也需要这个编号来认领本机结局。
+            let id = payload["turn_id"] as? String ?? activity?.turnId ?? "", ts = event.timestamp
             if type == "task_started" {
                 g.flush()
-                activity = HistoryTurnActivity(running: true, startedAt: ts ?? 0, updatedAt: ts ?? 0)
+                activity = HistoryTurnActivity(running: true, startedAt: ts ?? 0, updatedAt: ts ?? 0, turnId: id)
             } else if let ts = ts { activity?.updatedAt = ts }
             if ["task_complete", "turn_aborted", "turn_failed"].contains(type) {
-                activity = HistoryTurnActivity(running: false, startedAt: activity?.startedAt ?? 0, updatedAt: ts ?? 0)
+                activity = HistoryTurnActivity(running: false, startedAt: activity?.startedAt ?? 0, updatedAt: ts ?? 0, turnId: id)
                 g.enter(id); g.begin(id, at: ts); g.closeToSteers(); g.touch(ts)
-                outcome = type == "turn_aborted" ? "interrupted" : (type == "turn_failed" ? "failed" : "completed")
+                outcome = codexRolloutEnding(type, payload)
+                completed = outcome == "completed"
                 error = ((payload["error"] as? [String: Any])?["message"] as? String).map(codexReadableError)
             } else if type == "item_completed", let item = payload["item"] as? [String: Any], let kind = item["type"] as? String {
                 g.enter(id)
@@ -158,7 +170,7 @@ extension AppDelegate {
         }
         if activity?.running == true {
             // 唯一事件可能只是 task_started，也要给新回合自己的标题，避免把上一轮标成运行中。
-            g.begin("", at: activity?.startedAt)
+            g.begin(activity?.turnId ?? "", at: activity?.startedAt)
             outcome = "incomplete"
         }
         g.flush()

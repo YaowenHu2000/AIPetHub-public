@@ -1,6 +1,11 @@
 'use strict';
 
 // Codex 和 DeepSeek 以历史里最后一轮的明确状态为准。没有边界的旧记录和其他 CLI 仍按可见内容的变化判断。
+//
+// Claude 有明确结束记录、Gemini 的空闲摘要与当前步数相符时，侧栏同步立即撤下外部运行提示。
+// Codex 和 DeepSeek 把最后一轮的开始和结束状态随历史发给网页。
+// 运行中的回合静默时仍显示计时，读到结束事件就撤标；该会话一小时没有写入时按意外退出处理。
+// 缺少回合状态的记录仍按可见内容的变化判断。
 const TURN_STALE_MS = 60 * 60 * 1000;   // 崩溃可能没有结束事件，也可能恰好遇到长时间静默推理
 
 const ELSEWHERE_WATCH_MS = 300000;   // 盯多久：最后一次有动静之后 5 分钟（思考强度高的时候两步之间能隔好几分钟）
@@ -20,10 +25,14 @@ function noteElsewhere(id) {
 }
 
 function readElsewhereTurn(id, data, syncing) {
-  const st = S[id], turn = data.lastTurn;
+  const st = S[id], previous = st.externalTurn;
+  const tail = data.messages?.at(-1);
+  // 老记录可能没有运行边界。失败或中断的末轮已经结束；未完成的末轮仍可能在另一窗口继续写。
+  const ended = tail?.role === 'bot' && canRetryOutcome(tail.outcome) && tail.outcome !== 'incomplete';
+  const turn = typeof data.lastTurn?.running === 'boolean' ? data.lastTurn : (ended ? {running:false} : null);
   st.externalTurn = typeof turn?.running === 'boolean' ? { ...turn, cid: data.conversationId } : null;
   if (turn?.running && elsewhereOn(id)) watchElsewhere(id);
-  if (turn && syncing) markElsewhere(id);   // 状态可以先于可见步骤变化
+  if ((turn || previous) && syncing) markElsewhere(id);   // 状态可以先于可见步骤变化
 }
 
 function elsewhereOn(id) {
@@ -62,7 +71,14 @@ function markElsewhere(id) {
   const on = elsewhereOn(id);
   const turns = box.querySelectorAll('.msg.bot.turn:not(.live)');
   const last = on ? turns[turns.length - 1] : null;
-  const work = last && box.lastElementChild === last ? last.querySelector('.work') : null;   // 后面已经有新的提问了就不标
+  // 后面已经有新的提问了就不标；接在末尾的「没有回合接着的卡片」（live.js 的 unattendedRequest）不算
+  let tail = box.lastElementChild;
+  if (tail?.classList?.contains('unattended')) tail = tail.previousElementSibling;
+  box.querySelectorAll('.turn[data-incomplete] .retry').forEach(button => {
+    const running = last === tail && last?.contains(button);
+    button.hidden = button.disabled = !!running;
+  });
+  const work = last && tail === last ? last.querySelector('.work') : null;
   box.querySelectorAll('.work.elsewhere').forEach(w => {
     if (w === work) return;
     w.classList.remove('elsewhere');
@@ -122,4 +138,4 @@ setInterval(() => {
   if (S[active].elsewherePet && typeof pets !== 'undefined') pets[active].renderStatus();   // 桌宠状态里的时长每秒走
 }, 1000);
 // 没在盯的时候，每 20 秒看一眼列表：打开着的会话在别处开始动了，就能发现
-setInterval(() => { if (!document.hidden) postNative('listConversations', { agent: active }); }, 20000);
+setInterval(() => { if (!document.hidden) refreshHistory(active,true); }, 20000);

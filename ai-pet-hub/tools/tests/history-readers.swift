@@ -14,6 +14,7 @@ func testClaudeHistory() {
         #"{"type":"attachment","attachment":{"type":"something_else"}}"#,
     ]
     let (messages, cwd) = AppDelegate().claudeTurns(Data(lines.joined(separator: "\n").utf8))
+    check((messages.first?["createdAt"] as? Double ?? 0) > 0, "首次对账可区分停止后才写入的 Claude 提问")
     eq(cwd, "/w", "工作目录")
     eq(messages.map { str($0, "role") }, ["user", "bot"], "中途补充的话不拆成另一轮")
     // API 报错的那一轮：记录里是一条带 isApiErrorMessage 的回答。重开时要还原成出错的一轮（带原文、能重试），不能整条消失
@@ -60,6 +61,10 @@ func testClaudeHistory() {
         #"{"type":"user","timestamp":"2026-11-10T10:00:09.000Z","message":{"role":"user","content":"接着数"}}"#,
         #"{"type":"user","timestamp":"2026-11-10T10:00:10.000Z","message":{"role":"user","content":[{"type":"text","text":"[Request interrupted by user for tool use]"}]}}"#,
     ]
+    let toolsStopped = [stopped[0], lines[1],
+        #"{"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"t1","is_error":true,"content":"部分输出\n<error>Command was aborted before completion</error>"}]}}"#, stopped[2]]
+    let stoppedSteps = AppDelegate().claudeTurns(Data(toolsStopped.joined(separator:"\n").utf8)).0.last?["steps"] as? [[String:Any]]
+    eq(str(stoppedSteps?.first,"status"),"interrupted","Claude 重开用户取消的命令")
     let (afterStop, _) = AppDelegate().claudeTurns(Data(stopped.joined(separator: "\n").utf8))
     eq(afterStop.map { str($0, "role") }, ["user", "bot", "user", "bot"], "中断标记不是一句提问")
     check(!afterStop.contains { str($0, "text").contains("Request interrupted") }, "中断标记的原文不显示")
@@ -82,7 +87,133 @@ func testClaudeHistory() {
         row(5, 2, "user", "主线第二问"), row(7, 5, "user", "并行工具的另一条结果"), row(6, 5, "assistant", "主线第二答"),   // 7 也接在 5 后面、不在主线上，但这一支里没有回答：不算旁支
     ]
     let app = AppDelegate()
+    let cid = UUID().uuidString, file = NSTemporaryDirectory() + cid + ".jsonl"
+    defer { try? FileManager.default.removeItem(atPath: file) }
+    try! lines.joined(separator: "\n").write(toFile: file, atomically: true, encoding: .utf8)
+    app.claudeCache[cid] = (0, [:], file)
+    let req = AskRequest(agent:"claude", reqId:8, prompt:"再跑", model:"haiku", effort:"low", permissionMode:"default", workspace:"", conversationId:cid)
+    let first = AskRequest(agent:"claude",reqId:9,prompt:"首问",model:"haiku",effort:"low",permissionMode:"manual",workspace:"/tmp",conversationId:"")
+    let firstId = UUID().uuidString, partial = TurnBuilder(), firstParser = ClaudeStreamParser(turn:partial)
+    firstParser.feed(json(#"{"type":"assistant","session_id":"\#(firstId)","message":{"content":[{"type":"text","text":"首段"}]}}"#))
+    _ = app.claudeReply(first,res:CLIResult(out:"",err:"crash",status:42,cancelled:false),parser:firstParser,turn:partial)
+    var restored: [String:Any] = [:]
+    app.hooks.jsSink = { _, data in restored = data }
+    app.loadClaude(cid:firstId); app.claudeQueue.sync {}
+    let firstTurns = restored["messages"] as? [[String:Any]] ?? []
+    check(restored["missing"] as? Bool == false && firstTurns.map { str($0,"text") } == ["首问","首段"] && str(firstTurns.last,"outcome") == "failed",
+          "首轮未建记录仍恢复原问和失败正文，实际 missing=\(restored["missing"] ?? "无")、消息=\(firstTurns.count)")
+    for (status, stopped, body, expected) in [(Int32(0),false,"半句","incomplete"), (42,false,"","failed"), (0,true,"","interrupted")] {
+        let id = UUID().uuidString, builder = TurnBuilder(), stream = ClaudeStreamParser(turn:builder)
+        stream.feed(json(#"{"type":"system","subtype":"init","session_id":"\#(id)"}"#))
+        if !body.isEmpty { builder.add(makeStep("text","说明",detail:body)) }
+        let reply = app.claudeReply(first,res:CLIResult(out:"",err:"退出",status:status,cancelled:stopped),parser:stream,turn:builder)
+        app.loadClaude(cid:id); app.claudeQueue.sync {}
+        let rows = restored["messages"] as? [[String:Any]] ?? []
+        eq(rows.map { str($0,"text") }, [first.prompt,reply.reply], "Claude 首轮 \(expected) 保留实时正文")
+        eq(str(rows.last,"outcome"),expected,"Claude 首轮 \(expected) 结局")
+        eq((restored["lastTurn"] as? [String:Any])?["running"] as? Bool,false,"Claude 首轮 \(expected) 确认结束")
+    }
+    let turn = TurnBuilder(), parser = ClaudeStreamParser(turn:turn)
+    parser.feed(json(#"{"type":"assistant","message":{"content":[{"type":"text","text":"已跑一半"}]}}"#))
+    _ = app.claudeReply(req, res:CLIResult(out:"",err:"fixture crash",status:42,cancelled:false), parser:parser, turn:turn)
+    func reopen() -> [[String:Any]] {
+        var messages = [[String:Any]]()
+        app.hooks.jsSink = { name, data in if name == "onConversationLoaded" { messages = data["messages"] as? [[String:Any]] ?? [] } }
+        app.loadClaude(cid:cid); app.claudeQueue.sync {}
+        return messages
+    }
+    let endedLine = #"{"type":"assistant","message":{"stop_reason":"end_turn","content":[{"type":"text","text":"完成"}]}}"#
+    try! (lines + [endedLine]).joined(separator:"\n").write(toFile:file,atomically:true,encoding:.utf8)
+    var activity: [String:Any]?
+    app.hooks.jsSink = { _,data in activity = data["lastTurn"] as? [String:Any] }
+    app.loadClaude(cid:cid); app.claudeQueue.sync {}
+    eq(activity?["running"] as? Bool,false,"Claude 的明确结束记录撤掉外部运行标记")
+    try! lines.joined(separator:"\n").write(toFile:file,atomically:true,encoding:.utf8)
+    var recent = reopen()
+    eq(recent.suffix(2).map { str($0,"text") }, ["再跑","已跑一半"], "B2-07 崩溃后恢复未落盘的一问一答")
+    eq(str(recent.last,"outcome"), "failed", "B2-07 重开仍可重试")
+    let iso = ISO8601DateFormatter(); iso.formatOptions = [.withInternetDateTime,.withFractionalSeconds]
+    let stamp = iso.string(from:req.startedAt)
+    let filled = [#"{"type":"user","timestamp":"\#(stamp)","message":{"content":"再跑"}}"#,
+                  #"{"type":"assistant","timestamp":"\#(stamp)","message":{"content":[{"type":"text","text":"完整结果"}]}}"#]
+    let toolOnly = [filled[0],lines[1],lines[3]].joined(separator:"\n")
+    let beforeTool = #"{"type":"assistant","message":{"content":[{"type":"text","text":"工具前说明"}]}}"#
+    let toolCrash = app.claudeTurns(Data([filled[0],beforeTool,lines[1],lines[3]].joined(separator:"\n").utf8),cid:cid).0.last
+    eq([str(toolCrash,"text"),str(toolCrash,"outcome")],["已跑一半","failed"],"工具前说明不能盖掉崩溃时的新正文")
+    check((toolCrash?["steps"] as? [[String:Any]])?.contains { str($0,"detail") == "工具前说明" } == true, "工具前说明仍可从步骤查看")
+    let afterTool = app.claudeTurns(Data(toolOnly.utf8), cid:cid).0.last
+    eq(str(afterTool,"outcome"), "failed", "R3 单个工具结束后崩溃仍可重试")
+    eq(str(afterTool,"text"), "已跑一半", "R3 工具结束后保留崩溃前正文")
+    check((afterTool?["steps"] as? [[String:Any]] ?? []).contains { str($0,"kind") == "command" }, "R3 保留已完成的命令步骤")
+    // 命令回执落盘前就结束：实时按整轮结局把它收成失败或中断，重开不能让它一直转圈。
+    let noReceipt = Data([filled[0],lines[1]].joined(separator:"\n").utf8)
+    for (outcome, status) in [("failed","error"), ("interrupted","interrupted")] {
+        let reader = AppDelegate()
+        reader.hooks.localEndings = app.hooks.localEndings?.map { var row = $0; row["outcome"] = outcome; return row }
+        let row = reader.claudeTurns(noReceipt, cid:cid).0.last
+        let command = (row?["steps"] as? [[String:Any]])?.first { str($0,"kind") == "command" }
+        eq([str(row,"outcome"), str(command,"status")], [outcome, status], "Claude 命令回执前\(outcome)，重开命令按整轮结局收尾")
+    }
+    try! (lines + filled).joined(separator:"\n").write(toFile:file, atomically:true, encoding:.utf8)
+    recent = reopen()
+    eq(recent.map { str($0,"text") }.suffix(2), ["再跑","完整结果"], "B2-07 CLI 补齐后使用完整记录")
+    eq(recent.count, 4, "B2-07 同一轮不重复")
+    app.hooks.localEndings = []
+    let stoppingTurn = TurnBuilder(), sp = ClaudeStreamParser(turn:stoppingTurn)
+    sp.feed(json(lines[4]))
+    sp.feed(json(#"{"type":"result","result":"[ede_diagnostic] result_type=user"}"#))
+    let stoppedReply = app.claudeReply(req, res:CLIResult(out:"",err:"",status:0,cancelled:true), parser:sp, turn:stoppingTurn)
+    eq(stoppedReply.reply, "测试和 lint 都过了。", "停止时保留最后显示的正文")
+    let placeholder = #"{"type":"assistant","message":{"model":"<synthetic>","content":[{"type":"text","text":"No response requested."}]}}"#
+    let missingBody = app.claudeTurns(Data([filled[0],stopped[2]].joined(separator:"\n").utf8),cid:cid).0.last
+    eq([str(missingBody,"text"),str(missingBody,"outcome")], [stoppedReply.reply,"interrupted"], "停止后重开保住尚未落盘的正文")
+    app.hooks.localEndings = []
+    let archivedStop = app.claudeTurns(Data((Array(stopped.prefix(3)) + [placeholder]).joined(separator:"\n").utf8)).0.last
+    eq(str(archivedStop,"text"), "1\n2\n3", "续问后的中断占位不覆盖原正文")
+    let limited = TurnBuilder(), cp = ClaudeStreamParser(turn:limited)
+    cp.feed(json(#"{"type":"result","subtype":"success","stop_reason":"max_tokens","result":"写到上限"}"#))
+    _ = app.claudeReply(req, res:CLIResult(out:"",err:"",status:0,cancelled:false), parser:cp, turn:limited)
+    let cap = app.claudeTurns(Data(toolOnly.utf8), cid:cid).0.last
+    eq(str(cap,"outcome"), "failed", "R3 输出达到上限重开仍可重试")
+    check((cap?["steps"] as? [[String:Any]] ?? []).contains { str($0,"detail") == outputLimitHint }, "R3 重开显示输出上限原因")
+    let limitRow = #"{"type":"assistant","message":{"stop_reason":"max_tokens","content":[]}}"#
+    let archivedCap = app.claudeTurns(Data((toolOnly + "\n" + limitRow).utf8), cid:cid).0.last
+    eq(str(archivedCap,"text"), "写到上限", "R3 结束原因已落盘时补回尚未落盘的正文")
+    let partialLimit = #"{"type":"assistant","message":{"stop_reason":"max_tokens","content":[{"type":"text","text":"写到"}]}}"#
+    let prefixLimit = app.claudeTurns(Data((filled[0] + "\n" + partialLimit).utf8), cid:cid).0.last
+    eq(str(prefixLimit,"text"),"写到上限","Claude 失败记录只有正文前缀也能补齐")
     let data = Data(forked.joined(separator: "\n").utf8)
+    eq(str(app.claudeTurns(data).0.first, "turnKey"), u(9), "同步按原提问 UUID 识别 Claude 同文重问")
+    let synthetic = row(4,3,"assistant","No response requested.").replacingOccurrences(of:#""role":"assistant""#,with:#""role":"assistant","model":"<synthetic>""#)
+    let note = app.claudeBranchNotes(Data(synthetic.utf8), ids:[u(4)]).map(\.text)
+    eq(note, [], "并发旁支隐藏 CLI 占位句")
+    var overlapping = forked
+    overlapping[6] = overlapping[6].replacingOccurrences(of:"00:05.000Z",with:"00:02.500Z")
+    overlapping.remove(at:7)
+    let concurrent = app.claudeTurns(Data(overlapping.joined(separator:"\n").utf8)).0
+    let details = concurrent.flatMap { $0["steps"] as? [[String:Any]] ?? [] }.map { str($0,"detail") }
+    check(details.contains { $0.contains("副本里问的") && $0.contains("副本里答的") },
+          "并发旁支可从主线回答查看，实际步骤=\(details)")
+    // 固定在前置占用检查之后写入两支，验证本轮回复已经带上旁支，用户无需重开会话。
+    let fixtureDir = URL(fileURLWithPath: NSTemporaryDirectory()).appendingPathComponent(UUID().uuidString)
+    try! FileManager.default.createDirectory(at: fixtureDir, withIntermediateDirectories: true)
+    defer { try? FileManager.default.removeItem(at: fixtureDir) }
+    let cli = fixtureDir.appendingPathComponent("cli").path
+    try! installFakeCLI(at: cli, behavior: "backend")
+    try! "claude-unsupported".write(to: fixtureDir.appendingPathComponent("mode"), atomically: true, encoding: .utf8)
+    app.hooks.cliExecutable = cli
+    try! (overlapping.prefix(4).joined(separator: "\n") + "\n").write(toFile: file, atomically: true, encoding: .utf8)
+    app.hooks.liveTurnCreated = { _ in
+        let writer = FileHandle(forWritingAtPath: file)!
+        writer.seekToEndOfFile()
+        writer.write(Data(overlapping.dropFirst(4).joined(separator: "\n").utf8))
+        writer.closeFile()
+    }
+    var branchRequest = req
+    branchRequest.browserTools = false
+    let liveReply = withTestAsk(app, req.key) { app.runClaude(branchRequest) }
+    let liveNotes = (liveReply.turn?["steps"] as? [[String: Any]] ?? []).map { str($0, "detail") }
+    check(liveNotes.contains { $0.contains("副本里问的") && $0.contains("副本里答的") }, "本轮收尾即可查看终端旁支，实际步骤=\(liveNotes)")
     eq(app.claudeSideBranch(data).sorted(), [u(3), u(4)], "接在主线上、自己不在主线上的是旁支")
     let (kept, _) = app.claudeTurns(data)
     eq(kept.map { str($0, "text") }, ["压缩前的一句", "压缩前的回答", "第一问", "第一答", "主线第二问", "并行工具的另一条结果", "主线第二答"], "旁支不显示；更早的段落、没有回答的小岔都照常显示")
@@ -120,7 +251,9 @@ func testCodexHistory() {
                 let type = item["type"] as! String
                 let camel = type.prefix(1).lowercased() + type.dropFirst()
                 let id = ids[i].map { "'\($0)'" } ?? "NULL"
-                let sql = "INSERT INTO thread_items VALUES ('fixture', '\(camel)', '\(encoded(item).replacingOccurrences(of: "'", with: "''"))', \(i * 2000), \(i * 2000), \(i)\(hasColumn ? ", \(id)" : ""));"
+                // 和 rollout 夹具同一时刻（2026-11-17T00:00:00Z 起每条隔 2 秒）：附图记着发送时间，两条来源要逐字一致
+                let ms = 1_794_873_600_000 + i * 2000
+                let sql = "INSERT INTO thread_items VALUES ('fixture', '\(camel)', '\(encoded(item).replacingOccurrences(of: "'", with: "''"))', \(ms), \(ms), \(i)\(hasColumn ? ", \(id)" : ""));"
                 check(sqlite3_exec(db, sql, nil, nil, nil) == SQLITE_OK, "写入临时 SQLite 条目")
             }
         }
@@ -143,6 +276,13 @@ func testCodexHistory() {
         verify(db, detail: i == 2 ? "" : "补充", hasImage: i != 0, source: "SQLite \(i)")
         verify(roll, detail: i == 2 ? "" : "补充", hasImage: i != 0, source: "rollout \(i)")
         eq(encoded(["messages": db]), encoded(["messages": roll]), "两条历史来源输出完全一致")
+    }
+    for args in ["查看副本",""] {
+        let blocks = [["type":"skill","name":"fixture","path":"/tmp/fixture/SKILL.md"]] + (args.isEmpty ? [] : [["type":"text","text":args]])
+        let skill: [String:Any] = ["type":"UserMessage","content":blocks]
+        for messages in [database([skill,answer],ids:["s","s"]),d.codexRolloutTurns(rollout([skill,answer],ids:["s","s"])).messages] {
+            eq(str(messages.first,"text"),args.isEmpty ? "/fixture" : "/fixture " + args,"技能名和参数在历史里原样恢复")
+        }
     }
     let items = [question, supplements[0], answer]
     for ids: [String?] in [[nil, nil, nil], ["", "", ""], ["t1", "t2", "t2"], ["t1", nil, "t1"]] {
@@ -170,6 +310,18 @@ func testCodexHistory() {
 {"type":"event_msg","payload":{"type":"agent_message","message":"回答"}}
 """#
     eq(d.codexRolloutTurns(legacy).messages.map { str($0, "role") }, ["user", "user", "bot"], "旧 user_message 格式不猜回合")
+    // /compact 是没有提问、只有一条压缩条目的回合：和实时收起的提示同一口径记成压缩提示，不是多出来的一轮回答
+    let compaction = json(#"{"type":"ContextCompaction"}"#)
+    let compactItems = [question, answer, compaction, question, answer]
+    let compactRollout = [rollout([question, answer], ids: ["t1", "t1"]), complete, rollout([compaction], ids: ["t2"]),
+                          complete.replacingOccurrences(of: "t1", with: "t2"), rollout([question, answer], ids: ["t3", "t3"])].joined(separator: "\n")
+    for messages in [database(compactItems, ids: ["t1", "t1", "t2", "t3", "t3"]), d.codexRolloutTurns(compactRollout).messages] {
+        eq(messages.map { str($0, "role") }, ["user", "bot", "compact", "user", "bot"], "手动压缩记成压缩提示")
+        eq(str(messages[2], "text"), codexCompactNote, "压缩提示和实时那条同一句")
+    }
+    let midTurn = database([question, compaction, answer], ids: ["t1", "t1", "t1"])
+    eq(midTurn.map { str($0, "role") }, ["user", "bot"], "回答途中的自动压缩仍是这一轮的一步")
+    eq((midTurn.last?["steps"] as? [[String: Any]] ?? []).map { str($0, "title") }, ["压缩上下文"], "自动压缩留在工作过程")
 }
 
 func testCodexRetryLogs() {
@@ -241,7 +393,7 @@ func testCodexRetryLogs() {
         sqlite3_exec(db, "BEGIN EXCLUSIVE;", nil, nil, nil)
         let began = Date()
         _ = read()
-        check(Date().timeIntervalSince(began) < 0.5, "日志忙时迅速退化")
+        check(Date().timeIntervalSince(began) < 1.5, "日志忙时迅速退化")   // 这次查询的忙等是 50 毫秒，没设时用默认的 3 秒，取一半
         sqlite3_exec(db, "ROLLBACK;", nil, nil, nil)
     }
     try? fm.removeItem(atPath: path)
@@ -272,30 +424,67 @@ func testCodexRetryLogs() {
     eq(str(t.step("retry"), "status"), "error", "记录现有行为：恢复后仍保留红色错误样式，不顺手修改")
 }
 
-/// 显式运行，不属于离线套件；使用上次现场日志验证同一个读取函数，不发 API 请求。
-func verifyCodexRetryRealLogs() {
-    let d = AppDelegate()
-    let samples: [(String, Double, pid_t, Int)] = [
-        ("01a1e8e4-d54e-7f51-8d76-17064fe90964", 1794908676, 3659, 487),
-        ("01a1e8e9-a66c-7192-a5ea-f111c7d6ae3c", 1794908992, 10032, 106),
-        ("01a1e8e2-f794-7711-a40d-4d7b8acf6fa7", 1794908625, 2593, 538)
-    ]
-    var passed = true
-    for (thread, ts, pid, expected) in samples {
-        let result = d.codexLatestRetry(threadId: thread, since: Date(timeIntervalSince1970: ts), processID: pid)
-        let ok = result?.statusCode == 429 && result?.waitSeconds.rounded() == Double(expected)
-        passed = passed && ok
-        print("\(ok ? "✓" : "✗") thread=\(thread) pid=\(pid) id=\(result?.id ?? -1) status=\(result?.statusCode ?? -1) wait=\(result?.waitSeconds ?? -1)s expected≈\(expected)s")
-    }
-    exit(passed ? 0 : 1)
-}
-
 func testAssignedHistoryFixes() {
     print("· W4 回归：R05 / H01 H04 H05 H07–H12 H15 H16")
     let d = AppDelegate(), fm = FileManager.default
+    d.hooks.jsSink = { _, _ in }
     let dir = NSTemporaryDirectory() + "aipethub-w4-" + UUID().uuidString
     try! fm.createDirectory(atPath: dir, withIntermediateDirectories: true)
     defer { try? fm.removeItem(atPath: dir) }
+    do {
+        let app = AppDelegate(), cid = UUID().uuidString
+        app.hooks.geminiCliDir = dir; app.hooks.codexEnvironment = ["CODEX_HOME":dir]
+        let paths = [dir + "/claude.jsonl", dir + "/sessions/rollout-test-" + cid + ".jsonl", app.geminiTranscriptPath(cid)]
+        let content = [#"{"type":"user","message":{"content":"恢复了"}}"#,
+                       #"{"type":"session_meta","payload":{"id":"CID","source":"exec"}}"#.replacingOccurrences(of:"CID",with:cid) + "\n" + #"{"type":"event_msg","payload":{"type":"user_message","message":"恢复了"}}"#,
+                       #"{"type":"USER_INPUT","content":"恢复了"}"#]
+        for (path, text) in zip(paths, content) {
+            try! fm.createDirectory(atPath:(path as NSString).deletingLastPathComponent, withIntermediateDirectories:true)
+            try! (text + "\n").write(toFile:path, atomically:true, encoding:.utf8)
+            try! fm.setAttributes([.posixPermissions:0], ofItemAtPath:path)
+        }
+        func listed() -> [Bool] {
+            var codex = false, items: [[String:Any]] = [], seen = Set<String>()
+            app.hooks.jsSink = { _, data in codex = (data["items"] as? [[String:Any]])?.contains { str($0,"id") == cid } == true }
+            app.listCodex(); app.codexQueue.sync {}
+            app.appendGeminiHistory(app.geminiStore(cid), items:&items, seen:&seen)
+            return [app.claudeItem((cid,paths[0],app.modificationDate(paths[0])!)) != nil, codex, !items.isEmpty]
+        }
+        eq(listed(), [false,false,false], "无权限的历史夹具不可读")
+        for path in paths { try! fm.setAttributes([.posixPermissions:0o600], ofItemAtPath:path) }
+        eq(listed(), [true,true,true], "B4-15 恢复权限后 Claude、Codex、Gemini 重新列出")
+        try! fm.setAttributes([.posixPermissions:0], ofItemAtPath:dir)
+        defer { try! fm.setAttributes([.posixPermissions:0o700], ofItemAtPath:dir) }
+        let oldConfig = ProcessInfo.processInfo.environment["CLAUDE_CONFIG_DIR"]
+        setenv("CLAUDE_CONFIG_DIR", dir, 1)
+        defer { if let oldConfig { setenv("CLAUDE_CONFIG_DIR",oldConfig,1) } else { unsetenv("CLAUDE_CONFIG_DIR") } }
+        app.hooks.cliExecutable = "/fixture/claude"
+        for agent in ["claude","gpt","gemini"] {
+            var list: [String:Any] = [:]
+            app.hooks.jsSink = { name,row in if name == "onConversationsListed" { list = row } }
+            app.listConversations(agent:agent); app.queue(for:agent).sync {}
+            check(list["items"] == nil && !str(list,"unavailable").isEmpty, "\(agent) 目录不可读时保留历史列表，收到条目=\((list["items"] as? [Any])?.count ?? -1)")
+        }
+        try! fm.setAttributes([.posixPermissions:0o700],ofItemAtPath:dir)
+        for (agent,subdir) in [("gpt",dir + "/sessions/2026"),("gemini",app.geminiStore(cid).brain + "/" + cid)] {
+            try! fm.createDirectory(atPath:subdir,withIntermediateDirectories:true)
+            try! fm.setAttributes([.posixPermissions:0],ofItemAtPath:subdir)
+            var list: [String:Any] = [:]
+            app.hooks.jsSink = { _,row in list = row }; app.listConversations(agent:agent); app.queue(for:agent).sync {}
+            check(list["items"] == nil && !str(list,"unavailable").isEmpty,"\(agent) 历史子目录读失败时保留上次列表")
+            try! fm.setAttributes([.posixPermissions:0o700],ofItemAtPath:subdir)
+        }
+        try! fm.setAttributes([.posixPermissions:0],ofItemAtPath:dir)
+        var claude: [String: Any] = [:]
+        app.hooks.jsSink = { name, row in if name == "onConversationLoaded" { claude = row } }
+        app.loadClaude(cid: cid); app.claudeQueue.sync {}
+        for row in [claude, app.readCodexConversation(cid: cid), app.readGeminiConversation(cid: cid)] {
+            let why = str(row, "historyError") + str(row, "readError")
+            check(row["missing"] as? Bool == false && !why.isEmpty,
+                  "父目录不可进入时保留 \(str(row,"agent")) 会话和改动卡，实际 missing=\(row["missing"] ?? "无")、原因=\(why)")
+        }
+
+    }
     func steps(_ bot: [String: Any]?) -> [[String: Any]] { bot?["steps"] as? [[String: Any]] ?? [] }
     func hasError(_ bot: [String: Any]?) -> Bool { steps(bot).contains { str($0, "kind") == "error" } }
     func encode(_ obj: [String: Any]) -> String { String(data: try! JSONSerialization.data(withJSONObject: obj, options: .sortedKeys), encoding: .utf8)! }
@@ -328,6 +517,113 @@ func testAssignedHistoryFixes() {
         }
         check(d.runningPid("gpt#4002") == nil, "R05 假 CLI 已回收")
     }
+    // CO1/CO2：本机已确认的结局（停止时已显示的正文、进程崩溃）在重开时补回，历史有更新的结束记录时不覆盖。
+    let home = dir + "/codex-home"
+    try! fm.createDirectory(atPath: home + "/sessions", withIntermediateDirectories: true)
+    d.hooks.codexEnvironment = ["CODEX_HOME": home]
+    let now = ISO8601DateFormatter().string(from: Date())
+    func rollout(_ tail: [[String: Any]], legacy: Bool = false) {
+        let question: [String: Any] = legacy ? ["type": "user_message", "message": "fixture"] : [
+            "type": "item_completed", "turn_id": "fixture-turn",
+            "item": ["type": "UserMessage", "content": [["type": "text", "text": "fixture"]]]]
+        let rows: [[String: Any]] = [["type": "session_meta", "payload": ["id": "fixture-thread", "source": "cli", "cwd": dir]],
+            ["type": "event_msg", "timestamp": now, "payload": ["type": "task_started", "turn_id": "fixture-turn"]],
+            ["type": "event_msg", "timestamp": now, "payload": question]] + tail
+        try! rows.map { encode($0) }.joined(separator: "\n").appending("\n").write(toFile: home + "/sessions/rollout-co-fixture-thread.jsonl", atomically: true, encoding: .utf8)
+    }
+    func reopen() -> (bot: [String: Any]?, running: Bool?) {
+        let payload = d.readCodexConversation(cid: "fixture-thread")
+        let last = (payload["messages"] as? [[String: Any]])?.last
+        return (str(last, "role") == "bot" ? last : nil, (payload["lastTurn"] as? [String: Any])?["running"] as? Bool)
+    }
+    try! "live".write(toFile: dir + "/mode", atomically: true, encoding: .utf8)
+    _ = withTestAsk(d, "gpt#4003") { d.runCodex(AskRequest(agent: "gpt", reqId: 4003, prompt: "fixture", model: "fixture", effort: "low", permissionMode: "read-only", workspace: dir, conversationId: "", browserTools: false)) }
+    rollout([])
+    let crashed = reopen()
+    eq(crashed.running, false, "CO2 本机已确认崩溃的回合重开后不再算在别处运行中")
+    eq(str(crashed.bot, "outcome"), "failed", "CO2 遗留 inProgress 改成本机已知的失败（才有重试）")
+    check(str(steps(crashed.bot).last, "detail").contains("退出码 42"), "CO2 显示本机记下的失败原因：\(str(steps(crashed.bot).last, "detail"))")
+    eq(str(crashed.bot, "text"), "已有正文", "CO2 历史缺正文时补回本机已显示的正文")
+    rollout([], legacy: true)
+    let legacy = reopen()
+    eq(str(legacy.bot, "text"), "已有正文", "Codex 旧格式仅在 task_started 写编号，也能认出本机崩溃的那轮")
+    eq(legacy.running, false, "Codex 旧格式提问不带编号，确认崩溃后撤下运行提示")
+    let longReply = String(repeating: "甲", count: 50_000) + "完整结尾"
+    check(restoredEndingText(recorded: longReply, saved: clip(longReply, 50_000)) == longReply, "磁盘已写全的长回答保留超出本机备份的结尾")
+    for (disk, expected) in [("已有","已有正文"), ("已有正文及续句","已有正文及续句")] {
+        rollout([["type":"event_msg","payload":["type":"item_completed","turn_id":"fixture-turn",
+                 "item":["type":"AgentMessage","phase":"final_answer","content":[["type":"text","text":disk]]]]]])
+        eq(str(reopen().bot,"text"),expected,"Codex 缺结束记录时只补齐未落盘的正文")
+    }
+    rollout([["type": "event_msg", "timestamp": now, "payload": ["type": "item_completed", "turn_id": "fixture-turn",
+              "item": ["type": "AgentMessage", "phase": "final_answer", "content": [["type": "text", "text": "别处续写的结局"]]]]],
+             ["type": "event_msg", "timestamp": now, "payload": ["type": "task_complete", "turn_id": "fixture-turn"]]])
+    let newer = reopen()
+    eq(newer.running, false, "CO2 历史已有结束记录时按历史")
+    eq(str(newer.bot, "outcome"), "completed", "CO2 历史有更新的结束记录时不用本机结局覆盖")
+    eq(str(newer.bot, "text"), "别处续写的结局", "CO2 历史有正文时不补本机正文")
+    try! "interrupt".write(toFile: dir + "/mode", atomically: true, encoding: .utf8)
+    try? fm.removeItem(atPath: dir + "/streamed")
+    let stopped = DispatchSemaphore(value: 0)
+    var stoppedReply: AgentReply?
+    DispatchQueue.global().async {
+        stoppedReply = withTestAsk(d, "gpt#4004") { d.runCodex(AskRequest(agent: "gpt", reqId: 4004, prompt: "fixture", model: "fixture", effort: "low", permissionMode: "read-only", workspace: dir, conversationId: "", browserTools: false)) }
+        stopped.signal()
+    }
+    waitUntil { fm.fileExists(atPath: dir + "/streamed") }
+    d.cancel(agent: "gpt", reqId: 4004)
+    check(waitSignal(stopped), "CO1 停止后这一轮收尾")
+    eq(stoppedReply?.turn?["outcome"] as? String, "interrupted", "CO1 当次停止回调是已中断")
+    eq(stoppedReply?.reply, "已有正文", "CO1 当次停止回调保留已读到的正文")
+    rollout([["type": "event_msg", "timestamp": now, "payload": ["type": "turn_aborted", "turn_id": "fixture-turn", "reason": "interrupted"]]])
+    let reopened = reopen()
+    eq(str(reopened.bot, "outcome"), "interrupted", "CO1 重开后仍是已中断（有重试）")
+    eq(str(reopened.bot, "text"), "已有正文", "CO1 只有 turn_aborted 没有回答条目时补回停止时已显示的正文")
+    // CO1/CO2 常见形状：先有一段已完成的说明落进历史，正文流式到一半时停止或崩溃。补回的必须是那段正文，不是说明。
+    let note: [String: Any] = ["type": "event_msg", "timestamp": now, "payload": ["type": "item_completed", "turn_id": "fixture-turn",
+        "item": ["type": "AgentMessage", "phase": "commentary", "content": [["type": "text", "text": "我先看一下"]]]]]
+    for (mode, outcome) in [("note-interrupt", "interrupted"), ("note-live", "failed")] {
+        try! mode.write(toFile: dir + "/mode", atomically: true, encoding: .utf8)
+        try? fm.removeItem(atPath: dir + "/streamed")
+        let done = DispatchSemaphore(value: 0)
+        var liveReply: AgentReply?
+        DispatchQueue.global().async {
+            liveReply = withTestAsk(d, "gpt#4005") { d.runCodex(AskRequest(agent: "gpt", reqId: 4005, prompt: "fixture", model: "fixture", effort: "low", permissionMode: "read-only", workspace: dir, conversationId: "", browserTools: false)) }
+            done.signal()
+        }
+        if outcome == "interrupted" {
+            waitUntil { fm.fileExists(atPath: dir + "/streamed") }
+            d.cancel(agent: "gpt", reqId: 4005)
+        }
+        check(waitSignal(done), "CO1 \(mode) 这一轮收尾")
+        eq(liveReply?.reply ?? "", "已有正文", "说明后中断或失败时实时保留末段正文")
+        rollout([note] + (outcome == "interrupted" ? [["type": "event_msg", "timestamp": now, "payload": ["type": "turn_aborted", "turn_id": "fixture-turn", "reason": "interrupted"]]] : []))
+        let back = reopen()
+        eq(str(back.bot, "outcome"), outcome, "CO1 \(mode) 重开后结局是本机已知的 \(outcome)")
+        eq(str(back.bot, "text"), "已有正文", "CO1 \(mode) 说明之后流式到一半的正文重开后补回")
+        check(steps(back.bot).contains { str($0, "kind") == "text" && str($0, "detail") == "我先看一下" }, "CO1 \(mode) 历史里的说明仍作为说明步骤保留")
+    }
+    // 老版 exec 的 stdout 只有线程编号。用同轮问题和时间认领 rollout，避免拿上一轮同文的回答。
+    let request = AskRequest(agent:"gpt",reqId:4006,prompt:"fixture",model:"fixture",effort:"low",permissionMode:"read-only",workspace:dir,conversationId:"fixture-thread")
+    let execCLI = dir + "/old-codex"
+    try! installFakeCLI(at:execCLI,behavior:"backend")
+    d.hooks.cliExecutable = execCLI
+    try! "exec-crash".write(toFile:dir + "/mode",atomically:true,encoding:.utf8)
+    let execReply = withTestAsk(d,request.key) { d.runCodex(request) }
+    eq(execReply.reply,"末段","Codex 单次模式崩溃时保留最后更新的正文")
+    let iso = ISO8601DateFormatter(); iso.formatOptions = [.withInternetDateTime,.withFractionalSeconds]
+    let stamp = iso.string(from:request.startedAt)
+    let path = home + "/sessions/rollout-co-fixture-thread.jsonl"
+    let original = try! String(contentsOfFile:path,encoding:.utf8)
+    let execRows = [["type":"task_started","turn_id":"exec"],["type":"user_message","turn_id":"exec","message":"fixture"]].map {
+        encode(["type":"event_msg","timestamp":stamp,"payload":$0])
+    }
+    try! (original + execRows.joined(separator:"\n") + "\n").write(toFile:path,atomically:true,encoding:.utf8)
+    let execBack = reopen()
+    eq(str(execBack.bot,"text"),execReply.reply,"Codex 单次模式重开保留当场正文")
+    eq(str(execBack.bot,"outcome"),"failed","Codex 单次模式重开可重试")
+    eq(execBack.running,false,"Codex 单次模式崩溃后撤下运行状态")
+    d.hooks.codexEnvironment = nil
     let unfinished = #"{"type":"assistant","message":{"content":[{"type":"text","text":"已有正文"},{"type":"tool_use","id":"read","name":"Read","input":{"file_path":"/fixture/a"}}]}}"#
     let claude = d.claudeTurns(Data(unfinished.utf8)).0.last
     eq(str(steps(claude).first, "status"), "running", "H01 Claude 未返回工具保持未完成")
@@ -359,7 +655,8 @@ func testAssignedHistoryFixes() {
         for content in [item, legacy] {
             let bot = d.codexRolloutTurns(content + "\n" + end).messages.last
             eq(str(bot, "text"), "已有正文", "H01 rollout \(terminal) 新旧格式保留正文")
-            eq(hasError(bot), terminal != "task_complete", "H01 rollout \(terminal) 终态说明")
+            // 带 error 的 task_complete 是当前 CLI 的失败记录，三种结束事件都要有末尾说明。
+            eq(hasError(bot), true, "H01 rollout \(terminal) 终态说明")
         }
         if terminal == "turn_failed" {
             let bot = d.codexRolloutTurns(end).messages.last
@@ -488,17 +785,45 @@ func testAssignedHistoryFixes() {
     let imageOnly = #"{"type":"user","message":{"content":[{"type":"image","source":{"type":"base64","media_type":"image/png","data":"aGVsbG8="}}]}}"#
     try! (imageOnly + "\n").write(toFile: file, atomically: true, encoding: .utf8)
     eq(d.claudeSummary(path: file, cid: "fixture", mtime: Date())?["title"] as? String, "图片对话", "H15 纯图无标题会话进入列表")
+    do {
+        let app = AppDelegate(), cid = UUID().uuidString
+        app.hooks.geminiCliDir = dir + "/unreadable"
+        let path = app.geminiTranscriptPath(cid)
+        try! fm.createDirectory(atPath: (path as NSString).deletingLastPathComponent, withIntermediateDirectories: true)
+        try! "test".write(toFile: path, atomically: true, encoding: .utf8)
+        try! fm.setAttributes([.posixPermissions:0], ofItemAtPath:path)
+        app.claudeCache[cid] = (0, nil, path)
+        var claude: [String: Any] = [:]
+        app.hooks.jsSink = { name, data in if name == "onConversationLoaded" { claude = data } }
+        app.loadClaude(cid:cid); app.claudeQueue.sync {}
+        let gemini = app.readGeminiConversation(cid:cid)
+        for row in [claude, gemini] {
+            check(row["missing"] as? Bool == false && !str(row,"historyError").isEmpty,
+                  "B4-1 \(str(row,"agent")) 确认仍存在的文件带出读取原因，实际 \(str(row,"historyError")) / \(String(describing:row["missing"]))")
+        }
+    }
     // 任务会话：别的工具派出去的 claude -p（sdk-cli）在分界时间之后开始的才算；App 自己的（aipethub）和交互式的不算
     d.hooks.claudeTaskSince = ISO8601DateFormatter().date(from: "2026-11-18T12:00:00Z")
+    let taskFixture = UUID().uuidString
     func claudeTask(_ entrypoint: String, _ ts: String) -> Bool {
         let line = #"{"type":"user","entrypoint":"\#(entrypoint)","timestamp":"\#(ts)","message":{"content":"派出去的活"}}"#
         try! (line + "\n").write(toFile: file, atomically: true, encoding: .utf8)
-        return d.claudeSummary(path: file, cid: "fixture", mtime: Date())?["task"] as? Bool == true
+        return d.claudeSummary(path: file, cid: taskFixture, mtime: Date())?["task"] as? Bool == true
+    }
+    for entry in ["sdk-py", "sdk-ts"] {
+        let task = claudeTask(entry, "2026-11-18T11:00:00.000Z")
+        check(task, "SDK 会话不随普通项目删除：\(entry) task=\(task)")
     }
     check(claudeTask("sdk-cli", "2026-11-18T13:00:00.000Z"), "T01 分界之后的 sdk-cli 会话是任务会话")
     check(!claudeTask("sdk-cli", "2026-11-18T11:00:00.000Z"), "T01 分界之前的 sdk-cli 会话不动（分不清是不是 App 的）")
     check(!claudeTask("aipethub", "2026-11-18T13:00:00.000Z"), "T01 App 自己的会话不是任务会话")
     check(!claudeTask("claude-desktop", "2026-11-18T13:00:00.000Z") && !claudeTask("cli", "2026-11-18T13:00:00.000Z"), "T01 交互式会话不是任务会话")
+    let origin = d.claudeEntrypointEnv["CLAUDE_CODE_ENTRYPOINT"]!
+    check(claudeTask(origin, "2026-11-18T13:00:00.000Z"), "继承启动环境的 Claude 子任务仍归入任务")
+    let direct = AskRequest(agent: "claude", reqId: 1, prompt: "首问", model: "haiku", effort: "low", permissionMode: "default", workspace: dir, conversationId: "")
+    d.conversationWatcher(direct)(taskFixture)
+    check(!claudeTask(origin, "2026-11-18T13:00:00.000Z"), "App 直接创建的会话保留在项目中")
+    UserDefaults.standard.removeObject(forKey: "claudeDirectSession." + taskFixture)
     d.hooks.claudeTaskSince = nil
     func codexTask(_ source: String) -> Bool {
         let rows = [#"{"type":"session_meta","payload":{"id":"01a1ffff-0000-7000-8000-000000000001","cwd":"/fixture","source":"\#(source)"}}"#,

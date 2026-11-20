@@ -1,4 +1,12 @@
 // 可见文字的磁盘层：读取不等待后台写入，文件原子替换，失效仍交给内存层和会话摘要复核。
+//
+// 可见文字先查内存（上限 96 MiB），再查 `~/Library/Caches/AIPetHub/ConversationSearch`（上限 256 MiB，按最久未使用淘汰）；
+// 后台合并并原子写入，搜索不等待写盘。
+// 两层均核对来源的修改时间、大小（含 SQLite WAL）、本机保留的失败或中断记录，以及引用文件、图片依赖；共享 Codex 数据库变化时，再用本会话原始字段的 SHA256 摘要复核，
+// 避免无关写入导致重算。
+// 磁盘缓存另校验格式版本、渲染规则版本和内容摘要，损坏或版本不符时静默丢弃重算。
+// 改变可见文字规则时须递增 `ConversationSearchText.version`，改变缓存格式时递增 `ConversationSearchDiskCache.formatVersion`；
+// 自测始终使用临时缓存目录。
 import Foundation
 import CryptoKit
 

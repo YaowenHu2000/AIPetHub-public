@@ -1,4 +1,4 @@
-/* ===== 左栏：三格历史会话 ===== */
+/* ===== 左栏：历史会话，每位一格 ===== */
 #history-sidebar { width: var(--sidebar-w); flex-shrink: 0; display: flex; flex-direction: column; background: var(--bg-sidebar); }
 body.sidebar-hidden #history-sidebar, body.sidebar-hidden #resize-sidebar { display: none; }
 .sidebar-top { height: 44px; flex-shrink: 0; display: flex; align-items: center; justify-content: flex-end; padding: 0 8px 0 max(10px, var(--lights)); }   /* 左边让开红绿灯（全屏时没有，见 base.css 的 --lights） */

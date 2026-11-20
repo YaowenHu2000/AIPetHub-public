@@ -1,4 +1,4 @@
-/* ===== 右栏：三位 AI 娘 ===== */
+/* ===== 右栏：启用的几位 AI 娘 ===== */
 body.stage-squeezed #stage-column, body.stage-squeezed #resize-stage { display: none; }   /* 窗口太窄时自动收起舞台 */
 body.stage-hidden #stage-column, body.stage-hidden #resize-stage { display: none; }       /* 自己收起来的（顶栏右边的开关，或把分隔条一直往右拖） */
 body.stage-hidden .btn-stage-toggle { color: var(--text-muted); }

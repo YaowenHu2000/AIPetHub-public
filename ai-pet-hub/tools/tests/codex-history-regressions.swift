@@ -57,6 +57,25 @@ func testCodexProjectionFreshness() {
         INSERT INTO thread_turns VALUES('time-test','empty','inProgress','null',1794985212,NULL,1,NULL);
         INSERT INTO thread_turns VALUES('time-test','ended','failed','null',1794985300,1794985307,2,3);
         """)
+    try! fm.setAttributes([.posixPermissions:0], ofItemAtPath:database)
+    let unreadable = app.readCodexConversation(cid:"time-test")
+    check(unreadable["missing"] as? Bool == false && !str(unreadable,"readError").isEmpty,
+          "投影暂不可读仍保留会话，实际 missing=\(unreadable["missing"] ?? "无")，原因=\(str(unreadable,"readError"))")
+    try! fm.setAttributes([.posixPermissions:0o600], ofItemAtPath:database)
+    let day = root + "/sessions/2026"
+    try! fm.createDirectory(atPath:day, withIntermediateDirectories:true)
+    let hidden = day + "/rollout-fixture-hidden.jsonl"
+    try! prefix.write(toFile:hidden, atomically:true, encoding:.utf8)
+    exec(state, "INSERT INTO threads VALUES('hidden','',\(quote(hidden)));")
+    try! fm.setAttributes([.posixPermissions:0], ofItemAtPath:day)
+    let noRollout = app.readCodexConversation(cid:"hidden")
+    check(noRollout["missing"] as? Bool == false && !str(noRollout,"readError").isEmpty,
+          "已索引的正文目录不可进入时说明原因，实际「\(str(noRollout,"readError"))」")
+    try! fm.setAttributes([.posixPermissions:0o700], ofItemAtPath:day)
+    app.hooks.codexKnownEndings = ["ended":["outcome":"failed","compact":true]]
+    let compact = app.readCodexConversation(cid:"time-test")["messages"] as? [[String:Any]]
+    eq(str(compact?.last,"retryPrompt"), "/compact", "重开已知的手动压缩保留命令")
+    app.hooks.codexKnownEndings = [:]
     let placeholders = app.readCodexProjection("time-test").items
     eq(placeholders.map(\.created), [1794985212000, 1794985300000], "空回合的秒级开始时间统一为毫秒")
     eq(placeholders.map(\.completed), [1794985212000, 1794985307000], "空回合结束时间统一为毫秒，NULL 退回开始")
@@ -71,10 +90,65 @@ func testCodexProjectionFreshness() {
     func output(_ messages: [[String: Any]]) -> String {
         messages.flatMap { $0["steps"] as? [[String: Any]] ?? [] }.first { str($0, "kind") == "command" }?["output"] as? String ?? ""
     }
+    let reader = root + "/codex"
+    try! installFakeCLI(at: reader, behavior: "backend")
+    app.hooks.cliExecutable = reader
+    for field in ["history_base", "forked_from_id"] {
+        let value: Any = field == "history_base" ? ["thread_id": cid, "end_ordinal_exclusive": 1] as Any : cid as Any
+        write(encoded(["type": "session_meta", "payload": ["id": cid, field: value]]) + "\n" + event(question))
+        let effective = load()
+        eq(str(effective.first, "turnKey"), "t", "同步沿用有效历史的回合编号")
+        eq(effective.map { str($0, "text") }, ["有效提问", "有效回答"], "B3-3 \(field) 按 thread/read 的有效历史显示")
+    }
+    // 另起的只读 app-server 把别的客户端正在写的末轮报成 interrupted；写锁被占、rollout 里这一轮又没有结束事件时仍在别处运行。
+    try! "read-interrupted".write(toFile: root + "/mode", atomically: true, encoding: .utf8)
+    let locks = root + "/thread-writer-locks", lockFile = locks + "/" + cid + ".lock"
+    try! fm.createDirectory(atPath: locks, withIntermediateDirectories: true)
+    fm.createFile(atPath: lockFile, contents: nil)
+    let holder = open(lockFile, O_RDONLY)
+    check(holder >= 0 && flock(holder, LOCK_EX) == 0, "夹具占住 Codex 写锁")
+    let forkHead = encoded(["type": "session_meta", "payload": ["id": cid, "forked_from_id": cid]]) + "\n"
+    let forkStarted = encoded(["type": "event_msg", "payload": ["type": "task_started", "turn_id": "t"]]) + "\n"
+    let aborted = encoded(["type": "event_msg", "payload": ["type": "turn_aborted", "turn_id": "t"]]) + "\n"
+    func lastState(_ rollout: String) -> String {
+        write(rollout)
+        let read = app.readCodexConversation(cid: cid)
+        let running = (read["lastTurn"] as? [String: Any])?["running"] as? Bool
+        return "\(running.map(String.init) ?? "无")|\(str((read["messages"] as? [[String: Any]])?.last, "outcome"))"
+    }
+    eq(lastState(forkHead + forkStarted), "true|incomplete", "分叉会话的末轮正被别处写入：在别处运行中，不显示已中断")
+    eq(lastState(forkHead + forkStarted + aborted), "false|interrupted", "分叉会话末轮已写下中断事件：写锁仍被占也按已中断")
+    // 分叉在别的客户端里空闲开着也占写锁。末轮还是父会话的那一轮时，它的开始和结束都不属于这个分叉：
+    // 用户分叉（history_base）的 rollout 里根本没有这一轮；复制父历史的分叉（现行 forked_from_id 分叉也是）只带着开始早于分叉的 task_started。
+    eq(lastState(forkHead), "false|interrupted", "分叉还没开新回合：继承的已中断末轮不因空闲客户端占着写锁改成在别处运行")
+    let stampedHead = encoded(["type": "session_meta", "payload": ["id": cid, "forked_from_id": "parent", "timestamp": "2026-11-17T00:00:10.420Z"]]) + "\n"
+    let parentHead = encoded(["type": "session_meta", "payload": ["id": "parent", "timestamp": "2026-11-17T00:00:01.000Z"]]) + "\n"
+    func started(_ at: Int) -> String { encoded(["type": "event_msg", "payload": ["type": "task_started", "turn_id": "t", "started_at": at]]) + "\n" }
+    eq(lastState(stampedHead + parentHead + started(1794873605)), "false|interrupted", "复制来的父会话末轮开始早于分叉：仍按已中断")
+    eq(lastState(stampedHead + parentHead + started(1794873610)), "true|incomplete", "分叉自己开的末轮（与分叉同一秒开始）仍在别处运行")
+    flock(holder, LOCK_UN); close(holder)
+    eq(lastState(forkHead + forkStarted), "false|interrupted", "分叉会话写锁已释放、没有结束事件：按 Codex 的判定显示已中断")
+    try? fm.removeItem(atPath: locks)
+    try? fm.removeItem(atPath: root + "/mode")
+    app.hooks.cliExecutable = nil
     write(full)
     try! fm.setAttributes([.modificationDate: Date(timeIntervalSince1970: 1)], ofItemAtPath: path)
+    exec(state, "ALTER TABLE threads ADD COLUMN archived INTEGER DEFAULT 0; UPDATE threads SET archived=1;")
+    eq(app.readCodexConversation(cid: cid)["missing"] as? Bool, true, "B3-4 已归档的线程仍有投影也按不存在处理")
+    exec(state, "UPDATE threads SET archived=0;")
+    exec(state, "DELETE FROM threads WHERE id=\(quote(cid));")
+    let archivedDir = root + "/archived_sessions", archivedFile = archivedDir + "/" + (path as NSString).lastPathComponent
+    try! fm.createDirectory(atPath:archivedDir, withIntermediateDirectories:true)
+    for restore in [false,true] {
+        try! fm.moveItem(atPath:restore ? archivedFile : path, toPath:restore ? path : archivedFile)
+        let missing = app.readCodexConversation(cid:cid)["missing"] as? Bool
+        let found = app.searchSources(agent:"gpt", files:nil).sources.contains { $0.cid == cid }
+        check(missing == !restore && found == restore, "Codex 无索引 rollout 归档后仍有正文投影，恢复=\(restore) missing=\(String(describing:missing)) 搜索=\(found)")
+    }
+    exec(state, "INSERT INTO threads VALUES(\(quote(cid)),\(quote(root)),\(quote(path)),0);")
     let newer = load()
     eq(newer.map { str($0, "text") }, ["第一问", "第一答", "第二问", "第二答"], "D1 非空投影落后也读到新回合，文件mtime不参与猜测")
+    check((newer[2]["createdAt"] as? Double ?? 0) > 0, "首次对账保留 Codex 回合提问时间")
     eq(output(newer), "数据库保留的工具输出", "D1 接尾部不丢数据库前缀里的工具字段")
     // 整个竞态期间保留一个 writer，避免最后一个连接退出后 WAL 被检查点回主文件。
     var writer: OpaquePointer?
@@ -134,6 +208,34 @@ func testCodexProjectionFreshness() {
     eq(output(updated), "新的失败结果", "D1 rollout新snake_case结果覆盖数据库旧camelCase字段")
     eq(str(commands.first, "detail"), "echo cached", "D1 更新未带的工具命令仍从数据库保留")
     eq(str(commands.first, "status"), "error", "D1 同轮最新工具失败状态生效")
+    // 当前 CLI 把生成失败记成带 error 的 task_complete（没有 turn_failed），纯 rollout 和投影补尾都要认成失败。
+    let failedEnd = encoded(["type": "event_msg", "payload": ["type": "task_complete", "turn_id": "second", "last_agent_message": NSNull(),
+                                                                "error": ["message": "fixture http 400", "codex_error_info": "other"]]]) + "\n"
+    let failedTail = event(item("UserMessage", "u2", "第二问"), turn: "second") + failedEnd
+    func errorDetail(_ messages: [[String: Any]]) -> String {
+        guard let last = messages.last, str(last, "role") == "bot" else { return "" }
+        return (last["steps"] as? [[String: Any]] ?? []).filter { str($0, "kind") == "error" }.map { str($0, "detail") }.joined()
+    }
+    let rolloutOnly = app.codexRolloutTurns(prefix + failedTail).messages
+    eq(rolloutOnly.map { str($0, "role") }, ["user", "bot", "user", "bot"], "CO3 仅 rollout 时带错误的 task_complete 仍保留失败回合")
+    check(errorDetail(rolloutOnly).contains("fixture http 400"), "CO3 仅 rollout 时显示失败原因：\(errorDetail(rolloutOnly))")
+    write(prefix + failedTail)
+    let projectedFailure = load()
+    eq(projectedFailure.map { str($0, "role") }, ["user", "bot", "user", "bot"], "CO3 投影补尾时带错误的 task_complete 仍保留失败回合")
+    check(errorDetail(projectedFailure).contains("fixture http 400"), "CO3 投影补尾时显示失败原因：\(errorDetail(projectedFailure))")
+    // CO2 走数据库投影：回合表遗留 inProgress，本机已确认失败时同样改成失败并补正文。
+    let crashStart = encoded(["type": "event_msg", "payload": ["type": "task_started", "turn_id": "second"]]) + "\n"
+    write(prefix + crashStart + event(item("UserMessage", "u2", "第二问"), turn: "second"))
+    exec(database, "INSERT INTO thread_turns VALUES(\(quote(cid)),'second','inProgress','null',1000,NULL,5,NULL); UPDATE thread_history_projection_state SET next_rollout_byte_offset=\((prefix + crashStart).utf8.count),next_rollout_ordinal=6;")
+    app.hooks.codexKnownEndings = ["second": ["outcome": "failed", "text": "本机已显示的正文", "error": "本机记下的失败", "at": 1.0]]
+    let crashPayload = app.readCodexConversation(cid: cid)
+    let crashBot = (crashPayload["messages"] as? [[String: Any]])?.last
+    eq((crashPayload["lastTurn"] as? [String: Any])?["running"] as? Bool, false, "CO2 投影遗留 inProgress 不再算在别处运行中")
+    eq(str(crashBot, "outcome"), "failed", "CO2 投影遗留 inProgress 改成本机失败")
+    eq(str(crashBot, "text"), "本机已显示的正文", "CO2 投影缺正文时补回本机正文")
+    check(errorDetail([crashBot ?? [:]]).contains("本机记下的失败"), "CO2 投影显示本机失败原因")
+    app.hooks.codexKnownEndings = [:]
+    resetProjection()
     write(full)
     exec(database, "DROP TABLE thread_history_projection_state;")
     let oldSchema = load()

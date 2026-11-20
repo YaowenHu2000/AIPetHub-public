@@ -41,6 +41,7 @@
 /* 出错 / 停止的回答：「重试」一直显示 */
 .turn-actions.pinned { opacity: 1; }
 .answer-copy.retry { color: var(--accent); }
+.answer-copy.retry[hidden] { display: none; }
 
 /* 回答进行中：正在写的文字显示在正文位置，工作过程里对应的那一步藏起来 */
 .work-steps > .as-answer { display: none; }

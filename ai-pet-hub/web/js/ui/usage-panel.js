@@ -101,7 +101,7 @@ window.onAgentContext = function (data) {
   const keys = Object.keys(agentContext);
   if (keys.length > 60) keys.slice(0, keys.length - 60).forEach(k => delete agentContext[k]);   // 只留最近的几十个会话
   lsSet('context_usage', JSON.stringify(agentContext));
-  if (history && data.agent === active && S[active].conversationId === data.conversationId &&
+  if (data.agent === active && S[active].conversationId === data.conversationId &&
       pop?.anchor === els.chipModel && modelView === 'panel') showModelView('panel');
 };
 

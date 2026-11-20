@@ -61,7 +61,7 @@ function enableAgent(id) {
   const at = AGENT_IDS.filter(a => ALL_AGENT_IDS.indexOf(a) < ALL_AGENT_IDS.indexOf(id)).length;
   AGENT_IDS.splice(at, 0, id);
   afterAgentsChanged();
-  postNative('listConversations', { agent: id });
+  if (id === active) refreshHistory(id);
   if (S[id].conversationId) postNative('loadConversation', { agent: id, conversationId: S[id].conversationId });
   setActive(id);
 }
@@ -118,9 +118,8 @@ window.onAgentsProbed = data => {
     if (probedAll) {
       if (found.length && found.join() !== AGENT_IDS.join()) {
         AGENT_IDS.splice(0, AGENT_IDS.length, ...found);
-        if (!AGENT_IDS.includes(active)) setActive(AGENT_IDS[0], false);
         afterAgentsChanged();
-        setActive(active, false);
+        setActive(AGENT_IDS.includes(active) ? active : AGENT_IDS[0], false);
         AGENT_IDS.forEach(id => postNative('listConversations', { agent: id }));
       } else {
         saveEnabledAgents();

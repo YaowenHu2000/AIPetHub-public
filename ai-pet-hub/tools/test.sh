@@ -1,7 +1,9 @@
 #!/bin/zsh
 # 离线测试：不需要任何 CLI、会话记录或网络。改了解析器、Markdown 渲染或前端脚本之后跑一遍。
-#   tools/test.sh                 全部（提交前跑这个），约 30 秒
+#   tools/test.sh                 全部（提交前跑这个），约 45 秒
 #   tools/test.sh --only 词1,词2   只编译并跑名字含这些词的离线测试组（改代码调试时用；组名见 tools/tests/offline.swift）
+#     它只筛「离线主体」；下面其余几步不在组表里，编译过一次后各自单跑：build/selftest preview-fixes git|browser|docs、
+#     build/selftest preview-bridge、python3 tools/test-deepseek.py <模式>…（模式名见该文件开头）、python3 tools/test-suspend.py、node tools/test-*.mjs
 # 需要真实 CLI 和会话的测试（历史列表、提问、停止、文档预览等）见 tools/tests/selftest.swift 开头的用法。
 #
 # 各步之间没有共享状态（临时目录带 UUID / pid，端口由系统分配，WebKit 不落盘），所以编译完同时跑；
@@ -9,8 +11,6 @@
 set -uo pipefail
 cd "$(dirname "$0")/.."
 mkdir -p build
-LOG=$(mktemp -d "${TMPDIR:-/tmp}/aipethub-test.XXXXXX")
-SHARDS=${OFFLINE_SHARDS:-8}
 typeset -A pids names
 step() {   # step 名字 命令…：后台跑，输出进 $LOG/名字.log
   local name=$1; shift
@@ -33,6 +33,9 @@ if [[ ${1:-} == --only ]]; then
   AIPETHUB_OFFLINE_ONLY=$2 build/selftest offline
   exit $?
 fi
+# --only 走不到最后的 rm，所以日志目录在它之后才建，免得每次在 $TMPDIR 留一个空目录
+LOG=$(mktemp -d "${TMPDIR:-/tmp}/aipethub-test.XXXXXX")
+SHARDS=${OFFLINE_SHARDS:-8}
 
 if command -v node >/dev/null; then
   frontend() {
@@ -53,8 +56,11 @@ for i in {0..$((SHARDS - 1))}; do step "离线主体-$i" env AIPETHUB_OFFLINE_SH
 step 预览和网页桥 build/selftest preview-bridge
 step 暂停恢复 python3 tools/test-suspend.py
 step DeepSeek生命周期 python3 tools/test-deepseek.py
-step 预览和归因 build/selftest preview-fixes
-step 预览和归因-GitLFS env GIT_CONFIG_GLOBAL="$PWD/tools/fixtures/gitconfig-lfs" build/selftest preview-fixes
+step 预览和归因-git build/selftest preview-fixes git
+step 预览和归因-浏览器 build/selftest preview-fixes browser
+step 预览和归因-文档 build/selftest preview-fixes docs
+# 全局带 LFS 过滤器只影响 git 命令，所以只重跑 git 段
+step 预览和归因-git-GitLFS env GIT_CONFIG_GLOBAL="$PWD/tools/fixtures/gitconfig-lfs" build/selftest preview-fixes git
 
 failed=()
 for name in ${(ko)pids}; do

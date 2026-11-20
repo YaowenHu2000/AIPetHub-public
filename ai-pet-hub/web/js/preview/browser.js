@@ -31,6 +31,7 @@ function openBrowser(target = '', base = '', file = false) {
     pane.tabs.push(tab);
     if (pane.tabs.length > 8) pane.tabs.splice(pane.tabs.findIndex(t => t !== tab), 1);
   }
+  if (pane.active !== tab.id) rememberScroll();
   pane.active = tab.id;
   setPaneVisible(true);
   renderPaneTabs();
@@ -112,9 +113,14 @@ function renderBrowser(bar, body) {
   browserResize.observe(host);
 }
 
-/** 地址栏显示的内容：本地文件显示路径（~/…），网页显示网址。 */
+/** 地址栏显示的内容：本地文件显示路径（~/…），网页显示网址。
+ *  本地网页停在 #章节 时路径后带上章节，复制地址不丢；文件名里本来的「#」在网址里是 %23，不会多出一段。 */
 function browserAddress() {
-  if (browser.file) return prettyPath(browser.file);
+  if (browser.file) {
+    let hash = '';
+    try { hash = new URL(browser.url).hash; hash = decodeURIComponent(hash); } catch {}
+    return prettyPath(browser.file) + hash;
+  }
   return browser.url && browser.url !== 'about:blank' ? browser.url : '';
 }
 

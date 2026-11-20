@@ -1,6 +1,6 @@
 'use strict';
 
-// 本地存储、三位各自的状态（S）、正在进行的回答（run）的查询、和原生通信的入口。
+// 本地存储、四位各自的状态（S）、正在进行的回答（run）的查询、和原生通信的入口。
 
 // ===== 本地存储（失败时退回默认值） =====
 function lsGet(key, fallback = null) {
@@ -28,11 +28,41 @@ const pick = (options, value, fallback) => (options.some(o => o.v === value) ? v
 const find = (options, value) => options.find(o => o.v === value) || options[0];
 const clamp = (v, lo, hi) => Math.min(hi, Math.max(lo, v));
 
+function legacyUnread(id) {
+  const saved = lsJson(id+'_unread',[]);
+  return new Set(Array.isArray(saved) ? saved.filter(cid => typeof cid === 'string' && cid) : []);
+}
+function readUnreadConversations(id) {
+  const ids = legacyUnread(id), prefix = 'aihub_'+id+'_unread:';
+  try {
+    for (const key of Object.keys(localStorage)) if (key.startsWith(prefix)) {
+      const cid = key.slice(prefix.length);
+      if (localStorage.getItem(key) === '1') ids.add(cid); else ids.delete(cid);
+    }
+  } catch (_) { /* 存储暂不可用时仍可在当前窗口阅读 */ }
+  return ids;
+}
+// 一个会话一个持久位，两个窗口同时操作不同会话也不会覆盖对方。旧数组只作底本，已读覆盖也按编号记。
+function updateConversationUnread(id, cids, unread) {
+  const ids = S[id].unreadConvs, legacy = legacyUnread(id);
+  let changed = false;
+  for (const cid of cids) {
+    if (!cid) continue;
+    if (ids.has(cid) !== unread) changed = true;
+    if (unread) ids.add(cid); else ids.delete(cid);
+    lsSet(id+'_unread:'+cid, unread === legacy.has(cid) ? '' : (unread ? '1' : '0'));
+  }
+  return changed;
+}
+function setConversationUnread(id, cid, unread) { return updateConversationUnread(id,[cid],unread); }
+
 const S = {};
 ALL_AGENT_IDS.forEach(id => {
   const c = AGENTS[id];
+  const savedModel = lsGet(id + '_model');
+  const unreadConvs = readUnreadConversations(id);
   S[id] = {
-    model: pick(c.models, MODEL_ALIASES[lsGet(`${id}_model`)] || lsGet(`${id}_model`), c.model),
+    model: pick(c.models, savedModel, pick(c.models, MODEL_ALIASES[savedModel], c.model)),
     effortByModel: lsJson(`${id}_efforts`, {}),   // 每个模型各自记住的思考强度
     effort: '',                                   // 当前模型的思考强度（由 effortOf 算出）
     fast: lsGet(`${id}_fast`) === '1',            // 开着 fast（只对有 fast 档的模型起作用，见 fastOn）
@@ -51,7 +81,8 @@ ALL_AGENT_IDS.forEach(id => {
     applyCwdOnLoad: false,
     runs: new Map(),          // 正在进行的回答：reqId → run（同一位可以同时在好几个会话里回答）
     newView: 'new:0',         // 当前新对话的临时编号（还没有会话 ID 时用）
-    unread: false, unreadConvs: new Set(), draft: lsGet(`${id}_draft`, ''), pendingTitle: '',   // 没发出去的草稿重启后还在
+    unread: unreadConvs.size > 0, unreadConvs, draft: lsGet(`${id}_draft`, ''), pendingTitle: '',   // 没发出去的草稿重启后还在
+    returnedDrafts: lsJson(`${id}_returnedDrafts`, {owner:'', parked:{}}),
     msgEl: null,
   };
   // 旧版只存了一个思考强度：记到当前模型上
@@ -67,8 +98,8 @@ ALL_AGENT_IDS.forEach(id => {
 
 // 一次性：克劳蒂娜改成默认 Opus 5.5 + 思考强度高（之后用户自己改的会保留）
 if (lsGet('claude_default_v2') !== '1') {
-  S.claude.model = 'claude-opus-5-5';
-  S.claude.effortByModel['claude-opus-5-5'] = 'high';
+  S.claude.model = 'opus';
+  S.claude.effortByModel.opus = 'high';
   S.claude.effort = 'high';
   lsSet('claude_model', S.claude.model);
   lsSet('claude_efforts', JSON.stringify(S.claude.effortByModel));
@@ -79,8 +110,8 @@ let viewSeq = 0;
 /** 当前显示的会话：有 ID 用 ID，新对话用临时的 new:N。 */
 const viewKey = id => S[id].conversationId || S[id].newView;
 const isBusy = id => S[id].runs.size > 0;
-// 桌宠眼里的「在忙」：自己在答，或者打开着的会话正在别处跑。只用于桌宠的动作和睡觉，发送、删除等仍只看 isBusy。
-const petBusy = id => isBusy(id) || !!S[id].elsewherePet;
+// 桌宠眼里的「在忙」：自己在答，打开着的会话正在别处跑，或 DeepSeek 的外部审批尚待答复。只用于桌宠的动作和睡觉，发送、删除等仍只看 isBusy。
+const petBusy = id => isBusy(id) || !!S[id].elsewherePet || !!S[id].unattendedSince?.size;
 const runsOf = (id, view) => [...S[id].runs.values()].filter(r => r.view === view);
 const viewBusy = id => runsOf(id, viewKey(id)).length > 0;
 const busySince = id => Math.min(Date.now(), ...[...S[id].runs.values()].map(r => r.since));
@@ -114,6 +145,12 @@ function syncRunPhase(run) {
 /** 汇总某位 AI 娘当前展示的忙碌阶段（优先看当前打开的会话，否则看最近活跃的会话）。 */
 function busyInfo(id) {
   const st = S[id];
+  const pending = id === 'deepseek' && st?.msgEl?.querySelector(':scope > .unattended > .req-card');
+  const since = pending ? Number(pending.dataset.since) : st?.unattendedSince?.values().next().value?.since;
+  if (since && !runsOf(id, viewKey(id)).length) {
+    const meta = PHASE_META.thinking;
+    return {phase:'thinking',kind:'think',meta,icon:meta.icon,title:'等你回答／确认',waiting:true,count:1,fast:false,since};
+  }
   if (st && !st.runs.size && st.elsewherePet) {   // 打开着的会话正在别处跑（chat/elsewhere.js）：桌宠照样按它最后一步动起来
     const e = st.elsewherePet, meta = PHASE_META[e.phase] || PHASE_META.thinking;
     return { phase: e.phase, kind: e.stepKind, meta, icon: KIND_ICONS[e.stepKind] || meta.icon, title: e.stepTitle,
@@ -131,7 +168,8 @@ function busyInfo(id) {
     kind,
     meta,
     icon: KIND_ICONS[kind] || meta.icon,
-    title: run.stepTitle || meta.workLabel,
+    waiting: run.waiting > 0,
+    title: run.waiting > 0 ? '等你回答／确认' : (run.stepTitle || meta.workLabel),
     count: st.runs.size,
     fast: !!run.fast,
     since: busySince(id),
@@ -143,8 +181,9 @@ const fastOn = id => S[id].fast && !!find(AGENTS[id].models, S[id].model).fast;
 
 /** 这个模型支持的思考强度选项。 */
 function modelEfforts(id, m) {
-  const all = AGENTS[id].efforts;
   const levels = m.efforts || (id === 'gemini' ? ['low', 'medium', 'high'] : null);
+  // 固定档不在各位的档位表里：单独给一项，以前给这个模型存过的档位由 effortOf 落回它
+  const all = levels?.includes('default') ? effortOptions('default') : AGENTS[id].efforts;
   return levels ? all.filter(o => levels.includes(o.v)) : all;
 }
 /** 这个模型的思考强度：上次给它选的 → 默认 → 它支持的第一个。 */
@@ -184,7 +223,7 @@ const els = {
 const hasBridge = () => !!(window.webkit && window.webkit.messageHandlers && window.webkit.messageHandlers.hubBridge);
 function postNative(action, payload = {}) {
   if (!hasBridge()) return;
-  if (action === 'loadConversation') {
+  if (action === 'loadConversation' && !payload.unreadProbe) {
     const st = S[payload.agent], reads = st.historyReads ??= new Map();
     const mode = payload.sync ? 'sync' : (payload.afterSteer ? 'steer' : 'open');
     if (mode === 'open') reads.clear();   // 切走再切回来，同一会话的旧回包也不能接手新页面。

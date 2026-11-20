@@ -25,7 +25,7 @@ function setPaneVisible(on) {
 }
 
 /** 打开文件（已打开就切过去）；diff 是这一轮回答里对它的改动。 */
-function openPreview({ path, base = '', diff = '' }) {
+function openPreview({ path, base = '', diff = '', change = null }) {
   const raw = cleanPath(path);
   if (BROWSER_DOC_RE.test(raw)) { openBrowser(raw, base, true); return; }
   let tab = pane.tabs.find(t => (t.raw === raw && t.base === base) || (raw.startsWith('/') && t.resolved === raw));
@@ -33,11 +33,13 @@ function openPreview({ path, base = '', diff = '' }) {
   if (!tab) {
     tab = { id: ++pane.seq, raw, path, base, diff, data: null, mode: null, scrolled: false };
     pane.tabs.push(tab);
-    if (pane.tabs.length > 8) pane.tabs.shift();
-  } else if (diff && diff !== tab.diff) {
+    if (pane.tabs.length > 8) removePaneTab(0);
+  } else if (diff !== tab.diff) {   // 空 diff 也要换上：从没改动的引用打开时，上一轮的增删标记不该留着
     tab.diff = diff;
     tab.scrolled = false;
   }
+  tab.change = change;
+  if (pane.active !== tab.id) rememberScroll();
   pane.active = tab.id;
   setPaneVisible(true);
   renderPaneTabs();
@@ -57,11 +59,15 @@ function loadTab(tab) {
     if (data.path) tab.resolved = data.path;
     const dup = pane.tabs.find(t => t !== tab && t.resolved && t.resolved === tab.resolved);
     if (dup) {
-      if (tab.diff && !dup.diff) dup.diff = tab.diff;
+      // 留下的是先开的那个标签，但这次读到的正文和这次打开带的改动才是最新的
+      dup.data = data;
+      dup.change = tab.change;
+      if (tab.diff !== dup.diff) { dup.diff = tab.diff; dup.scrolled = false; }
       pane.tabs = pane.tabs.filter(t => t !== tab);
       if (pane.active === tab.id) pane.active = dup.id;
     }
-    if (same && !dup) return;
+    if (same && !dup && !tab.changeUpdated) return;
+    tab.changeUpdated = false;
     renderPaneTabs();
     if (dup || pane.active === tab.id) renderPaneBody();
   });
@@ -76,17 +82,28 @@ function refreshPreviews(files, cwd) {
     if (t.kind === 'browser') return;
     const f = t.resolved && changed.get(t.resolved);
     if (!f) return;
-    if (f.diff) { t.diff = f.diff; t.scrolled = false; }
+    const diff = f.diff || '';
+    const updated = t.diff !== diff || ['added','removed','truncated','kind'].some(key => t.change?.[key] !== f[key]);
+    t.change = f; t.diff = diff;
+    if (updated) { t.scrolled = false; t.changeUpdated = true; }
     loadTab(t);
   });
-  // 浏览器：正在看的文件被改了就刷新；看的是网页文件时，同一文件夹里的样式、脚本改了也刷新
+  // 浏览器：正在看的文件被改了就刷新；看的是网页文件时，交给原生按页面实际加载的本地资源判断（Browser.swift 的 reloadBrowserIfUses），
+  // 不按所在文件夹：同目录的 README 改了不该重载清空表单，引用上层目录的样式改了要刷新
   const shown = browser.file;
-  if (shown && browserTab() && [...changed.keys()].some(p => p === shown || (/\.html?$/i.test(shown) && p.startsWith(dirOf(shown) + '/')))) {
-    postNative('browserCommand', { cmd: 'reload' });
+  if (shown && browserTab()) {
+    if (changed.has(shown)) postNative('browserCommand', { cmd: 'reload' });
+    else if (/\.html?$/i.test(shown)) postNative('browserReloadIfUses', { paths: [...changed.keys()] });
   }
 }
 
+function removePaneTab(index) {
+  const [removed] = pane.tabs.splice(index, 1);
+  if (removed?.kind === 'browser') postNative('browserCommand', {cmd:'close'});
+}
+
 function closePreview() {
+  if (browserTab()) postNative('browserCommand', {cmd:'close'});
   pane.tabs = [];
   pane.active = null;
   setPaneVisible(false);
@@ -95,7 +112,7 @@ function closePreview() {
 function closeTab(id) {
   const idx = pane.tabs.findIndex(t => t.id === id);
   if (idx < 0) return;
-  pane.tabs.splice(idx, 1);
+  removePaneTab(idx);
   if (pane.active === id) pane.active = pane.tabs.length ? pane.tabs[Math.max(0, idx - 1)].id : null;
   if (!pane.tabs.length) { closePreview(); return; }
   renderPaneTabs();
@@ -119,6 +136,7 @@ function renderPaneTabs() {
     tab.querySelector('.ed-tab-name').textContent = name;
     tab.addEventListener('click', e => {
       if (e.target.closest('.ed-tab-x')) { closeTab(t.id); return; }
+      if (pane.active !== t.id) rememberScroll();
       pane.active = t.id;
       renderPaneTabs();
       renderPaneBody();
@@ -149,6 +167,7 @@ function updatePaneActions() {
   const t = activeTab();
   const web = !!t && ((t.kind === 'browser' && !browser.file) || t.kind === 'changes');
   pane.el.querySelector('.ed-reveal').style.display = web ? 'none' : '';
+  pane.el.querySelector('.ed-open').style.display = t?.kind === 'changes' ? 'none' : '';
   pane.el.querySelector('.ed-open').title = web ? '在系统浏览器中打开' : '用默认应用打开';
   const ext = pane.el.querySelector('.browser-ext');
   if (ext) ext.title = browser.file ? '用默认应用打开' : '在系统浏览器中打开';
@@ -169,7 +188,13 @@ function renderPaneContent() {
   body.classList.remove('browser-mode');
   if (!tab) { body.innerHTML = ''; bar.innerHTML = ''; return; }
   if (tab.kind === 'browser') { bar.innerHTML = ''; body.innerHTML = ''; renderBrowser(bar, body); return; }
-  if (tab.kind === 'changes') { bar.innerHTML = ''; body.innerHTML = ''; renderChanges(bar, body, tab); return; }
+  if (tab.kind === 'changes') {
+    bar.innerHTML = ''; body.innerHTML = '';
+    renderChanges(bar, body, tab);
+    body.scrollTop = tab.savedScroll ?? 0;
+    tab.savedScroll = null;
+    return;
+  }
   const data = tab.data;
   const path = tab.resolved || tab.raw;
   const ext = (path.split('.').pop() || '').toLowerCase();
@@ -204,9 +229,11 @@ function renderPaneContent() {
   const hasContent = typeof data.content === 'string';
   const marks = tab.diff && hasContent ? annotateFile(data.content, tab.diff) : null;
   if (marks || (tab.diff && !hasContent)) {
-    const add = marks ? marks.added : tab.diff.split('\n').filter(l => l.startsWith('+') && !l.startsWith('+++')).length;
-    const del = marks ? marks.removed : tab.diff.split('\n').filter(l => l.startsWith('-') && !l.startsWith('---')).length;
+    const truncated = patchTruncated(tab.change);
+    const add = truncated ? tab.change.added : marks ? marks.added : tab.diff.split('\n').filter(l => l.startsWith('+') && !l.startsWith('+++')).length;
+    const del = truncated ? tab.change.removed : marks ? marks.removed : tab.diff.split('\n').filter(l => l.startsWith('-') && !l.startsWith('---')).length;
     tools.insertAdjacentHTML('beforeend', `<span class="ed-diffinfo" title="这一轮回答对它的改动"><span class="add">+${add}</span> <span class="del">−${del}</span></span>`);
+    if (truncated) tools.append(document.createTextNode('改动预览已截断'));
     const prev = toolButton(UI.caret, '上一处改动', () => jumpChange(-1));
     const next = toolButton(UI.caret, '下一处改动', () => jumpChange(1));
     next.classList.add('flip');
@@ -323,31 +350,59 @@ function changeAnchors() {
   return [...pane.el.querySelectorAll('.ed-body .chg-start, .ed-body .md-chg, .ed-body .md-del')];
 }
 
+// 平滑跳转期间保留目标序号，用户接手滚动后再按可见位置定位。
+for (const event of ['wheel', 'touchstart', 'pointerdown', 'keydown']) {
+  pane.el.querySelector('.ed-body').addEventListener(event, e => {
+    if (event === 'keydown' && !['ArrowUp','ArrowDown','PageUp','PageDown','Home','End',' '].includes(e.key)) return;
+    const tab = activeTab();
+    if (tab) tab.chgAt = null;
+  }, {passive:true});
+}
+
 function jumpChange(dir) {
   const anchors = changeAnchors();
   if (!anchors.length) return;
   const body = pane.el.querySelector('.ed-body');
-  const top = body.scrollTop + 40;
+  const tab = activeTab();
+  const at = tab && tab.chgAt;
   let target;
-  if (dir > 0) target = anchors.find(a => a.offsetTop > top + 4) || anchors[0];
-  else target = [...anchors].reverse().find(a => a.offsetTop < top - 4) || anchors[anchors.length - 1];
+  // 按记下的那一处挪：停下的位置在锚点上方 60 像素，按滚动位置找会又找回当前这处；平滑滚动没走完时滚动位置也不准
+  if (Number.isInteger(at) && at < anchors.length) target = anchors[(at + dir + anchors.length) % anchors.length];
+  else {
+    const top = body.scrollTop + 40;
+    if (dir > 0) target = anchors.find(a => a.offsetTop > top + 4) || anchors[0];
+    else target = [...anchors].reverse().find(a => a.offsetTop < top - 4) || anchors[anchors.length - 1];
+  }
+  if (tab) tab.chgAt = anchors.indexOf(target);
   body.scrollTo({ top: Math.max(0, target.offsetTop - 60), behavior: 'smooth' });
   target.classList.add('flash');
   setTimeout(() => target.classList.remove('flash'), 900);
 }
 
-/** 第一次打开有改动的文件时，滚到第一处改动。 */
+/** 第一次打开有改动的文件时，滚到第一处改动；之后切回这个标签时回到切走前的位置。 */
 function finishScroll(tab, body) {
-  if (tab.scrolled) return;
+  if (tab.scrolled) {
+    // 各标签共用一个正文区，切标签会重建内容，滚动位置只能自己记着；用一次就丢，免得同一标签之后重画时被拉回旧位置
+    if (tab.savedScroll != null) { body.scrollTop = tab.savedScroll; tab.savedScroll = null; }
+    return;
+  }
   tab.scrolled = true;
+  tab.savedScroll = null;   // 要重新定位到改动处时（改动换了、切了预览 / 源码），切走前的位置作废
   const first = changeAnchors()[0];
+  tab.chgAt = first ? 0 : null;
   body.scrollTop = first ? Math.max(0, first.offsetTop - 60) : 0;
+}
+
+/** 切到别的标签前记下当前标签读到哪里。 */
+function rememberScroll() {
+  const t = activeTab();
+  if (t) t.savedScroll = pane.el.querySelector('.ed-body').scrollTop;
 }
 
 /** 回答里的文件标签：顺便找这一轮改动里有没有它的 diff。 */
 function previewFromTurn(path, turnEl) {
   const files = (turnEl && turnEl._files) || [];
-  const clean = cleanPath(path).replace(/^\.\//, '');
-  const match = files.find(f => f.path === clean || f.path.endsWith('/' + clean));
-  openPreview({ path: match ? match.path : path, base: (turnEl && turnEl.dataset.cwd) || (S[active] && S[active].workspace) || '', diff: match ? (match.diff || '') : '' });
+  const base = (turnEl && turnEl.dataset.cwd) || (S[active] && S[active].workspace) || '';
+  const match = turnFileChange(files, path, base);
+  openPreview({ path: match ? match.path : path, base, diff: match ? (match.diff || '') : '', change:match });
 }

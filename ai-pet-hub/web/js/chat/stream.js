@@ -52,11 +52,16 @@ function streamTo(run, text, final) {
     st.at = now;
     const left = st.text.length - st.shown;
     // 速度跟着「还差多少」走：差得多放得快。追得不急（约半秒），下一撮字到的时候手里还有没放完的，所以中间不会停顿
-    st.shown += revealStep(left, dt);
+    st.shown += live.finalAnswer && (!live.el.isConnected || document.hidden || run.agent !== active) ? left : revealStep(left, dt);
     const done = st.shown >= st.text.length;
     const box = S[run.agent].msgEl;
     const stick = live.el.isConnected && nearBottom(box);
-    renderStreamingAnswer(live.answer, done ? st.text : st.text.slice(0, st.shown), done && st.final);
+    if (done && live.finalAnswer) {
+      // 原本的定稿节点已处理本地图片；最后仍用它，并核对其中的文件链接。
+      live.answer.replaceWith(live.finalAnswer);
+      delete live.el._answerStream;
+      if (live.el.isConnected) verifyFileChips(live.el,live.el.dataset.cwd);
+    } else renderStreamingAnswer(live.answer, done ? st.text : st.text.slice(0, st.shown), done && st.final);
     if (stick) scrollToBottom(box);
     if (!done && live.el.isConnected) schedule();
   };
@@ -64,6 +69,19 @@ function streamTo(run, text, final) {
   const schedule = () => { st.raf = requestAnimationFrame(tick); st.timer = setTimeout(tick, 120); };
   st.at = performance.now() - 16;
   schedule();
+}
+
+// 收尾或同步会换掉整轮节点，但屏幕还没放完的字不应随定稿一起跳出来。
+function continueAnswer(id, turn, source, prior = '') {
+  const answer = turn.querySelector('.answer'), text = turn._text;
+  if (!answer || id !== active || document.hidden || !turn.isConnected) return;
+  const typing = source?.typing || {text:prior, shown:prior.length};
+  if (typing.shown >= text.length || !text.startsWith(typing.text.slice(0,typing.shown))) return;
+  cancelAnimationFrame(typing.raf); clearTimeout(typing.timer); typing.raf = typing.timer = 0;
+  const live = turn._answerStream = {el:turn, answer:source?.answer || document.createElement('div'), typing, finalAnswer:answer};
+  answer.replaceWith(live.answer);
+  live.answer.className = answer.className;
+  streamTo({agent:id,live},text,true);
 }
 
 /** 正在写的回答在「工作过程」里的那一步：这时它是藏着的（显示在正文位置），先放个空壳，不白渲染一遍；要显示时再补上。 */

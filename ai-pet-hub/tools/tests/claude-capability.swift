@@ -22,6 +22,12 @@ func testClaudeCapabilityRefresh() {
     mode("help-missing", in: dir)
     check(app.claudeSupportsPartial(cli, prefix: []), "二进制没有变化时仍使用直接 CLI 的能力缓存")
 
+    let recovering = AppDelegate()
+    mode("help-failed", in: dir)
+    check(!recovering.claudeSupportsPartial(cli,prefix:[]), "探测失败时本次保守发送")
+    mode("ok", in: dir)
+    check(recovering.claudeSupportsPartial(cli,prefix:[]), "标准 Claude 恢复后重新请求流式正文")
+    mode("help-missing", in: dir)
     let wrapperApp = AppDelegate()
     check(!wrapperApp.claudeSupportsPartial(cli, prefix: ["cli"]), "包装器底层旧 CLI 不支持")
     mode("ok", in: dir)

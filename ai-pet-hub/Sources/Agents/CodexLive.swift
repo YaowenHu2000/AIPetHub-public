@@ -1,123 +1,8 @@
 // Codex 的交互式回答：`codex app-server`（JSON-RPC，一行一条），一次回答起一个进程：
 // initialize → thread/start（或 thread/resume）→ turn/start → 一路通知 → turn/completed 后关掉输入让它退出。
-// 相比 `codex exec`：能审批（命令 / 改文件）、能回答它提的问题、能中途补充（turn/steer）、能请它停（turn/interrupt），
+// 相比 `codex exec`：能审批（命令 / 改文件 / MCP 工具）、能回答它提的问题、能中途补充（turn/steer）、能请它停（turn/interrupt），
 // 回答文字是逐字给的，文件改动带 diff。
 import Cocoa
-
-/// 应用自动附在用户的话后面的说明，都以它开头（读历史时从这里起去掉，不显示）。
-let codexNoteMarker = "[AIPetHub 提示]"
-
-extension AppDelegate {
-    var codexInitialize: [String: Any] {
-        ["id": 1, "method": "initialize",
-         "params": ["clientInfo": ["name": "aipethub", "title": "AIPetHub", "version": "1.0"], "capabilities": NSNull()]]
-    }
-
-    /// skills/list 的答复：记下技能（名字 → 路径），并告诉网页（输入框里打 / 时列出来，连同我们替它接的 /compact）。
-    func noteCodexSkills(_ result: [String: Any]) {
-        var found: [(name: String, desc: String, path: String)] = []
-        for entry in result["data"] as? [[String: Any]] ?? [] {
-            for s in entry["skills"] as? [[String: Any]] ?? [] where (s["enabled"] as? Bool) != false {
-                guard let name = s["name"] as? String, let path = s["path"] as? String, !found.contains(where: { $0.name == name }) else { continue }
-                found.append((name, (s["shortDescription"] as? String) ?? (s["description"] as? String) ?? "", path))
-            }
-        }
-        procLock.lock(); codexSkills = Dictionary(found.map { ($0.name, $0.path) }, uniquingKeysWith: { a, _ in a }); procLock.unlock()
-        var list: [[String: String]] = [["name": "compact", "desc": "把前面的对话压缩成摘要，腾出上下文空间"]]
-        list += found.map { ["name": $0.name, "desc": clip($0.desc.replacingOccurrences(of: "\n", with: " "), 80)] }
-        sendToJS("onAgentCommands", ["agent": "gpt", "commands": list])
-    }
-
-    /// model/list 的答复：它现在能用的模型和各自支持的思考强度。
-    func noteCodexModels(_ result: [String: Any]) {
-        let models = (result["data"] as? [[String: Any]] ?? []).compactMap { m -> [String: Any]? in
-            guard let id = (m["model"] as? String) ?? (m["id"] as? String), (m["hidden"] as? Bool) != true else { return nil }
-            var item: [String: Any] = ["v": id, "name": m["displayName"] as? String ?? id, "desc": m["description"] as? String ?? ""]
-            let efforts = (m["supportedReasoningEfforts"] as? [[String: Any]] ?? []).compactMap { $0["reasoningEffort"] as? String }
-            if !efforts.isEmpty { item["efforts"] = efforts }
-            if (m["isDefault"] as? Bool) == true { item["isDefault"] = true }
-            // 有 Fast 档的模型（serviceTiers 里的 priority）：说明里写着快多少
-            if let tier = (m["serviceTiers"] as? [[String: Any]] ?? []).first(where: { $0["id"] as? String == "priority" }) {
-                item["fast"] = true
-                if let d = tier["description"] as? String, !d.isEmpty { item["fastDesc"] = d }
-            }
-            return item
-        }
-        if !models.isEmpty { sendToJS("onAgentModels", ["agent": "gpt", "models": models]) }
-    }
-
-    func codexSkill(named name: String) -> (name: String, path: String)? {
-        procLock.lock(); defer { procLock.unlock() }
-        return codexSkills[name].map { (name, $0) }
-    }
-
-    /// initialize 答复之后：告诉它我们准备好了，顺便问它现在有哪些模型（模型菜单跟着它走）。
-    func codexInitialized(_ input: LiveInput) {
-        input.send(["method": "initialized"])
-        input.send(["id": 8, "method": "model/list", "params": [String: Any]()])
-    }
-
-    /// 开会话（新建或接上已有的）：codexInitialized 之后发。
-    func codexOpenThread(_ req: AskRequest, _ input: LiveInput, model: String, effort: String, sandbox: String) {
-        let asking = req.permissionMode == "ask"
-        var config: [String: Any] = ["model_reasoning_effort": effort]
-        if let mcp = browserMCP(req) {   // 内置浏览器的工具（BrowserTools.swift）
-            config["mcp_servers"] = ["aipethub_browser": ["command": mcp.command, "args": mcp.args]]
-        }
-        var p: [String: Any] = ["model": model, "sandbox": asking ? "workspace-write" : sandbox,
-                                "approvalPolicy": asking ? "untrusted" : "never", "config": config]
-        if let ws = validWorkspace(req.workspace) { p["cwd"] = ws }
-        if req.fast { p["serviceTier"] = "priority" }   // Fast 档；不传就是默认档（会话不会记住上一次的）
-        if req.conversationId.isEmpty {
-            input.send(["id": 2, "method": "thread/start", "params": p])
-        } else {
-            p["threadId"] = req.conversationId
-            input.send(["id": 2, "method": "thread/resume", "params": p])
-        }
-    }
-
-    /// 接着聊一个已有的会话时，内置浏览器工具的开关和这个会话上一次不一样：给这一句附一段说明。
-    /// 工具本身每一轮都按开关配好了（进程是新起的），但 Codex 只在会话开头看一次「有哪些工具」，之后不会自己再去查，
-    /// 不说的话，后来打开它不知道有、后来关掉它还会去调。新会话不用说（开头它自己会看到）。
-    func codexBrowserNote(threadId: String, isNew: Bool, on: Bool) -> String? {
-        let key = "codexBrowserTools"
-        var states = hooks.codexBrowserStates ?? UserDefaults.standard.dictionary(forKey: key) as? [String: Bool] ?? [:]
-        let before = states[threadId]
-        guard before != on else { return nil }
-        if states.count > 400 { states.removeAll() }   // 只是个小本子，记太多就清掉重记
-        states[threadId] = on
-        if hooks.codexBrowserStates != nil { hooks.codexBrowserStates = states } else { UserDefaults.standard.set(states, forKey: key) }
-        if isNew || (before == nil && !on) { return nil }
-        return on
-            ? "\(codexNoteMarker) 从这一句起可以用内置浏览器的工具（MCP 服务 aipethub_browser：browser_open、browser_screenshot、browser_console、browser_text、browser_eval）。工具列表里没有直接列出的话，在 exec 里用 tools.mcp__aipethub_browser__browser_open({url}) 这样调用。这段是应用自动加的，不用回应。"
-            : "\(codexNoteMarker) 内置浏览器的工具（aipethub_browser）从这一句起关掉了，不要再调用。这段是应用自动加的，不用回应。"
-    }
-
-    /// 答完后只握手和查模型，用户开始打字才提前接入旧线程。
-    func warmCodex(_ req: AskRequest) -> CLIProcess? {
-        guard let setup = codexSetup(req) else { return nil }
-        let cli = CLIProcess(input: LiveInput())
-        cli.warmFilter = { [weak self, weak cli] line in
-            guard let self = self, let cli = cli, let obj = self.jsonObject(line), obj["method"] == nil,
-                  let id = (obj["id"] as? NSNumber)?.intValue else { return false }
-            if id == 1, cli.stage > 0 { return true }
-            if id == 2, cli.stage == 2 { return self.warmResumeReply(cli, req: req, result: obj["result"] as? [String: Any]) }
-            if id == 8 {   // 模型列表：预热时就告诉网页，不用等到真发话
-                self.noteCodexModels(obj["result"] as? [String: Any] ?? [:])
-                return true
-            }
-            guard id == 1, obj["error"] == nil, let input = cli.input else { return false }
-            self.codexInitialized(input)
-            cli.stage = 1
-            cli.resumeWhenReady()
-            return true
-        }
-        guard (try? cli.start(executable: setup.codex, arguments: ["app-server"], cwd: validWorkspace(req.workspace) ?? home,
-                              environment: cliEnvironment())) != nil else { cli.input?.abandon(); return nil }
-        cli.input?.send(codexInitialize)
-        return cli
-    }
-}
 
 /// 一次交互式回答。流程：initialize(1) → thread/start 或 thread/resume(2) → turn/start(3) → 一路通知 → turn/completed。
 /// 预热进程的 stage 为 1 时，initialize 已完成。
@@ -131,10 +16,15 @@ final class CodexLiveTurn: LiveTurn {
     private var nextId = 10
     private var calls: [Int: String] = [:]        // 我们发出的请求：id → 用途
     private var steers: [(id: String, text: String, images: [String])] = []
+    private var convertingSteers = 0               // 还在后台转图片的补充（steer）
+    private let steerQueue = DispatchQueue(label: "aipethub.codex-steer-images")
     private var userSeen = 0
     private var failure: String?                   // 开场就失败（接不上会话等）
     private var gotResponse = false
-    private var openRetries = 0                    // 会话被上一个进程占着时重接了几次
+    private var writerBusy = false                 // 会话的写锁在别的 Codex 客户端手里
+    private var skillsQueried = false              // 这一轮已经查过技能（/技能名 提交前先查的）
+    private var skillThread: String?               // /技能名 等技能清单时，查完要提交到的会话
+    private var skillsCwd: String { app.validWorkspace(req.workspace) ?? app.home }
     private let retryQuietInterval: TimeInterval
     private let retryPollInterval: TimeInterval
     private let retryReader: (String, Date, pid_t?) -> CodexRetryRecord?
@@ -222,29 +112,32 @@ final class CodexLiveTurn: LiveTurn {
         if let e = res.launchError {
             return AgentReply(reply: "⚠️ 无法启动 codex：\(e)", conversationId: req.conversationId)
         }
+        // 提问还没送出：标成失败，网页留着这句供重试；提示只在正文里说一次，不再另列「出错」步骤。
+        // Codex 的记录里没有这句，原话和附件退回原会话草稿，切走再回来、重开都还在
+        if !res.cancelled, locked({ writerBusy }) {
+            let text = "⚠️ 这个会话正在别的 Codex 客户端里打开。请先在那边关掉或切到别的会话，再重试发送。"
+            var built = builder.finish(finalText: nil, outcome: "failed", includeEnding: false)
+            built["text"] = text
+            return AgentReply(reply: text, conversationId: req.conversationId, restoreDraft: true, turn: built)
+        }
         // app-server 用不了（老版本没有这个子命令），或者接不上这个会话：还什么都没做，退回 codex exec
         let (failed, answered, submitted, timedOut) = locked { (failure, gotResponse, initialPromptSubmitted, initializationTimedOut) }
         if !res.cancelled, !submitted, timedOut || !answered || failed != nil {
             fputs("AIPetHub：Codex 交互式没成（\(failed ?? (timedOut ? "初始化阶段 300 秒没有推进" : "app-server 没有答复"))），退回 codex exec\n", stderr)
             return nil
         }
+        // 已有会话的追问，turn/start 还没发出就停了：Codex 的记录里没有这一句，退回原会话草稿（新会话由网页退回）
+        if res.cancelled, !req.conversationId.isEmpty, !submitted {
+            return AgentReply(reply: unsentFollowUpReply, conversationId: req.conversationId, cancelled: true, restoreDraft: true)
+        }
         return reply(res)
     }
 
     private func reply(_ res: CLIResult) -> AgentReply {
         let convId = parser.threadId.isEmpty ? req.conversationId : parser.threadId
-        let failedExit = parser.status == nil && !res.cancelled
-        let outcome = res.cancelled ? "interrupted" : (parser.status ?? "failed")
-        let error = failedExit ? "⚠️ Codex 出错（退出码 \(res.status)）：\n" + (trimmed(res.err).isEmpty ? "进程在本轮完成前退出了。" : String(trimmed(res.err).suffix(1500)))
-            : parser.errors.joined(separator: "\n")
-        var built = builder.finish(finalText: parser.lastAgentMessage, outcome: outcome, error: res.cancelled ? nil : error)
-        var reply = built["text"] as? String ?? ""
-        if res.cancelled { return AgentReply(reply: reply, conversationId: convId, cancelled: true, turn: built) }
-        if reply.isEmpty && !parser.errors.isEmpty { reply = "⚠️ Codex 出错：\n" + parser.errors.joined(separator: "\n") }
-        if reply.isEmpty && parser.compacted { reply = "前面的对话已经压缩成摘要，腾出了上下文空间。" }
-        if reply.isEmpty && ((built["steps"] as? [Any]) ?? []).isEmpty { reply = app.fallbackReply(res, cli: "Codex", preferStderr: true) }
-        built["text"] = reply
-        return AgentReply(reply: reply, conversationId: convId, turn: built)
+        return app.codexReply(req, res:res, builder:builder, cid:convId, turnId:parser.turnId, status:parser.status,
+                              text:parser.lastAgentMessage, partial:parser.unfinishedAgentMessage,
+                              errors:parser.errors, compacted:parser.compacted)
     }
 
     /// 一句话：图片作为本机图片交给它（不是把路径写在话里）。
@@ -262,6 +155,25 @@ final class CodexLiveTurn: LiveTurn {
 
     override func steer(_ text: String, images: [String], id: String) -> Bool {
         guard !parser.threadId.isEmpty, !parser.turnId.isEmpty, parser.status == nil else { return false }
+        guard convertingSteers > 0 || !images.allSatisfy(app.codexReadsImage) else { return sendSteer(text, images: images, id: id) }
+        // HEIC 等要先转成 JPEG，一张大照片要零点几秒，而这里在主线程上、拿着这一轮的锁：和 DeepSeek 一样放到后台转，转完再送。
+        // 前面还有补充在转时，这一句也排进同一个队列，免得后发的先送进去
+        convertingSteers += 1
+        steerQueue.async { [weak self] in
+            guard let self else { return }
+            let usable = images.compactMap(self.app.codexImagePath)
+            self.locked {
+                self.convertingSteers -= 1
+                // 转不了的图片不送进这一轮：退回排队，等这一轮结束再作为新提问发，那时 runCodex 会在发送前提示
+                if usable.count < images.count || !self.sendSteer(text, images: usable, id: id) { self.noteSteer(id, "rejected") }
+            }
+        }
+        return true
+    }
+
+    /// 把补充送进这一轮；这一轮已经结束、送不进去时返回 false（网页留着排队，等这一轮结束再发）。
+    private func sendSteer(_ text: String, images: [String], id: String) -> Bool {
+        guard !parser.threadId.isEmpty, !parser.turnId.isEmpty, parser.status == nil else { return false }
         locked { steers.append((id, text, images)) }
         guard call("turn/steer", ["threadId": parser.threadId, "expectedTurnId": parser.turnId, "input": userInput(text, images: images)], tag: "steer:\(id)") else {
             locked { steers.removeAll { $0.id == id } }
@@ -274,6 +186,7 @@ final class CodexLiveTurn: LiveTurn {
     override func interrupt() {
         markStopping()
         stopRetryChecks()
+        cancelMCPElicitations { input.send(["id": $0["rpcId"] ?? NSNull(), "result": ["action": "cancel", "content": NSNull(), "_meta": NSNull()]]) }
         if parser.threadId.isEmpty || parser.turnId.isEmpty { input.close(); return }   // 回合还没开始：直接收
         call("turn/interrupt", ["threadId": parser.threadId, "turnId": parser.turnId], tag: "interrupt")
     }
@@ -281,17 +194,38 @@ final class CodexLiveTurn: LiveTurn {
     override func answer(_ requestId: String, _ body: [String: Any]) {
         guard let info = pending.take(requestId), let rpcId = info["rpcId"] else { return }
         let decision = body["decision"] as? String ?? "deny"
-        if info["kind"] as? String == "question" {
-            // 回答按题目 ID 交回去；用户选了「不回答」就都留空
+        switch info["kind"] as? String {
+        case "question":
+            // 网页按题目 id 交回答案（两题文字相同也不会串）；用户选了「不回答」就都留空。
+            // 多选题网页用「、」连着，拆回一个个选项；整句就是一个选项时不拆（选项文字里本来就可能有「、」）
             var answers: [String: Any] = [:]
             let given = body["answers"] as? [String: Any] ?? [:]
             for q in info["questions"] as? [[String: Any]] ?? [] {
                 guard let qid = q["id"] as? String else { continue }
-                let a = decision == "deny" ? "" : (given[q["question"] as? String ?? ""] as? String ?? "")
-                answers[qid] = ["answers": a.isEmpty ? [String]() : [a]]
+                if decision != "deny", let parts = questionAnswerParts(body, qid) {
+                    answers[qid] = ["answers": parts.selected + (parts.custom.isEmpty ? [] : [parts.custom])]
+                    continue
+                }
+                let a = decision == "deny" ? "" : (given[qid] as? String ?? "")
+                let labels = (q["options"] as? [[String: Any]] ?? []).compactMap { $0["label"] as? String }
+                let parts = q["multiSelect"] as? Bool == true && !labels.contains(a) ? a.components(separatedBy: "、") : [a]
+                answers[qid] = ["answers": parts.filter { !$0.isEmpty }]
             }
             input.send(["id": rpcId, "result": ["answers": answers]])
-        } else {
+        case "mcpTool":
+            // MCP 工具审批：「这一轮都允许」用 persist session（App 一个回合一个进程，就是这一轮）；不用 always，那会写进用户的配置
+            if decision == "allowAll" { pending.allowAll("mcp") }
+            let accept = decision == "allow" || decision == "allowAll"
+            input.send(["id": rpcId, "result": ["action": accept ? "accept" : "decline", "content": accept ? [String: Any]() as Any : NSNull(),
+                                                "_meta": decision == "allowAll" ? ["persist": "session"] as Any : NSNull()]])
+        case "elicitation":
+            let (action, content) = mcpElicitationResult(info, body)
+            input.send(["id": rpcId, "result": ["action": action, "content": content.map { $0 as Any } ?? NSNull(), "_meta": NSNull()]])
+        case "permissions":
+            if decision == "allowAll" { pending.allowAll("permissions") }
+            let granted = decision == "deny" ? [String: Any]() : info["permissions"] as? [String: Any] ?? [:]
+            input.send(["id": rpcId, "result": ["permissions": granted, "scope": decision == "allowAll" ? "session" : "turn"]])
+        default:
             if decision == "allowAll" { pending.allowAll(info["allowKey"] as? String ?? "") }
             input.send(["id": rpcId, "result": ["decision": decision == "allow" ? "accept" : (decision == "allowAll" ? "acceptForSession" : "decline")]])
         }
@@ -300,7 +234,7 @@ final class CodexLiveTurn: LiveTurn {
 
     // MARK: app-server 发来的
 
-    /// 打字时已发出的 resume 由同一条答复继续推进，不能重新发送。
+    /// 预热只做到握手（stage 1），接手后在这里开会话。
     override func adopted() {
         guard let w = warm, w.stage >= 1 else { return }
         locked { gotResponse = true }
@@ -338,10 +272,15 @@ final class CodexLiveTurn: LiveTurn {
         }
         parser.notify(method, params)
         noteConversation(parser.threadId)
-        if method == "turn/completed" { stopRetryChecks(); input.close() }   // 答完了：关掉输入，它自己退出
+        if method == "turn/completed" {   // 答完了：还挂着的 MCP 请求回 cancel，关掉输入，它自己退出
+            stopRetryChecks()
+            cancelMCPElicitations { input.send(["id": $0["rpcId"] ?? NSNull(), "result": ["action": "cancel", "content": NSNull(), "_meta": NSNull()]]) }
+            input.close()
+        }
     }
 
-    /// 它要我们答复的请求：审批（命令 / 改文件）、提问；别的一律说不支持。
+    /// 它要我们答复的请求：审批（命令 / 改文件 / MCP 工具 / 额外权限）、提问、MCP 服务器要用户输入；
+    /// 别的说不支持（codex 当成拒绝，这一轮照常继续），并记一行日志，CLI 升级加了新回调时能发现。
     private func handleRequest(_ rpcId: Any, _ method: String, _ params: [String: Any]) {
         let rid = "codex-\(rpcId)"
         switch method {
@@ -366,13 +305,59 @@ final class CodexLiveTurn: LiveTurn {
             let questions = params["questions"] as? [[String: Any]] ?? []
             pending.add(rid, ["rpcId": rpcId, "kind": "question", "questions": questions])
             let shown = questions.map { q -> [String: Any] in
-                ["question": q["question"] as? String ?? "", "header": q["header"] as? String ?? "",
-                 "multiSelect": false, "options": q["options"] as? [[String: Any]] ?? []]
+                ["id": q["id"] as? String ?? "", "question": q["question"] as? String ?? "", "header": q["header"] as? String ?? "",
+                 "multiSelect": q["multiSelect"] as? Bool ?? false, "isOther": q["isOther"] as? Bool ?? true,
+                 "isSecret": q["isSecret"] as? Bool ?? false, "options": q["options"] as? [[String: Any]] ?? []]
             }
             app.sendRequest(req, id: rid, kind: "question", ["questions": shown])
+        case "mcpServer/elicitation/request":
+            mcpElicitation(rpcId, params)
+        case "item/permissions/requestApproval":
+            // 原样给回它要的，去掉值为 null 的项（答复里这两项只能缺省、不能是 null）
+            let granted = (params["permissions"] as? [String: Any] ?? [:]).filter { !($0.value is NSNull) }
+            if pending.isAllowed("permissions") {
+                input.send(["id": rpcId, "result": ["permissions": granted, "scope": "session"]])
+                return
+            }
+            pending.add(rid, ["rpcId": rpcId, "kind": "permissions", "permissions": granted])
+            var what: [String] = []
+            if ((granted["network"] as? [String: Any])?["enabled"] as? Bool) == true { what.append("网络") }
+            let fs = granted["fileSystem"] as? [String: Any] ?? [:]
+            what += (fs["read"] as? [String] ?? []).map { "读 \($0)" } + (fs["write"] as? [String] ?? []).map { "写 \($0)" }
+            var fields: [String: Any] = ["tool": "permissions", "stepKind": "tool", "title": "申请额外权限：" + (what.isEmpty ? "其他" : what.joined(separator: " / "))]
+            if let reason = params["reason"] as? String, !reason.isEmpty { fields["detail"] = reason }
+            app.sendRequest(req, id: rid, kind: "permission", fields)
+        case "item/tool/call":
+            // 动态工具：App 没有注册过，真来了也给一个能让它继续工作的结果，而不是报错
+            input.send(["id": rpcId, "result": ["contentItems": [["type": "inputText", "text": "AIPetHub 没有这个工具"]], "success": false]])
         default:
+            fputs("AIPetHub：Codex 发来不认识的请求 \(method)，回了不支持\n", stderr)
             input.send(["id": rpcId, "error": ["code": -32601, "message": "AIPetHub 不支持这个请求"]])
         }
+    }
+
+    /// MCP 的 elicitation。_meta.codex_approval_kind 为 mcp_tool_call 的是 codex 自己在「每次询问」下调 MCP 工具前的审批
+    /// （App 的内置浏览器工具也走这条），用审批卡；其余是 MCP 服务器自己要用户输入，用提问卡 / 链接卡（MCPElicitation.swift）。
+    private func mcpElicitation(_ rpcId: Any, _ params: [String: Any]) {
+        let rid = "codex-\(rpcId)"
+        let server = params["serverName"] as? String ?? "MCP"
+        let meta = params["_meta"] as? [String: Any] ?? [:]
+        if meta["codex_approval_kind"] as? String == "mcp_tool_call" {
+            if pending.isAllowed("mcp") {
+                input.send(["id": rpcId, "result": ["action": "accept", "content": [String: Any](), "_meta": ["persist": "session"]]])
+                return
+            }
+            pending.add(rid, ["rpcId": rpcId, "kind": "mcpTool"])
+            var fields: [String: Any] = ["tool": "mcp", "stepKind": "tool", "title": "运行 MCP 工具 \(server).\(meta["tool_name"] as? String ?? "")"]
+            let detail = mcpToolParamsText(meta)
+            if !detail.isEmpty { fields["detail"] = clip(detail, 20_000) }
+            app.sendRequest(req, id: rid, kind: "permission", fields)
+            return
+        }
+        let shown = showMCPElicitation(id: rid, info: ["rpcId": rpcId], server: server, mode: params["mode"] as? String ?? "",
+                                       message: params["message"] as? String ?? "", schema: params["requestedSchema"] as? [String: Any],
+                                       order: nil, url: params["url"] as? String)
+        if !shown { input.send(["id": rpcId, "result": ["action": "decline", "content": NSNull(), "_meta": NSNull()]]) }
     }
 
     /// 这一轮里用户已经选过「都允许」的那一类操作：直接答应。
@@ -390,17 +375,11 @@ final class CodexLiveTurn: LiveTurn {
             app.codexInitialized(input)
             app.codexOpenThread(req, input, model: model, effort: effort, sandbox: sandbox)
         case 2:   // thread/start 或 thread/resume
-            // 上一个进程（上一轮的、或者刚被换掉的预热进程）还没完全退出、还占着这个会话：等一下再接，不要因此退回 codex exec
-            if let e = error, e.contains("active writer"), openRetries < 12 {
-                openRetries += 1
-                DispatchQueue.global().asyncAfter(deadline: .now() + 0.4) { [weak self] in
-                    guard let self = self else { return }
-                    self.locked {
-                        guard !self.stopping, !self.initializationTimedOut, !self.initialPromptSubmitted else { return }
-                        self.app.codexOpenThread(self.req, self.input, model: self.model, effort: self.effort, sandbox: self.sandbox)
-                    }
-                }
-                return
+            // 写锁在别的 Codex 客户端手里：App 自己的预热不再提前续接，上一轮的进程也在回复前就退出了，
+            // 所以这只能是外部占用，重试和退回 codex exec resume 都拿不到锁，只会让用户白等。立即结束这一轮。
+            if let e = error, e.contains("active writer") {
+                locked { writerBusy = true }
+                fail(e); return
             }
             guard error == nil, let tid = (result["thread"] as? [String: Any])?["id"] as? String, !tid.isEmpty else {
                 fail(error ?? "没有拿到会话"); return
@@ -416,7 +395,9 @@ final class CodexLiveTurn: LiveTurn {
         case 8:   // model/list
             app.noteCodexModels(result)
         case 9:   // skills/list
-            app.noteCodexSkills(result)
+            if error == nil { app.noteCodexSkills(result, cwd: skillsCwd, workspace: req.workspace) }
+            // /技能名 在等这份清单：查到（或查失败）都接着提交，查失败就按普通文字发
+            if let thread = locked({ () -> String? in defer { skillThread = nil }; return skillThread }) { startTurn(threadId: thread) }
         default:
             // 补充的话没送进去（这一轮刚好结束了之类）：告诉网页，留到这一轮结束后再发
             if tag.hasPrefix("steer:"), error != nil {
@@ -440,9 +421,16 @@ final class CodexLiveTurn: LiveTurn {
             return
         }
         var items: [[String: Any]]
-        if words.hasPrefix("/"), let name = words.dropFirst().split(separator: " ", maxSplits: 1).first.map(String.init),
-           let skill = app.codexSkill(named: name) {
-            items = req.images.map { ["type": "localImage", "path": $0] } + [["type": "skill", "name": skill.name, "path": skill.path]]
+        let name = words.hasPrefix("/") ? words.dropFirst().split(separator: " ", maxSplits: 1).first.map(String.init) : nil
+        let skills = app.codexSkills(in: skillsCwd)
+        // 技能表按工作目录记：项目级技能可以同名，别的目录的表会发错路径。这个目录还没查过就先查再提交，普通提问不等。
+        if name != nil, skills == nil, !skillsQueried {
+            locked { skillsQueried = true; skillThread = threadId }
+            input.send(["id": 9, "method": "skills/list", "params": ["cwds": [skillsCwd]]])
+            return
+        }
+        if let name, let path = skills?[name] {
+            items = req.images.map { ["type": "localImage", "path": $0] } + [["type": "skill", "name": name, "path": path]]
             let rest = trimmed(String(words.dropFirst(name.count + 1)))
             if !rest.isEmpty { items.append(["type": "text", "text": rest, "text_elements": [Any]()]) }
         } else {
@@ -454,8 +442,8 @@ final class CodexLiveTurn: LiveTurn {
         guard submitInitialPrompt({ input.send(["id": 3, "method": "turn/start", "params": ["threadId": threadId, "input": items]]) }) else {
             input.close(); return
         }
-        // 顺便问一下它有哪些技能（输入框里打 / 时列出来）
-        input.send(["id": 9, "method": "skills/list", "params": ["cwds": [app.validWorkspace(req.workspace) ?? app.home]]])
+        // 顺便问一下它有哪些技能（输入框里打 / 时列出来）；提交前刚查过就不再问
+        if !skillsQueried { input.send(["id": 9, "method": "skills/list", "params": ["cwds": [skillsCwd]]]) }
     }
 
     /// 用户的话轮到了：第一条是提问本身；之后每来一条，就是轮到了一句中途补充的话。

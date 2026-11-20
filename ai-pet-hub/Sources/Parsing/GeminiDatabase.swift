@@ -2,7 +2,7 @@
 import Foundation
 
 // steps 表里每一步是一段 protobuf，没有 .proto，只按字段号读：
-//   step_type 14 = 用户消息：19.2 是原话
+//   step_type 14 = 用户消息：19.2 是原话（桌面版常为空，原话按段在重复的 19.3.1 里），19.9 是附件
 //   step_type 15 = 智能体一步：20.1 是说明 / 正式回答，20.3 是思考摘要，20.7 是发起的工具调用
 //   step_type 132 = 工具结果：5.4.2 工具名，5.4.3 参数 JSON，140.2.1 输出；4 是状态，31 是错误说明
 // 2026-11-17 已按本机 agy 内嵌的 Step / CortexStepStatus / CortexErrorDetails 描述核对字段号。
@@ -74,16 +74,66 @@ struct PBMessage {
     }
 }
 
+// 桌面版的替换参数含未改的上下文；以工具实际返回的补丁为准，不能把整段算成删了重写。
+// 补丁是一个从第 1 行起、带着整份文件的 hunk（2026-11-19 本机 754 条全是），diff 只留改动附近，行数仍按整个补丁数。
+private func agyRecordedDiff(_ step: PBMessage, path: String) -> String? {
+    guard let result = step.message([140,2,6]), result.string(1) == "type.googleapis.com/exa.cortex.core.tools.FileEdit",
+          let edit = result.message([2]), edit.string(2) == path, let patch = edit.message([3]) else { return nil }
+    let hunks = patch.lengthFields().filter { $0.num == 3 }.map { PBMessage($0.value).lengthFields().filter { $0.num == 3 } }.filter { !$0.isEmpty }
+    guard !hunks.isEmpty else { return nil }
+    var parts: [String] = []
+    for hunk in hunks {
+        var ops: [(sign: Character, text: String)] = []
+        for (_, bytes) in hunk {
+            let line = PBMessage(bytes)
+            guard let kind = line.integer(2), let sign: Character = [1:"+",2:"-",3:" "][kind] else { return nil }
+            ops.append((sign, line.string(1) ?? ""))
+        }
+        let part = contextDiff(ops, fromFirstLine: hunks.count == 1)
+        if !part.isEmpty { parts.append(part) }
+    }
+    return parts.joined(separator:"\n")
+}
+
+/// 用户步骤 19.9 里的图片附件 → 和其他几位一样的图片来源。2026-11-18 实测：1 是类型，
+/// agy acp 收到的图片字节在 2，5 的落盘路径并不存在；桌面版没有 2，原图在 5 指向的文件（6 只是小缩略图）。
+/// ref 是「步骤序号#附件序号」，点开原图时按它回库里取（GeminiHistory.swift 的 geminiAttachedImage）。
+func agyImageSources(_ pb: PBMessage, step: Int) -> [[String: Any]] {
+    let attachments = (pb.message([19])?.lengthFields() ?? []).filter { $0.num == 9 }.map { PBMessage($0.value) }
+    return attachments.enumerated().compactMap { k, a in
+        let path = a.string(5) ?? ""
+        guard (a.string(1) ?? "").hasPrefix("image/") || chatImageExts.contains((path as NSString).pathExtension.lowercased()) else { return nil }
+        if let bytes = a.message([2])?.bytes, !bytes.isEmpty { return ["data": bytes.base64EncodedString(), "ref": "\(step)#\(k)"] }
+        return path.isEmpty ? nil : ["path": path]
+    }
+}
+
+/// /compact 这一轮在会话库里留没留下会读成历史条目的东西：直接用下面的 agyDbTurns 读最后一句提问之后的各步，口径和重开时一致。
+/// agy 不回报 /compact 的结果，只能回会话库里看。2026-11-18 本机 agy 1.5.11 实测：有对话时 /compact 记成「提问 14 → 压缩 23（状态 3）」；
+/// 对着空会话发、或最高权限退回 agy -p（加了 --disable-slash-commands）时当成普通提问作答，留下的是一条回答。
+/// 两种都让记录多一条（网页会滤掉 user「/compact」），实时提示都要算；压缩失败（状态 7）或什么都没写时不算。
+func agyCompactedAfterLastAsk(_ steps: [(type: Int, payload: Data)]) -> Bool {
+    let start = (steps.lastIndex { $0.type == 14 } ?? -1) + 1
+    return !agyDbTurns(Array(steps[start...]), cleanUser: { $0 }).isEmpty
+}
+
 /// 把会话库 steps 表的各步（按顺序）还原成和其他两位一样的消息列表：用户消息 + 一次回答（步骤、正式回答、改动文件）。
+/// steps 表的 idx 从 0 连续（2026-11-18 本机 CLI 和桌面版 60 多个会话库全是如此），所以各步在数组里的位置就是转写里的 step_index；
+/// finalStatus 按它给出转写记的最终状态（DONE / ERROR …），只在遇到状态 5 时才问。
 func agyDbTurns(_ steps: [(type: Int, payload: Data)], isHeld: () -> Bool? = { nil },
-                retryEnded: () -> Bool = { false }, cleanUser: (String) -> String) -> [[String: Any]] {
+                retryEnded: () -> Bool = { false }, finalStatus: (Int) -> String? = { _ in nil },
+                cleanUser: (String) -> String) -> [[String: Any]] {
     var out: [[String: Any]] = []
     var turn: TurnBuilder?
     var retries = AgyRetries()
     var interrupted = false
     var latestError = ""
+    var startAt: Double?, endAt: Double?
+    // 最近一句提问是不是手动压缩命令。没见过提问时（如 agyCompactedAfterLastAsk 只读最后一句之后）按手动处理。
+    var manualCompact = true
     lazy var held = isHeld()
     func flush(atEnd: Bool = false) {
+        defer { startAt = nil; endAt = nil }
         guard let t = turn else { return }
         let pending = !retries.isEmpty
         var outcome = interrupted ? "interrupted" : "completed"
@@ -95,6 +145,7 @@ func agyDbTurns(_ steps: [(type: Int, payload: Data)], isHeld: () -> Bool? = { n
         let notice = outcome == "failed" ? agyFailureNotice(latestError.isEmpty ? "agy 返回了 ERROR" : latestError).text : nil
         var bot = t.finish(finalText: notice, outcome: outcome, includeEnding: !pending)
         if !trimmed(bot["text"] as? String).isEmpty || !((bot["steps"] as? [Any]) ?? []).isEmpty {
+            if let startAt, let endAt, endAt > startAt { bot["duration"] = endAt - startAt }
             bot["role"] = "bot"
             out.append(bot)
         }
@@ -103,11 +154,35 @@ func agyDbTurns(_ steps: [(type: Int, payload: Data)], isHeld: () -> Bool? = { n
     for (index, row) in steps.enumerated() {
         let (type, payload) = row
         let pb = PBMessage(payload)
+        let metadata = pb.message([5])
+        func timestamp(_ field: Int) -> Double? {
+            guard let date = metadata?.message([field]), let seconds = date.integer(1) else { return nil }
+            return Double(seconds) + Double(date.integer(2) ?? 0) / 1e9
+        }
+        if [15, 17, 132].contains(type) {
+            let created = timestamp(1)
+            if startAt == nil { startAt = created }
+            // 工具和回答可能分几步完成；旧记录只有创建时间时用最后一个可用的时间。
+            if let last = timestamp(8) ?? timestamp(7) ?? timestamp(6) ?? created { endAt = max(endAt ?? last, last) }
+        }
         switch type {
         case 14:
-            guard let text = pb.string(19, 2), !trimmed(text).isEmpty else { continue }
+            // 反重力桌面版的长会话常把 19.2 留空、原话按段拆进重复的 19.3.1；没有文字也是一次提问，照样切开上一轮。
             flush()
-            out.append(["role": "user", "text": cleanUser(text)])
+            startAt = timestamp(1)
+            var text = pb.string(19, 2) ?? ""
+            if trimmed(text).isEmpty {
+                text = (pb.message([19])?.lengthFields() ?? []).filter { $0.num == 3 }.compactMap { PBMessage($0.value).string(1) }.joined()
+            }
+            manualCompact = ["/compact", "/compress"].contains(trimmed(text))
+            let images = agyImageSources(pb, step: index)
+            guard !trimmed(text).isEmpty || !images.isEmpty else { continue }
+            var user: [String: Any] = ["role": "user", "text": cleanUser(text)]
+            user["createdAt"] = startAt
+            // 本机补记的开始时间可能早于落库，只有数据库自己的时间能标识同文的新提问。
+            user["turnKey"] = startAt
+            if !images.isEmpty { user["imageSources"] = images }
+            out.append(user)
         case 15:
             interrupted = false
             if turn == nil { turn = TurnBuilder() }
@@ -120,15 +195,24 @@ func agyDbTurns(_ steps: [(type: Int, payload: Data)], isHeld: () -> Bool? = { n
             if retries.isEmpty || !detail.isEmpty { latestError = detail }
             if let t = turn { retries.note(in: t, at: index, detail: detail) }
         case 23 where pb.integer(4) == 3:
-            flush()
-            out.append(["role": "compact", "text": "已压缩上下文"])
+            // 手动 /compact、/compress 是一条独立提示；普通提问作答途中 agy 自动压缩，实时只有一张回答卡，
+            // 这里也记成这一轮的一步（和 Claude、Codex、DeepSeek 一样），其后的正文、结局和「重试」都归回原问。
+            if manualCompact {
+                flush()
+                out.append(["role": "compact", "text": "已压缩上下文"])
+            } else {
+                if turn == nil { turn = TurnBuilder() }
+                turn?.add(makeStep("tool", "压缩上下文", status: "ok"))
+            }
         case 132:
             if turn == nil { turn = TurnBuilder() }
             let name = pb.string(5, 4, 2) ?? "tool"
             let params = (pb.string(5, 4, 3).flatMap { try? JSONSerialization.jsonObject(with: Data($0.utf8)) } as? [String: Any]) ?? [:]
             var step = agyToolStep(name: name, params: params)
             // agy 内嵌的 CortexStepStatus 枚举：3 完成，4 无效、6 取消、7 失败、12 中断。
-            let recorded = pb.integer(4)
+            var recorded = pb.integer(4)
+            // 反重力桌面版把已经结束的步骤也留成 5，最终结果只写在转写里；转写读不到或也没结束时照旧按未完成处理。
+            if recorded == 5, let final = finalStatus(index).flatMap({ ["DONE": UInt64(3), "ERROR": 7][$0] }) { recorded = final }
             interrupted = recorded == 6 || recorded == 12
             let failed = recorded == 4 || recorded == 7
             var status = interrupted ? "interrupted" : (failed ? "error" : (recorded == nil || recorded == 3 ? "ok" : "running"))
@@ -145,7 +229,7 @@ func agyDbTurns(_ steps: [(type: Int, payload: Data)], isHeld: () -> Bool? = { n
             if !trimmed(output).isEmpty { step["output"] = clip(output, maxOutput) }
             turn?.add(step)
             if status == "ok", let path = step["path"] as? String, let kind = step["kind"] as? String, ["edit", "write"].contains(kind) {
-                turn?.addFile(path, kind: kind == "write" ? "create" : "edit", diff: agyDiff(params))
+                turn?.addFile(path, kind: kind == "write" ? "create" : "edit", diff: agyRecordedDiff(pb,path:path) ?? agyDiff(params))
             }
         default:
             continue

@@ -1,14 +1,9 @@
 // 会话同步的纯逻辑与页面重载请求编号，离线运行：node tools/test-session-logic.mjs
-// --baseline 只检验旧编号分配器的跨页碰撞（用 git show 读取 HEAD，不改工作区）。
 import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
-import { execFileSync } from 'node:child_process';
 import vm from 'node:vm';
 
-const baseline = process.argv.includes('--baseline');
-const source = file => baseline
-  ? execFileSync('git', ['show', 'HEAD:ai-pet-hub/web/js/' + file], { encoding: 'utf8' })
-  : readFileSync(new URL('../web/js/' + file, import.meta.url), 'utf8');
+const source = file => readFileSync(new URL('../web/js/' + file, import.meta.url), 'utf8');
 let failed = 0, checked = 0;
 function test(name, f) {
   checked++;
@@ -32,105 +27,173 @@ test('N10 同一毫秒重载，旧响应不会命中新请求', () => assert.ok(
 test('N10 时钟回拨仍不复用请求号', () => assert.ok(page(now - 10000)() > newId));
 test('N10 编号保持 JavaScript/原生桥可无损表示的整数', () => assert.ok(Number.isSafeInteger(newId)));
 
-if (!baseline) {
-  test('桌面只读提示复用输入框上方的提示，退出桌面后收起', () => {
-    const hint = {}, cid = 'desktop:both';
-    const ui = vm.createContext({ window: {}, active: 'gemini', S: { gemini: { conversationId: cid } },
-      viewBusy: () => false, lsJson: () => ({}), setInterval() {},
-      document: { createElement: () => hint, getElementById: () => ({ insertBefore() {} }) } });
-    vm.runInContext(source('chat/fork.js'), ui);
-    const data = { agent: 'gemini', conversationId: cid, live: true };
-    ui.window.onSessionLive({ ...data, status: 'readOnly' });
-    assert.equal(hint.hidden, false);
-    assert.match(hint.textContent, /桌面版.*只读/);
-    ui.window.onSessionLive({ ...data, status: 'idle' });
-    assert.match(hint.textContent, /关闭那边的会话/);
-    ui.window.onSessionLive({ ...data, live: false });
-    assert.equal(hint.hidden, true);
+test('补记后来才带请求编号时，同步仍须重新对账', () => {
+  const ui = vm.createContext({});
+  vm.runInContext(source('core/logic.js'), ui);
+  const turn = {role:'bot', text:'半句', outcome:'failed'};
+  assert.notEqual(ui.messageSignature(turn), ui.messageSignature({...turn, endingReqId:17}));
+});
+test('本机截短的备份不能替换窗口里仍然完整的长回答', () => {
+  const ui = vm.createContext({});
+  vm.runInContext(source('core/logic.js'), ui);
+  const prefix = '甲'.repeat(50000);
+  const message = {role:'bot', text:prefix+'…', endingReqId:17};
+  for (const tail of ['末','完整结尾']) {
+    assert.equal(ui.recordedTurnEnding(message, {reqId:17, text:prefix+tail}), false);
+  }
+});
+test('桌面只读提示复用输入框上方的提示，退出桌面后收起', () => {
+  const hint = {}, cid = 'desktop:both';
+  const ui = vm.createContext({ window: {}, active: 'gemini', S: { gemini: { conversationId: cid } },
+    viewBusy: () => false, lsJson: () => ({}), setInterval() {},
+    document: { createElement: () => hint, getElementById: () => ({ insertBefore() {} }) } });
+  vm.runInContext(source('chat/fork.js'), ui);
+  const data = { agent: 'gemini', conversationId: cid, live: true };
+  ui.window.onSessionLive({ ...data, status: 'readOnly' });
+  assert.equal(hint.hidden, false);
+  assert.match(hint.textContent, /桌面版.*只读/);
+  ui.window.onSessionLive({ ...data, status: 'idle' });
+  assert.match(hint.textContent, /关闭那边的会话/);
+  ui.window.onSessionLive({ ...data, live: false });
+  assert.equal(hint.hidden, true);
+});
+for (const batch of [false, true]) test((batch ? '批量' : '单条') + '删除拦截显示原生提供的原因', () => {
+  let message;
+  const ui = vm.createContext({ window: {}, active: 'gemini', S: { gemini: {} }, renderHeader() {}, renderHistory() {}, updateSendUI() {},
+    forgetWorkspace() {}, pets: { gemini: { say: text => { message = text; } } } });
+  vm.runInContext(source('native-callbacks.js') + source('ui/project-delete.js'), ui);
+  const reason = '⚠️ 桌面版可能把会话写回。';
+  if (batch) {
+    vm.runInContext("deletingProjects.set(7, { id: 'gemini' })", ui);
+    ui.window.onConversationsDeleted({ agent: 'gemini', reqId:7, failed: ['desktop:both'], reason });
+  } else ui.window.onConversationDeleted({ agent: 'gemini', ok: false, reason });
+  assert.equal(message, reason);
+});
+test('DH2 历史列表读取失败时保留上次的会话并在左栏写明原因', () => {
+  const st = { conversations: [{ id: 'old', cwd: '/fixture/a' }], addedWs: [], groupState: {}, expanded: new Set() };
+  const nodes = [];
+  const list = { scrollTop: 0, set innerHTML(v) { if (v) nodes.push({ html: v }); else nodes.length = 0; }, appendChild: n => nodes.push(n) };
+  const history = source('ui/history.js');
+  const ui = vm.createContext({ window: {}, active: 'deepseek', S: { deepseek: st }, renderHeader() {}, noteListedStamp() {},
+    histSections: { deepseek: { sec: { classList: { toggle() {} } }, list } }, histQuery: '', isBusy: () => false,
+    liveItems: () => [], buildGroups: () => [], elSpan: (cls, text) => ({ cls, textContent: text, dataset: {} }) });
+  vm.runInContext(source('native-callbacks.js') + history.slice(history.indexOf('function visibleConversation('), history.indexOf('function renderHistorySmooth')), ui);
+  const reason = 'dsh 的本机服务没有启动起来：Error: failed to parse patches cordis.patch.yml: YAMLException (2:6)\n 1 | foo';
+  ui.window.onConversationsListed({ agent: 'deepseek', unavailable: reason });
+  assert.deepEqual(st.conversations.map(c => c.id), ['old']);
+  const shown = nodes.map(n => n.textContent || n.html).join('|');
+  assert.match(shown, /读取失败.*YAMLException \(2:6\)/);
+  ui.window.onConversationsListed({ agent: 'deepseek', items: [{ id: 'new', cwd: '/fixture/a' }] });
+  assert.deepEqual(st.conversations.map(c => c.id), ['new']);
+  assert.doesNotMatch(nodes.map(n => n.textContent || n.html).join('|'), /读取失败/);
+});
+const ctx = vm.createContext({});
+vm.runInContext(source('core/logic.js') + '\nglobalThis.api = { messageSignature, liveHistoryCut };', ctx);
+const { messageSignature, liveHistoryCut } = ctx.api;
+const user = (text, images) => ({ role: 'user', text, images }), bot = text => ({ role: 'bot', text });
+test('F02 等长正文不同', () => assert.notEqual(messageSignature(bot('aaa')), messageSignature(bot('bbb'))));
+// 原生发来的同一条消息，字段先后每次都可能不同：指纹不能跟着变（变了就会一直被当成「别处还在写」）
+test('字段先后不同、内容相同：指纹相同', () => assert.equal(
+  messageSignature({ role: 'bot', text: 'a', steps: [{ kind: 'command', title: '运行命令', detail: 'ls', status: 'ok' }], files: [{ path: '/a', kind: 'edit' }] }),
+  messageSignature({ files: [{ kind: 'edit', path: '/a' }], steps: [{ status: 'ok', detail: 'ls', title: '运行命令', kind: 'command' }], text: 'a', role: 'bot' })));
+test('F02 步骤状态/输出不同', () => assert.notEqual(
+  messageSignature({ ...bot('answer'), steps: [{ status: 'running', output: 'aaa' }] }),
+  messageSignature({ ...bot('answer'), steps: [{ status: 'ok', output: 'bbb' }] }),
+));
+test('长思考保持运行，状态变化但正文相同也立刻撤标；崩溃与旧格式有期限', () => {
+  let clock = now;
+  function classes(...names) {
+    const values = new Set(names);
+    return { contains: name => values.has(name), add: name => values.add(name), remove: name => values.delete(name) };
+  }
+  const label = { textContent: '工作过程' };
+  const step = { classList: classes('step-error'), querySelector: () => ({textContent:'未完成'}) };
+  const work = { classList: classes(), dataset: {}, querySelector: s => s === '.work-label' ? label : step,
+    querySelectorAll: () => step.classList.contains('pending-elsewhere') ? [step] : [] };
+  const bot = { querySelector: () => work };
+  const st = { conversationId: 'test', loadedId: 'test', msgEl: { lastElementChild: bot,
+    querySelectorAll: s => s.startsWith('.msg.bot') ? [bot] : (s === '.work.elsewhere' && work.classList.contains('elsewhere') ? [work] : []) } };
+  // active 设成别的位：桌宠跟随（setElsewherePet）只管选中的那位，它的行为由窗口测试 e2e-ui.js 覆盖
+  const ui = vm.createContext({ Date: { now: () => clock }, setInterval: () => {}, viewBusy: () => false, active: 'claude',
+    durationText: secs => String(secs),
+    S:{gpt:st}, window:{}, messageSignature: m=>m, noteListedStamp:()=>{}, renderMessages:()=>{}, askSessionLive:()=>{}, jumpToSearchHit:()=>{},
+    runsOf:()=>[], viewKey:()=>'', isCompactCommand:()=>false, localAsksInHistory:()=>[], syncAppend:()=>true, nearBottom:()=>true,
   });
-  for (const batch of [false, true]) test((batch ? '批量' : '单条') + '删除拦截显示原生提供的原因', () => {
-    let message;
-    const ui = vm.createContext({ window: {}, active: 'gemini', S: { gemini: {} }, renderHeader() {}, renderHistory() {},
-      forgetWorkspace() {}, pets: { gemini: { say: text => { message = text; } } } });
-    vm.runInContext(source('native-callbacks.js') + source('ui/project-delete.js'), ui);
-    const reason = '⚠️ 桌面版可能把会话写回。';
-    if (batch) {
-      vm.runInContext("projectDelete = { id: 'gemini', deleting: true }", ui);
-      ui.window.onConversationsDeleted({ agent: 'gemini', failed: ['desktop:both'], reason });
-    } else ui.window.onConversationDeleted({ agent: 'gemini', ok: false, reason });
-    assert.equal(message, reason);
-  });
-  const ctx = vm.createContext({});
-  vm.runInContext(source('core/logic.js') + '\nglobalThis.api = { messageSignature, liveHistoryCut };', ctx);
-  const { messageSignature, liveHistoryCut } = ctx.api;
-  const user = (text, images) => ({ role: 'user', text, images }), bot = text => ({ role: 'bot', text });
-  test('F02 等长正文不同', () => assert.notEqual(messageSignature(bot('aaa')), messageSignature(bot('bbb'))));
-  // 原生发来的同一条消息，字段先后每次都可能不同：指纹不能跟着变（变了就会一直被当成「别处还在写」）
-  test('字段先后不同、内容相同：指纹相同', () => assert.equal(
-    messageSignature({ role: 'bot', text: 'a', steps: [{ kind: 'command', title: '运行命令', detail: 'ls', status: 'ok' }], files: [{ path: '/a', kind: 'edit' }] }),
-    messageSignature({ files: [{ kind: 'edit', path: '/a' }], steps: [{ status: 'ok', detail: 'ls', title: '运行命令', kind: 'command' }], text: 'a', role: 'bot' })));
-  test('F02 步骤状态/输出不同', () => assert.notEqual(
-    messageSignature({ ...bot('answer'), steps: [{ status: 'running', output: 'aaa' }] }),
-    messageSignature({ ...bot('answer'), steps: [{ status: 'ok', output: 'bbb' }] }),
-  ));
-  test('长思考保持运行，状态变化但正文相同也立刻撤标；崩溃与旧格式有期限', () => {
-    let clock = now;
-    function classes(...names) {
-      const values = new Set(names);
-      return { contains: name => values.has(name), add: name => values.add(name), remove: name => values.delete(name) };
-    }
-    const label = { textContent: '工作过程' };
-    const step = { classList: classes('step-error'), querySelector: () => ({textContent:'未完成'}) };
-    const work = { classList: classes(), dataset: {}, querySelector: s => s === '.work-label' ? label : step,
-      querySelectorAll: () => step.classList.contains('pending-elsewhere') ? [step] : [] };
-    const bot = { querySelector: () => work };
-    const st = { conversationId: 'test', loadedId: 'test', msgEl: { lastElementChild: bot,
-      querySelectorAll: s => s.startsWith('.msg.bot') ? [bot] : (work.classList.contains('elsewhere') ? [work] : []) } };
-    // active 设成别的位：桌宠跟随（setElsewherePet）只管选中的那位，它的行为由窗口测试 e2e-ui.js 覆盖
-    const ui = vm.createContext({ Date: { now: () => clock }, setInterval: () => {}, viewBusy: () => false, active: 'claude',
-      durationText: secs => String(secs),
-      S:{gpt:st}, window:{}, messageSignature: m=>m, noteListedStamp:()=>{}, renderMessages:()=>{}, askSessionLive:()=>{}, jumpToSearchHit:()=>{},
-      runsOf:()=>[], viewKey:()=>'', isCompactCommand:()=>false, syncAppend:()=>true, nearBottom:()=>true,
+  vm.runInContext(source('chat/elsewhere.js') + source('native-callbacks.js') + '\nglobalThis.on = elsewhereOn;', ui);
+  const read = (running, at = now / 1000) => {
+    st.historyReads = new Map([[1, 'sync']]);
+    ui.window.onConversationLoaded({agent:'gpt',conversationId:'test',reqId:1,messages:[],lastTurn:{running,updatedAt:at}});
+  };
+  read(true); clock += 354000;
+  assert.equal(ui.on('gpt'), true);
+  read(true);
+  assert.match(label.textContent, /在别处运行中/);
+  assert.equal(step.classList.contains('pending-elsewhere'), true);
+  read(false); assert.equal(ui.on('gpt'), false);
+  assert.equal(label.textContent, '工作过程');
+  assert.equal(step.classList.contains('pending-elsewhere'), false);
+  read(true, now / 1000 - 86400); assert.equal(ui.on('gpt'), false);
+  st.elsewhereAt = clock;
+  read(undefined);
+  assert.equal(ui.on('gpt'), true);
+  clock += 180001;
+  assert.equal(ui.on('gpt'), false);
+});
+for (const agent of ['claude','gpt','gemini','deepseek']) {
+  for (const [outcome,running] of [['failed',false],['interrupted',false],['incomplete',true]]) {
+    test(agent+' 外部同步缺少末轮状态 '+outcome, () => {
+      const st = {conversationId:'外部',elsewhereAt:now};
+      const ui = vm.createContext({S:{[agent]:st},Date:{now:()=>now},viewBusy:()=>false,setInterval(){}});
+      vm.runInContext(source('core/logic.js') + source('chat/elsewhere.js'),ui);
+      ui.readElsewhereTurn(agent,{conversationId:'外部',messages:[{role:'bot',text:'半句',outcome}]},false);
+      assert.equal(ui.elsewhereOn(agent),running);
     });
-    vm.runInContext(source('chat/elsewhere.js') + source('native-callbacks.js') + '\nglobalThis.on = elsewhereOn;', ui);
-    const read = (running, at = now / 1000) => {
-      st.historyReads = new Map([[1, 'sync']]);
-      ui.window.onConversationLoaded({agent:'gpt',conversationId:'test',reqId:1,messages:[],lastTurn:{running,updatedAt:at}});
-    };
-    read(true); clock += 354000;
-    assert.equal(ui.on('gpt'), true);
-    read(true);
-    assert.match(label.textContent, /在别处运行中/);
-    assert.equal(step.classList.contains('pending-elsewhere'), true);
-    read(false); assert.equal(ui.on('gpt'), false);
-    assert.equal(label.textContent, '工作过程');
-    assert.equal(step.classList.contains('pending-elsewhere'), false);
-    read(true, now / 1000 - 86400); assert.equal(ui.on('gpt'), false);
-    st.elsewhereAt = clock;
-    read(undefined);
-    assert.equal(ui.on('gpt'), true);
-    clock += 180001;
-    assert.equal(ui.on('gpt'), false);
-  });
-  test('桌面版无项目会话和同目录普通项目分组不同，续聊目录仍在', () => {
-    const cwd = '/fixture/Documents/Codex/2026-11-17/example';   // 不用 /tmp：临时文件夹里的会话会归进「任务会话」
-    const items = [{ id: 'desktop', cwd }, { id: 'project', cwd }];
-    const history = source('ui/history.js');
-    const groups = vm.runInNewContext(history.slice(history.indexOf('const TASK_GROUP'), history.indexOf('function isCollapsed')) + '\nbuildGroups("gpt",items,true)',
-      { S: { gpt: { projectlessIds: new Set(['desktop']) } }, items, wsKey: path => path });
-    assert.equal(groups.find(g => g.key === '').list[0].cwd, cwd);
-    assert.equal(groups.find(g => g.key === cwd).list[0].id, 'project');
-  });
-  const run = { historyStart: 2, text: 'repeat', prompt: 'repeat', images: [] };
-  test('F10 本轮未入历史，不向前找同句', () => assert.equal(liveHistoryCut(run, [user('repeat'), bot('old')]), -1));
-  test('F10 起始位置不确定时不猜', () => assert.equal(liveHistoryCut({ ...run, historyStart: null }, [user('repeat')]), -1));
-  test('F10 改变分页窗口，位置随 omitted 换算', () => assert.equal(liveHistoryCut({ ...run, historyStart: 302 }, [user('older'), bot('older'), user('repeat')], 300), 2));
-  const imgRun = { historyStart: 0, text: '', prompt: '请看这张图片。', images: ['/tmp/a.png'] };
-  test('F10 纯图真实 prompt + path 匹配', () => assert.equal(liveHistoryCut(imgRun, [user(imgRun.prompt, [{ path: '/tmp/a.png' }])]), 0));
-  test('F10 历史纯图正文为空时按图片匹配', () => assert.equal(liveHistoryCut(imgRun, [user('', [{ ref: { id: '/tmp/a.png' } }])]), 0));
-  test('F10 同文但图片不同，不接', () => assert.equal(liveHistoryCut(imgRun, [user(imgRun.prompt, [{ path: '/tmp/b.png' }])]), -1));
-  test('F10 图片身份缺失，不接', () => assert.equal(liveHistoryCut(imgRun, [user(imgRun.prompt, [{ src: 'thumbnail' }])]), -1));
-  test('F10 多了其他图片也不接', () => assert.equal(liveHistoryCut(imgRun, [user(imgRun.prompt, [{ path: '/tmp/a.png' }, { path: '/tmp/b.png' }])]), -1));
+  }
 }
+test('桌面版无项目会话和同目录普通项目分组不同，续聊目录仍在', () => {
+  const cwd = '/fixture/Documents/Codex/2026-11-17/example';   // 不用 /tmp：临时文件夹里的会话会归进「任务会话」
+  const items = [{ id: 'desktop', cwd }, { id: 'project', cwd }];
+  const history = source('ui/history.js');
+  const groups = vm.runInNewContext(history.slice(history.indexOf('const TASK_GROUP'), history.indexOf('function isCollapsed')) + '\nbuildGroups("gpt",items,true)',
+    { S: { gpt: { projectlessIds: new Set(['desktop']) } }, items, wsKey: path => path });
+  assert.equal(groups.find(g => g.key === '').list[0].cwd, cwd);
+  assert.equal(groups.find(g => g.key === cwd).list[0].id, 'project');
+});
+const run = { historyStart: 2, text: 'repeat', prompt: 'repeat', images: [] };
+// 同一组提问必须在首次回读、切回和重试时认领同一轮。附件按实际发送顺序比较。
+for (const agent of ['claude','gpt','gemini','deepseek']) {
+  const ask = {agent, text:'继续', prompt:'继续', historyStart:0, since:2000};
+  const ref = {agent, id:'/图甲.png#0@一', index:0};
+  const sent = {...ask, images:['/图乙.png'], imageRefs:[ref], imageKeys:['甲','乙']};
+  const saved = [{imageKey:'甲', ref}, {path:'/图乙.png', imageKey:'乙'}];
+  for (const [name, local, images, want] of [
+    ['纯文字遇到另一实例的带图同文', ask, saved, -1],
+    ['重试混合附件顺序相同', sent, saved, 0],
+    ['重试混合附件顺序不同', sent, [...saved].reverse(), -1],
+    ['重试只带记录引用，另一张图', {...ask,imageRefs:[ref]}, [{ref:{...ref,id:'不同'}}], -1],
+    ['还原的记录引用与普通附件混发，历史只留路径',
+      {...sent,imageKeys:[],restoredPaths:['/当时的副本.png']}, [{path:'/当时的副本.png'},{path:'/图乙.png'}], 0],
+    ['重试恢复的副本在历史里同时带原路径和发送路径',
+      {...ask,imageRefs:[ref],restoredPaths:['/副本.png']}, [{path:'/原路径.png',ref:{agent,id:'新轮',path:'/副本.png'}}], 0],
+    ['编辑重发，正文提到的路径不算附件', ask, [{path:'/图乙.png',mentioned:true}], 0],
+  ]) test(agent+' '+name, () => assert.equal(liveHistoryCut(local,[user('继续',images)]),want));
+  const asks = ['甲答','乙答'].map(text => ({...ask,historyStart:null,ending:{text,outcome:'completed'}}));
+  test(agent+' 首次回包连续同文并已写完两轮', () => assert.deepEqual(
+    Array.from(ctx.localAsksInHistory(asks,[user('继续'),bot('甲答'),user('继续'),bot('乙答')],3000)),[0,2]));
+  test(agent+' 首次回包旧同文在前、只写进第一轮', () => assert.deepEqual(
+    Array.from(ctx.localAsksInHistory(asks,[user('继续'),bot('旧答'),user('继续'),bot('甲答')],3000)),[2]));
+}
+test('F10 本轮未入历史，不向前找同句', () => assert.equal(liveHistoryCut(run, [user('repeat'), bot('old')]), -1));
+test('F10 起始位置不确定时不猜', () => assert.equal(liveHistoryCut({ ...run, historyStart: null }, [user('repeat')]), -1));
+test('F10 改变分页窗口，位置随 omitted 换算', () => assert.equal(liveHistoryCut({ ...run, historyStart: 302 }, [user('older'), bot('older'), user('repeat')], 300), 2));
+const imgRun = { historyStart: 0, text: '', prompt: '请看这张图片。', images: ['/tmp/a.png'] };
+test('F10 纯图真实 prompt + path 匹配', () => assert.equal(liveHistoryCut(imgRun, [user(imgRun.prompt, [{ path: '/tmp/a.png' }])]), 0));
+test('F10 历史纯图正文为空时按图片匹配', () => assert.equal(liveHistoryCut(imgRun, [user('', [{ ref: { id: '/tmp/a.png' } }])]), 0));
+test('CI 原文件移走、只剩 Codex 记录里「原路径#第几次发送」的 ref 也能对上', () => assert.equal(liveHistoryCut(imgRun, [user('', [{ ref: { id: '/tmp/a.png#0' } }])]), 0));
+test('CI ref 序号前的路径不同，不接', () => assert.equal(liveHistoryCut(imgRun, [user('', [{ ref: { id: '/tmp/b.png#0' } }])]), -1));
+test('CI2 ref 是「原路径#回合里第几次@回合」时也去掉序号和回合再比', () => assert.equal(liveHistoryCut(imgRun, [user('', [{ ref: { id: '/tmp/a.png#0@019a-turn' } }])]), 0));
+test('F10 同文但图片不同，不接', () => assert.equal(liveHistoryCut(imgRun, [user(imgRun.prompt, [{ path: '/tmp/b.png' }])]), -1));
+test('F10 图片身份缺失，不接', () => assert.equal(liveHistoryCut(imgRun, [user(imgRun.prompt, [{ src: 'thumbnail' }])]), -1));
+test('F10 多了其他图片也不接', () => assert.equal(liveHistoryCut(imgRun, [user(imgRun.prompt, [{ path: '/tmp/a.png' }, { path: '/tmp/b.png' }])]), -1));
 console.log(`${checked - failed}/${checked} 项通过`);
 process.exitCode = failed ? 1 : 0;

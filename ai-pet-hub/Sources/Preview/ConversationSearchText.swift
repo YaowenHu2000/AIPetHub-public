@@ -4,7 +4,7 @@ import JavaScriptCore
 
 final class ConversationSearchText {
     // 历史解析、Markdown/公式或图片标签改变可见文字时加一，使旧的落盘正文重新计算。
-    static let version = 3
+    static let version = 9
     private let context: JSContext?
     private unowned let app: AppDelegate
     private var cwd = ""
@@ -42,8 +42,8 @@ final class ConversationSearchText {
                   return transparent.at(-1) || part.startsWith('<') ? '' : part;
                 }));
             }
-            var searchDirs = [], searchFiles = [];
-            function searchBeginMessage(files) { searchDirs = []; searchFiles = files; }
+            var searchDirs = [], searchFiles = [], searchCwd = '';
+            function searchBeginMessage(files, cwd) { searchDirs = []; searchFiles = files; searchCwd = cwd; }
             function searchRichText(text, loadImages) {
               const html = renderRich(text).replace(/<pre\b[\s\S]*?<\/pre>|<code\b[^>]*>([\s\S]*?)<\/code>|<span class="file-chip"([^>]*)>([\s\S]*?)<\/span><\/span>|<span class="file-maybe"([^>]*)>([\s\S]*?)<\/span>/g,
                 (whole, code, chipAttrs, chipBody, maybeAttrs) => {
@@ -51,7 +51,7 @@ final class ConversationSearchText {
                   if (code !== undefined) { noteCodeDirectory(searchDirs, searchDecode(code.replace(/<[^>]*>/g, ''))); return whole; }
                   const attrs = chipAttrs ?? maybeAttrs;
                   const path = searchDecode(attrs.match(/data-path="([^"]*)"/)?.[1] || '');
-                  const plan = fileReferencePlan(path, chipAttrs !== undefined, searchFiles, searchDirs);
+                  const plan = fileReferencePlan(path, chipAttrs !== undefined, searchFiles, searchDirs, searchCwd);
                   if (plan.edited || chipAttrs === undefined || searchFileExists(path, plan.dirs)) return whole;
                   return /data-src="link"/.test(attrs) ? whole : '<code>' + escapeHtml(path) + '</code>';
                 });
@@ -135,7 +135,7 @@ final class ConversationSearchText {
     /// 和定位选中的正文节点一致：工具标题、详情、输出包含在内，拷贝等控件标签不参与。
     func messages(_ messages: [[String: Any]]) -> [String] {
         messages.map { message in
-            context?.objectForKeyedSubscript("searchBeginMessage")?.call(withArguments: [message["files"] as? [[String: Any]] ?? []])
+            context?.objectForKeyedSubscript("searchBeginMessage")?.call(withArguments: [message["files"] as? [[String: Any]] ?? [], cwd])
             let text = message["text"] as? String ?? ""
             if message["role"] as? String == "user" {
                 if trimmed(text).range(of: #"^/(compact|compress)$"#, options: .regularExpression) != nil { return "" }

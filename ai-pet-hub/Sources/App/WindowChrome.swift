@@ -29,7 +29,7 @@ extension AppDelegate {
 
     /// 把红绿灯往下、往右挪一点，竖直落在 44pt 顶栏的正中（系统默认把它们放在标题栏的正中，离顶 16pt，
     /// 比顶栏里的搜索框、标题高 6pt）。只挪按钮自己，而且不挪出装着它们的那一条标题栏——
-    /// 上一次是把标题栏容器加高，结果真实窗口里红绿灯整个不见了；这一版用 tools/uitest/e2e-chrome.js 在真实窗口里量过、截过图。
+    /// 上一次是把标题栏容器加高，结果真实窗口里红绿灯整个不见了；这一版当时在真实窗口里量过、截过图（那套测试已在 53e3fde 并掉，现在只有 tools/uitest/prelude.js 的 trafficLights 能读到红绿灯位置）。
     func layoutTrafficLights() {
         guard let window = window, !window.styleMask.contains(.fullScreen) else { return }
         let buttons = [NSWindow.ButtonType.closeButton, .miniaturizeButton, .zoomButton].compactMap { window.standardWindowButton($0) }

@@ -8,16 +8,19 @@ func testHistoryContext() {
     try! fm.createDirectory(at: root, withIntermediateDirectories: true)
     defer { try? fm.removeItem(at: root) }
     func context(_ agent: String, _ cid: String) -> [String: Any]? {
-        var result: [String: Any]?
+        var result: [String: Any]?, readAt: Double?
         let done = DispatchSemaphore(value: 0)
-        app.jsSink = { name, row in
-            if name == "onConversationLoaded" { result = row["context"] as? [String: Any]; done.signal() }
+        app.hooks.jsSink = { name, row in
+            if name == "onConversationLoaded" { result = row["context"] as? [String: Any]; readAt = row["readAt"] as? Double; done.signal() }
         }
+        let before = Date().timeIntervalSince1970 * 1000
         app.loadConversation(agent: agent, cid: cid)
         // 回包一到就往下走；期限只防卡死。压缩记录要经 python 写的假 zstd 跑好几次，机器很忙时 5 秒会偶发来不及。
-        // 20 秒仍短于 App 给 zstd 的 30 秒超时，等到超时才回包的情况照样判失败
-        check(done.wait(timeout: .now() + 20) == .success, "打开历史及时返回")
-        app.jsSink = nil
+        // 门槛不用统一上限：坏路径是等 App 给 zstd 的 30 秒超时（CodexHistory、DeepSeekHistory、CodexProjection）才回包，取一半 15 秒才拦得住
+        check(waitSignal(done, limit: 15), "打开历史及时返回")
+        // 网页靠它分辨读取期间发的提问在不在这份记录里：必须是这次读取开始的时刻（和 Date.now() 同一时钟）
+        check(readAt.map { $0 >= before && $0 <= Date().timeIntervalSince1970 * 1000 } == true, "\(agent) 打开历史的回包带上开始读取的时刻 \(String(describing: readAt))")
+        app.hooks.jsSink = nil
         return result
     }
 

@@ -68,44 +68,55 @@ function renderWelcome() {
     b.classList.toggle('on', (b.dataset.safe === '1') === welcomeSafe);
     b.addEventListener('click', () => { welcomeSafe = b.dataset.safe === '1'; renderWelcome(); });
   });
-  welcome.querySelector('.wl-note').textContent = probing ? '' : (found.length ? `会启用找到的 ${found.length} 位` : '一位都没找到：先装上至少一个，再点「重新检测」');
+  // 存过名单（重看）时关掉引导页不改名单（见 closeWelcome），提示不能再说「会启用找到的」
+  welcome.querySelector('.wl-note').textContent = probing ? '' : !found.length ? '一位都没找到：先装上至少一个，再点「重新检测」'
+    : lsGet('enabled_agents') ? '启用名单不变，增删用「添加 AI」' : `会启用找到的 ${found.length} 位`;
   welcome.querySelector('.wl-recheck').addEventListener('click', () => {
     ALL_AGENT_IDS.forEach(id => delete agentProbe[id]);
     renderWelcome();
-    postNative('probeAgents', { agents: ALL_AGENT_IDS });
+    postNative('probeAgents', { agents: ALL_AGENT_IDS, refresh: true });
   });
   welcome.querySelector('.wl-go').addEventListener('click', closeWelcome);
+  welcome.querySelector('.wl-opt.on').focus();
 }
 
 function openWelcome() {
   welcome.classList.remove('settled');
   setTimeout(() => welcome.classList.add('settled'), 800);   // 依次出现只演这一遍
   welcomeSafe = ALL_AGENT_IDS.some(id => S[id].perm === AGENTS[id].safePerm && AGENTS[id].safePerm !== AGENTS[id].perm);
-  renderWelcome();
+  document.getElementById('main').inert = true;
   welcome.hidden = false;
+  renderWelcome();
   if (ALL_AGENT_IDS.some(id => !agentProbe[id])) postNative('probeAgents', { agents: ALL_AGENT_IDS });
 }
 
 function closeWelcome() {
-  // 权限：选了「保守」就把每位换到各自的保守档；选「最高」就换回默认
+  // 权限：选了「保守」就把每位换到各自的保守档；选「最高」就换回默认。
+  // 重看时什么都不点直接关，也按当前高亮的那项（通常是最高权限）重设各位——用户 2026-11-18 定的，有意如此，不是 bug
   ALL_AGENT_IDS.forEach(id => {
     const want = welcomeSafe ? AGENTS[id].safePerm : AGENTS[id].perm;
     if (want && S[id].perm !== want) { S[id].perm = want; lsSet(`${id}_perm`, want); }
   });
   renderComposer();
-  // 启用名单：找到了几位就用那几位（一位都没找到就先保持原样，界面还看得到）
+  // 启用名单：只在还没存过名单时（第一次）自动定，重看时用户已经增删过，不能覆盖。
+  // 检测还没回来就先不存：引导页关了以后，晚到的检测由 onAgentsProbed（ui/agents.js）按同样的规则定名单。
+  // 找到了几位就用那几位（一位都没找到就先保持原样，界面还看得到）
   const found = ALL_AGENT_IDS.filter(id => agentProbe[id]?.found);
-  if (found.length && found.join() !== AGENT_IDS.join()) {
+  const probing = ALL_AGENT_IDS.some(id => !agentProbe[id]);
+  if (lsGet('enabled_agents') || probing) {
+    // 不动名单
+  } else if (found.length && found.join() !== AGENT_IDS.join()) {
     AGENT_IDS.splice(0, AGENT_IDS.length, ...found);
-    if (!AGENT_IDS.includes(active)) setActive(AGENT_IDS[0], false);
     afterAgentsChanged();
-    setActive(active, false);
+    setActive(AGENT_IDS.includes(active) ? active : AGENT_IDS[0], false);
     AGENT_IDS.forEach(id => postNative('listConversations', { agent: id }));
   } else {
     saveEnabledAgents();
   }
   lsSet('welcomed', '1');
   welcome.hidden = true;
+  document.getElementById('main').inert = false;
+  els.input.focus();
 }
 
 // 检测结果到了：引导页开着的话刷新一下

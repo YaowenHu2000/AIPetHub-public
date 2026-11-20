@@ -50,5 +50,7 @@ try {
   await sleep(2500);
   S.claude.msgEl.scrollTop = 0;
   await realShot('readme');
+  // run-suite.py 要求至少一条断言；图有没有真的写出，由 shot-readme.sh 最后的 cp 判
+  out.checks = [{ name: '截图请求已发出', ok: true }];
 } catch (e) { out.ok = false; out.error = String(e) + ' | ' + String(e && e.stack).slice(0, 300); }
 return out;

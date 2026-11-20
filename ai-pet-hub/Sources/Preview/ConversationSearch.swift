@@ -1,12 +1,18 @@
 // 正文搜索先粗筛来源，再用打开历史的解析器和网页 Markdown 渲染确认；不建立磁盘索引。
+//
+// 搜索标题和工作空间会匹配全部候选，单字也能搜到最近列表以外的会话。
+// Codex 搜索只枚举一次活动记录目录，索引里的标题和工作目录足以判断单字命中。
+// 两个字起同时搜正文。
+// 正文搜索先筛候选，再复用打开会话的历史解析和网页 Markdown 渲染确认；覆盖用户消息、回答、补充以及工作步骤的标题、详情和输出。
+// 结果分批累计返回，来源读不到时明确提示。
 import Cocoa
 import SQLite3
 
 extension AppDelegate {
-    func searchConversations(agent: String, query: String, files: [(cid: String, path: String)]? = nil) {
+    func searchConversations(agent: String, query: String, reqId: Int? = nil, files: [(cid: String, path: String)]? = nil) {
         let q = trimmed(query)
         let request = ConversationSearchRequests.shared.begin(self, agent: agent)
-        guard q.count >= 2 else {
+        guard !q.isEmpty else {
             sendToJS("onConversationsSearched", ["agent": agent, "query": query, "ids": [String](), "complete": true]); return
         }
         DispatchQueue.global(qos: .userInitiated).async { [self] in
@@ -17,21 +23,31 @@ extension AppDelegate {
             func publish(_ complete: Bool) {
                 guard current() else { return }
                 var payload: [String: Any] = ["agent": agent, "query": query, "ids": ids, "items": items, "complete": complete, "scanned": scanned]
+                payload["reqId"] = reqId
                 if !problems.isEmpty { payload["unavailable"] = Array(Set(problems)).sorted().joined(separator: "；") }
                 sendToJS("onConversationsSearched", payload)
                 sent = Date()
             }
             guard renderer.available else { problems.append("这一位没搜：正文渲染器读取失败"); publish(true); return }
-            let found = searchSources(agent: agent, files: files)
+            let found = searchSources(agent: agent, files: files, metadataOnly:q.count < 2)
             if let error = found.error { problems.append("这一位没搜：" + error) }
             let cache = hooks.conversationSearchCache ?? ConversationSearchCache.shared
+            let endings = q.count >= 2 ? endingMarks(agent) : [:]
             for source in found.sources {
                 guard current() else { return }
                 scanned += 1
+                func matchesMetadata(_ item: [String: Any]) -> Bool {
+                    ["title", "cwd"].contains { (item[$0] as? String)?.range(of: q, options: .caseInsensitive) != nil }
+                }
+                if q.count < 2 {
+                    if matchesMetadata(source.item) { items.append(source.item) }
+                    continue
+                }
                 let key = agent + ":" + source.cid + ":" + source.paths.joined(separator: "|")
-                let stamp = searchStamp(source)
+                let ending = searchEndingMark(source, marks:endings)
+                let stamp = searchStamp(source, ending:ending)
                 let shared = searchSharedDatabases(source)
-                let individualStamp = shared.isEmpty ? nil : searchStamp(source, excluding: shared)
+                let individualStamp = shared.isEmpty ? nil : searchStamp(source, excluding:shared, ending:ending)
                 var cachedValue = cache.get(key, stamp: stamp)
                 if cachedValue == nil, let individual = individualStamp,
                    let previous = cache.revalidationCandidate(key, individualStamp: individual),
@@ -46,9 +62,10 @@ extension AppDelegate {
                 if let cached = cachedValue {
                     texts = cached.texts; item = cached.item
                 } else {
-                    let candidate = searchCandidate(source, query: q)
+                    let candidate = ending.isEmpty ? searchCandidate(source, query:q) : (possible:true, error:nil as String?)
                     if let error = candidate.error { problems.append(error) }
                     guard candidate.possible else {
+                        if matchesMetadata(source.item) { items.append(source.item) }
                         if Date().timeIntervalSince(sent) >= 0.3 { publish(false) }
                         continue
                     }
@@ -77,6 +94,11 @@ extension AppDelegate {
                                   individualStamp: individualStamp, databaseRevision: databaseRevision)
                     }
                 }
+                // 摘要可能独立于正文缓存改名，列表里的最新标题和目录优先。
+                for field in ["title", "cwd"] {
+                    if let value = source.item[field] as? String, !value.isEmpty { item[field] = value }
+                }
+                if let task = source.item["task"] { item["task"] = task }
                 if let hit = texts.lastIndex(where: { $0.range(of: q, options: .caseInsensitive) != nil }) {
                     ids.append(source.cid)
                     item["searchLimit"] = max(300, texts.count - hit)
@@ -84,7 +106,7 @@ extension AppDelegate {
                         item["searchMatch"] = String(texts[hit][range])
                     }
                     items.append(item)
-                }
+                } else if matchesMetadata(item) { items.append(item) }
                 if Date().timeIntervalSince(sent) >= 0.3 { publish(false) }
             }
             publish(true)

@@ -1,10 +1,9 @@
 // 不用 CLI：外部会话运行标记、收起后的补充、文件链接/预览、桌宠状态、栏位收放、原生窗口点击。
 // REAL=1 tools/uitest/run.sh claude e2e-ui.js
-const {out, check, note, until, finish} = makeSuite('ui');
+const {out, check, note, until, section, finish} = makeSuite('ui');
 const errors = [];
 const onError = e => errors.push(e.message);
 window.addEventListener('error', onError);
-const section = async (name, fn) => { try { await fn(); } catch (e) { check(name, false, String(e.message || e) + '\n' + String(e.stack || '')); } };
 const pathKey = path => String(path || '').replace(/^\/private(?=\/var\/)/, '');
 const shown = el => !!el && el.getClientRects().length > 0;
 const id = 'claude', box = S[id].msgEl;
@@ -17,7 +16,7 @@ await section('别处运行中', async () => {
   const work = box.querySelector('.work');
   check('外部运行标记出现', work.classList.contains('elsewhere') && label().startsWith('在别处运行中'), label());
   check('计时从历史时长继续', label() === '在别处运行中 · 已 5 分 35 秒', label());
-  await until(() => { if (document.hidden) markElsewhere(id); return label() !== '在别处运行中 · 已 5 分 35 秒'; }, 4000, '外部运行计时增加');
+  await until(() => { if (document.hidden) markElsewhere(id); return label() !== '在别处运行中 · 已 5 分 35 秒'; }, '外部运行计时增加');
   check('外部运行计时递增', /在别处运行中 · 已 5 分 (3[6-9]|[4-5]\d) 秒/.test(label()), label());
   // 桌宠跟着动：最后一步已做完 → 在想下一步；状态里写明在别处
   const petStatus = () => pets[id].statusEl.textContent;
@@ -52,10 +51,12 @@ await section('补充的可见性', async () => {
   const works = [...box.querySelectorAll('.work')], [withSteer, plain] = works;
   check('两轮默认收起', works.length === 2 && works.every(w => !w.classList.contains('open')), works.length);
   check('收起时仍显示自己的补充', shown(withSteer.querySelector('.step-user')), withSteer.querySelector('.step-user-text')?.textContent);
-  check('收起时隐藏其他步骤', [...withSteer.querySelectorAll('.work-steps > .step:not(.step-user)')].every(s => !shown(s)));
+  // 先数够两步（命令、思考）：一步都没渲染时 every 对空数组也成立
+  const others = [...withSteer.querySelectorAll('.work-steps > .step:not(.step-user)')];
+  check('收起时隐藏其他步骤', others.length === 2 && others.every(s => !shown(s)), others.length);
   check('没有补充时隐藏整个步骤列表', !shown(plain.querySelector('.work-steps')));
   withSteer.querySelector('.work-head').click();
-  await until(() => [...withSteer.querySelectorAll('.work-steps > .step')].every(shown), 2000, '工作步骤展开');
+  await until(() => [...withSteer.querySelectorAll('.work-steps > .step')].every(shown), '工作步骤展开');
   check('展开后所有步骤可见', withSteer.querySelectorAll('.work-steps > .step').length === 3 && [...withSteer.querySelectorAll('.work-steps > .step')].every(shown));
 });
 
@@ -66,16 +67,16 @@ await section('文件链接与预览', async () => {
   const before = turn.querySelector('.answer').textContent;
   note('核对前的文件候选', [...turn.querySelectorAll('.file-maybe')].map(e => e.textContent));
   verifyFileChips(turn, REPO);
-  await until(() => ['page.html', 'red.png', 'keep.txt'].every(name => [...turn.querySelectorAll('.file-chip')].some(c => c.textContent === name)), 6000, '真实文件核对');
+  await until(() => ['page.html', 'red.png', 'keep.txt'].every(name => [...turn.querySelectorAll('.file-chip')].some(c => c.textContent === name)), '真实文件核对');
   const chips = [...turn.querySelectorAll('.file-chip')];
   check('文件名在前文目录或工作区中正确解析', chips.some(c => c.textContent === 'page.html' && pathKey(c.dataset.path) === pathKey(DIR + '/page.html')) && chips.some(c => c.textContent === 'red.png' && pathKey(c.dataset.path) === pathKey(DIR + '/red.png')) && chips.some(c => c.textContent === 'keep.txt' && pathKey(c.dataset.path) === pathKey(REPO + '/keep.txt')), chips.map(c => ({name:c.textContent,path:c.dataset.path})));
   check('不存在的文件和 Node.js 不成为文件链接', !chips.some(c => ['没有这个文件.md','nothing.md','Node.js'].includes(c.textContent)), chips.map(c => c.textContent));
   check('核对不改变回答文字', turn.querySelector('.answer').textContent === before, turn.querySelector('.answer').textContent);
   chips.find(c => c.textContent === 'keep.txt').click();
-  await until(() => document.querySelector('.ed-code .cl'), 6000, 'keep.txt 预览内容');
+  await until(() => document.querySelector('.ed-code .cl'), 'keep.txt 预览内容');
   check('点击文件链接显示代码与标签', [...document.querySelectorAll('.ed-tab-name')].some(e => e.textContent === 'keep.txt') && document.querySelector('.ed-code')?.textContent.includes('hello'), document.querySelector('.ed-code')?.textContent);
   chips.find(c => c.textContent === 'page.html').click();
-  await until(() => [...document.querySelectorAll('.ed-tab-name')].some(e => e.textContent === 'page.html'), 4000, 'page.html 预览标签');
+  await until(() => [...document.querySelectorAll('.ed-tab-name')].some(e => e.textContent === 'page.html'), 'page.html 预览标签');
   check('点击另一个文件保留两个标签', ['keep.txt','page.html'].every(name => [...document.querySelectorAll('.ed-tab-name')].some(e => e.textContent === name)));
 });
 
@@ -89,12 +90,12 @@ await section('桌宠状态和入口', async () => {
     p.setBusy(true); check(a + ' 忙碌进入工作状态', BUSY_STATES.has(p.state), p.state);
     p.setBusy(false); check(a + ' 空闲退出工作状态', !BUSY_STATES.has(p.state), p.state);
     p.startDrag(); check(a + ' 拖拽进入拖动状态', p.dragging && p.state === 'dragged', p.state);
-    p.endDrag(); await until(() => !p.dragging && !p.falling, 4000, a + ' 松手落地');
+    p.endDrag(); await until(() => !p.dragging && !p.falling, a + ' 松手落地');
     check(a + ' 松手清除拖动状态', !p.card.classList.contains('dragging') && p.state !== 'dragged', p.state);
     if (S[a].roam) p.toggleRoam(); p.toggleRoam();
     check(a + ' 散步开关进入行走状态', S[a].roam && p.state === 'walk', p.state);
     p.toggleRoam(); check(a + ' 关闭散步恢复空闲', !S[a].roam && p.state !== 'walk', p.state);
-    p.toggleSleep(); await until(() => p.state === 'sleep', 10000, a + ' 入睡'); check(a + ' 小憩进入睡眠', p.state === 'sleep');
+    p.toggleSleep(); await until(() => p.state === 'sleep', a + ' 入睡'); check(a + ' 小憩进入睡眠', p.state === 'sleep');
     p.toggleSleep(); check(a + ' 再点小憩醒来', p.state !== 'sleep', p.state);
     p.celebrate(); check(a + ' 完成反馈可触发', p.state === 'happy', p.state);
   }
@@ -105,8 +106,8 @@ await section('桌宠状态和入口', async () => {
   check('点桌宠切换并开启无工作区新会话', active === 'gemini' && !S.gemini.workspace && !S.gemini.conversationId && !!histSections.gemini.list.querySelector('.conv-row.pending'), {active,workspace:S.gemini.workspace,conversation:S.gemini.conversationId});
   setActive(id, false);
   openPreview({path:REPO + '/keep.txt',base:'',diff:'@@ -1 +1,2 @@\n hello\n+world'});
-  await until(() => document.querySelector('.ed-code .cl'), 5000, '改动预览'); check('改动预览显示代码行', document.querySelectorAll('.ed-code .cl').length > 0);
-  openBrowser(PAGE); await until(() => pathKey(browser.file) === pathKey(PAGE) || browser.url === PAGE, 5000, '打开网页');
+  await until(() => document.querySelector('.ed-code .cl'), '改动预览'); check('改动预览显示代码行', document.querySelectorAll('.ed-code .cl').length > 0);
+  openBrowser(PAGE); await until(() => pathKey(browser.file) === pathKey(PAGE) || browser.url === PAGE, '打开网页');
   check('内置浏览器打开指定测试页', pathKey(browser.file) === pathKey(PAGE) || browser.url === PAGE, {file:browser.file,url:browser.url});
   closePreview();
 });
@@ -117,7 +118,7 @@ await section('栏位收放', async () => {
   const btn = document.querySelector('#chat-header .btn-stage-toggle');
   btn.click(); check('聊天栏开关收起舞台并保存', stageHidden() && lsGet('stage_hidden') === '1');
   btn.click(); check('再点开关展开舞台并保存', !stageHidden() && lsGet('stage_hidden') !== '1');
-  openBrowser(PAGE); await until(() => !pane.el.hidden, 3000, '预览打开');
+  openBrowser(PAGE); await until(() => !pane.el.hidden, '预览打开');
   const paneBtn = document.querySelector('#preview-pane .btn-stage-toggle');
   check('打开预览后开关转移到预览面板', !shown(btn) && shown(paneBtn));
   paneBtn.click(); check('预览面板开关可收起舞台', stageHidden()); paneBtn.click(); closePreview();
@@ -141,7 +142,7 @@ await section('原生窗口点击', async () => {
     // 原生 testClick 分开派发 down/up；必须等上一击 mouseup，不能在聚焦的 down 阶段就发下一击。
     let released = false; const onUp = () => { released = true; };
     document.addEventListener('mouseup', onUp, true);
-    try { const r = el.getBoundingClientRect(); postNative('testClick',{x:r.left+r.width/2,y:r.top+r.height/2}); await until(() => released && condition(), 3000, name); check(name, !!condition()); }
+    try { const r = el.getBoundingClientRect(); postNative('testClick',{x:r.left+r.width/2,y:r.top+r.height/2}); await until(() => released && condition(), name); check(name, !!condition()); }
     finally { document.removeEventListener('mouseup', onUp, true); }
   };
   const search = document.getElementById('hist-search');

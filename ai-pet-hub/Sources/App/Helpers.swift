@@ -24,6 +24,12 @@ extension AppDelegate {
         return candidates.first.flatMap { lookupOnPath(($0 as NSString).lastPathComponent) }
     }
 
+    /// 只有确认路径不存在才能清掉会话附加记录；父目录不可进入也会让 fileExists 返回 false。
+    func historyAccessError(_ path: String, mode: Int32 = R_OK) -> String? {
+        guard access(path, mode) != 0, errno != ENOENT && errno != ENOTDIR else { return nil }
+        return "历史记录无法读取：" + String(cString: strerror(errno))
+    }
+
     func modificationDate(_ path: String) -> Date? {
         (try? fm.attributesOfItem(atPath: path))?[.modificationDate] as? Date
     }
@@ -66,7 +72,7 @@ extension AppDelegate {
     /// 旧版桌宠曾在提示词前拼接人设，展示历史时去掉。
     func stripPersonaPrefix(_ raw: String) -> String {
         var s = raw
-        if let note = s.range(of: codexNoteMarker) { s = String(s[..<note.lowerBound]) }   // 应用自动附的说明（CodexLive.swift）
+        if let note = s.range(of: codexNoteMarker) { s = String(s[..<note.lowerBound]) }   // 应用自动附的说明（CodexRun.swift）
         if let start = s.range(of: "<USER_REQUEST>"), let end = s.range(of: "</USER_REQUEST>"), start.upperBound <= end.lowerBound {
             s = String(s[start.upperBound..<end.lowerBound])
         }

@@ -5,8 +5,7 @@
 // ===== 回答进行中：实时显示工作步骤 =====
 function nearBottom(box) { return box.scrollHeight - box.scrollTop - box.clientHeight < 80; }
 
-function startLiveTurn(id, run) {
-  const box = S[id].msgEl;
+function startLiveTurn(id, run, box = S[id].msgEl) {
   box.querySelector('.chat-empty')?.remove();
   const el = document.createElement('div');
   el.className = 'msg bot turn live';
@@ -78,8 +77,8 @@ function attachRuns(id) {
   running.forEach(r => r.nodes.forEach(n => box.appendChild(n)));
   scrollToBottom(box);
 }
-const prettyPath = p => p.replace(/^\/Users\/[^/]+/, '~');
-const isHomeLike = p => !p || p === '/' || /^\/Users\/[^/]+\/?$/.test(p);
+const prettyPath = p => window.hubHome && (p === window.hubHome || p.startsWith(window.hubHome + '/')) ? '~' + p.slice(window.hubHome.length) : p;
+const isHomeLike = p => !p || p === '/' || p.replace(/\/+$/, '') === window.hubHome;
 const wsKey = cwd => (isHomeLike(cwd || '') ? '' : String(cwd).replace(/\/+$/, ''));
 const baseName = p => p.split('/').filter(Boolean).pop() || p;
 

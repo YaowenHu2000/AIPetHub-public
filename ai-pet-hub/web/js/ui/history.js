@@ -1,6 +1,25 @@
 'use strict';
 
-// 左栏：三位的历史会话（按工作空间分组）、搜索、删除会话、打开会话、新对话（删除整个项目在 project-delete.js）。
+// 左栏：各位的历史会话（按工作空间分组）、搜索、删除会话（会话行与打开 / 新对话在 history-rows.js，删除整个项目在 project-delete.js）。
+//
+// 侧栏和删除项目共用任务会话来源。
+// Claude 的 Python 和 TypeScript SDK 会话归入任务，其他入口核对新版入口与直接创建的会话编号；Gemini 核对同一份 CLI 启动日志里的新建会话与 print 发送记录，
+// 并记住已确认的来源，DeepSeek 核对首问是否由 headless 直接交给 agent。
+// 交互式续写不改变来源。
+// 用户右键移进移出的分组记在本实例的网页存储（WebKit 不在实例之间实时同步），同时经分布式通知告诉其他实例；删除项目发出前按最新分组重新筛选，名单变了先重新显示数量再确认。
+//
+// 四位助手的单删、项目部分成功、聊天页缺失和后台未读核对都由 `removeConversations` 接收已确认的编号。
+// 它一起撤下列表、在途搜索命中、未读、改动预览和当前聊天页；输入框里退回给当前聊天页的稿子转到原项目的新对话。
+// 原搜索词的新请求可以接纳恢复的记录。
+// 删除成功会通过 macOS 分布式通知请其他实例重读各自的 CLI 来源。
+// 手动刷新、切回助手或窗口、重新启用和定时刷新共用 `refreshHistory`。
+// 未读按助手和会话逐条存储，兼容旧数组，两个窗口操作不同会话时各写自己的编号。
+//
+// 历史目录暂时不可读时保留上次列表并提示原因。
+// 最近列表最多 300 条，落在外面的当前会话和后台未读按编号核对。
+// 重新看到编号时撤销旧核对，读错或当前仍在回答时保留页面。
+// 点「显示更早」或定位搜索命中时按需增加显示范围。
+// 项目删除回执按提交时的请求编号归回相应项目，另开确认框不影响已提交的操作。
 
 function openPetSettings(id, anchor) {
   openPopover(anchor, () => {
@@ -28,7 +47,7 @@ function openPetSettings(id, anchor) {
   }, { placement: 'bottom', keepOpen: true });
 }
 
-// ===== 左栏：三位的历史会话上下三格，每格按工作空间分组（可折叠） =====
+// ===== 左栏：启用的几位的历史会话，每位一格上下排，每格按工作空间分组（可折叠） =====
 const histSections = {};
 const GROUP_PREVIEW = 5;
 
@@ -60,7 +79,7 @@ function buildHistorySection(id) {
   refresh.title = '刷新历史会话';
   refresh.addEventListener('click', e => {
     e.stopPropagation();
-    postNative('listConversations', { agent: id });
+    refreshHistory(id);
     pets[id].say('已刷新历史列表 ↻', 1500);
   });
   const add = document.createElement('button');
@@ -132,28 +151,100 @@ function isCollapsed(id, key, index) {
 
 function renderAllHistory() { AGENT_IDS.forEach(renderHistory); }
 
-// 左栏顶部的搜索：按会话标题或工作空间名过滤三位的会话
+// 左栏顶部的搜索：按会话标题或工作空间名过滤各位的会话
 let histQuery = '';
 const histSearch = document.getElementById('hist-search');
 let bodySearchTimer = 0;
 histSearch.addEventListener('input', () => {
   histQuery = histSearch.value.trim().toLowerCase();
+  if (histQuery) AGENT_IDS.forEach(id => markBodySearch(id, histQuery));
   renderAllHistory();
   // 停下来 0.3 秒再去翻正文
   clearTimeout(bodySearchTimer);
   const q = histQuery;
-  if (q.length >= 2) bodySearchTimer = setTimeout(() => AGENT_IDS.forEach(id => postNative('searchConversations', { agent: id, query: q })), 300);
+  if (q) bodySearchTimer = setTimeout(() => AGENT_IDS.forEach(id => requestHistorySearch(id,q)), 300);
 });
+function refreshHistory(id, automatic = false) {
+  postNative('listConversations', {agent:id});
+  // 搜索结果包含最近列表以外的会话，切回或刷新时也要读同一个词。慢搜索留给原请求跑完。
+  if (histQuery && !(automatic && S[id].searchInFlight === histQuery)) requestHistorySearch(id,histQuery);
+}
+/**
+ * 这个词从输入起就算「正在搜正文」：首批结果回来以前标题没命中，不等于没有匹配的会话。
+ * 同一个词重搜（切回、刷新）保留上次的命中，等新批次替换，免得列表闪空。
+ */
+function markBodySearch(id, query) {
+  const st = S[id];
+  if (st.bodyQuery === query) return;
+  st.bodyQuery = query;
+  st.bodyHits = new Set();
+  st.bodyItems = [];
+  st.bodyUnavailable = '';
+  st.bodyComplete = false;
+}
+function requestHistorySearch(id, query) {
+  const st = S[id];
+  markBodySearch(id, query);
+  st.bodyRequest = nextRequestId();
+  st.bodyDropped = null;
+  st.searchInFlight = query;
+  postNative('searchConversations', {agent:id, query, reqId:st.bodyRequest});
+}
 window.onConversationsSearched = data => {
   const st = S[data.agent];
-  if (!st || data.query !== histQuery) return;   // 已经改了搜索词
+  if (!st || data.query !== histQuery || (data.reqId != null && data.reqId !== st.bodyRequest)) return;   // 已经改了搜索词
+  const dropped = st.bodyDropped;   // 这次搜索期间删掉的：在途的批次里还带着
   st.bodyQuery = data.query;
-  st.bodyHits = new Set(data.ids || []);
-  st.bodyItems = Array.isArray(data.items) ? data.items : [];
+  st.bodyHits = new Set((data.ids || []).filter(cid => !dropped?.has(cid)));
+  st.bodyItems = (Array.isArray(data.items) ? data.items : []).filter(it => visibleConversation(it) && !dropped?.has(it.id));
   st.bodyUnavailable = data.unavailable || '';
   st.bodyComplete = data.complete !== false;
+  if (st.bodyComplete) st.searchInFlight = '';
   renderHistory(data.agent);
 };
+/** 单删、项目回执和外部缺失都确认了同一件事。一次更新会话的所有入口，避免后台核对只清未读却留下可点的旧页。 */
+function removeConversations(id, ids) {
+  if (!ids.length) return;
+  const st = S[id], gone = new Set(ids);
+  if (st.conversations) st.conversations = st.conversations.filter(item => !gone.has(item.id));
+  if (st.bodyItems) st.bodyItems = st.bodyItems.filter(item => !gone.has(item.id));
+  const dropped = st.bodyDropped ??= new Set();
+  for (const cid of gone) {
+    dropped.add(cid);   // 只挡本次搜索的迟到批次；新搜索能重新发现恢复的源文件。
+    st.bodyHits?.delete(cid);
+    st.unreadChecks?.delete(cid);
+    st.unreadChecked?.delete(cid);
+  }
+  forgetTurnExtras(id, gone);
+  updateConversationUnread(id,gone,false);
+  st.unattendedSince?.forEach(({cid}, requestId) => {
+    if (gone.has(cid)) window.onAgentRequestClosed({agent:id, reqId:0, requestId});
+  });
+  if (gone.has(st.conversationId)) {
+    const book = st.returnedDrafts, owned = book.owner === currentDraftKey(id);
+    st.conversationId = st.loadedId = st.loadedSig = st.pendingTitle = '';
+    st.newView = `new:${++viewSeq}`;
+    // 输入框里是退回给这个会话的稿子（比如发送时才发现它在别处被归档、删掉）：那个会话再也打不开，
+    // 稿子留在输入框，归到原项目的新对话；那里原先等着的退稿排在前面
+    if (owned) {
+      const key = currentDraftKey(id), waiting = book.parked[key];
+      book.owner = key;
+      delete book.parked[key];
+      if (waiting) displayReturnedDraft(id, combineDrafts(draftAttachments(st), [waiting], 'return').merged);
+      saveReturnedDrafts(id);
+    }
+    st.applyCwdOnLoad = false;
+    st.historyReads?.clear();
+    st.elsewhereAt = st.watchUntil = 0;
+    st.externalTurn = null;
+    setElsewherePet(id,null);
+    if (gone.has(lsGet(id+'_conv'))) lsSet(id+'_conv','');
+    showEmpty(id);
+  }
+  refreshUnread(id);
+  renderHistory(id);
+  if (id === active) { renderHeader(); updateSendUI(); }
+}
 document.querySelector('.search-clear').addEventListener('click', e => {
   e.preventDefault();
   histSearch.value = '';
@@ -163,6 +254,8 @@ document.querySelector('.search-clear').addEventListener('click', e => {
 histSearch.addEventListener('keydown', e => {
   if (e.key === 'Escape') { e.stopPropagation(); histSearch.value = ''; histQuery = ''; renderAllHistory(); histSearch.blur(); }
 });
+
+function visibleConversation(item) { return !/\/aipethub-verify\/?$/.test(item.cwd || ''); }
 
 function renderHistory(id) {
   const st = S[id];
@@ -180,7 +273,7 @@ function renderHistory(id) {
   const all = [...listed, ...extra];   // 刚建好、列表里还没有的正在回答的会话放在最前
   // 标题、工作空间里有，或者正文里有（原生在会话记录里找，结果稍后到：onConversationsSearched）
   const inBody = st.bodyQuery === q ? st.bodyHits : null;
-  const items = q ? all.filter(it => (it.title || '').toLowerCase().includes(q) || wsKey(it.cwd).toLowerCase().includes(q) || inBody?.has(it.id)) : all;
+  const items = q ? all.filter(it => (it.title || '').toLowerCase().includes(q) || wsKey(it.cwd).toLowerCase().includes(q) || inBody?.has(it.id) || !listedIds.has(it.id)) : all;
   const groups = buildGroups(id, items, !!q);
   const searchStatus = q.length >= 2 && st.bodyQuery === q
     ? (st.bodyUnavailable || (!st.bodyComplete ? '正在搜索正文…' : '')) : '';
@@ -189,8 +282,15 @@ function renderHistory(id) {
     note.dataset.k = 'search-status';
     list.appendChild(note);
   }
+  if (st.listUnavailable) {
+    // 原因第一行已带出错的文件和行列号；完整的调用栈摘录放在悬停提示里，不撑长左栏
+    const note = elSpan('hist-empty', '历史会话读取失败：' + st.listUnavailable.split('\n')[0]);
+    note.title = st.listUnavailable;
+    note.dataset.k = 'list-status';
+    list.appendChild(note);
+  }
   if (!groups.length) {
-    if (!searchStatus) list.innerHTML = `<div class="hist-empty">${q ? '没有匹配的会话' : '暂无历史会话'}</div>`;
+    if (!searchStatus && !st.listUnavailable) list.innerHTML = `<div class="hist-empty">${q ? '没有匹配的会话' : '暂无历史会话'}</div>`;
     return;
   }
 
@@ -230,7 +330,8 @@ function renderHistory(id) {
     add.title = g.key ? `在「${baseName(g.key)}」里开启新对话` : '开启不绑定工作空间的新对话';
     add.addEventListener('click', e => { e.stopPropagation(); startChatIn(id, g.key); });
     if (!isTasks) head.appendChild(add);   // 任务会话不是一个目录，不在这里开新对话
-    head.addEventListener('click', () => {
+    if (q) head.style.cursor = 'default';
+    else head.addEventListener('click', () => {
       st.groupState[g.key] = collapsed ? 0 : 1;
       lsSet(`${id}_groups`, JSON.stringify(st.groupState));
       renderHistorySmooth(id);
@@ -248,7 +349,7 @@ function renderHistory(id) {
       row.dataset.k = `c:${item.id}`;
       list.appendChild(row);
     });
-    if (g.list.length > GROUP_PREVIEW) {
+    if (!q && g.list.length > GROUP_PREVIEW) {
       const more = document.createElement('div');
       more.className = 'see-all';
       more.dataset.k = `m:${g.key}`;
@@ -261,12 +362,12 @@ function renderHistory(id) {
     }
   });
   list.scrollTop = scroll;
-  if (typeof queueSectionFit === 'function') queueSectionFit();   // 行数变了：三格的高度重新分（layout.js）
+  if (typeof queueSectionFit === 'function') queueSectionFit();   // 行数变了：各格的高度重新分（layout.js）
 }
 
 /**
  * 展开 / 折叠一个工作空间（或者「查看全部」）时重画，但不是一帧闪过去：
- * 还在的行从原来的位置滑到新位置，新出现的行淡进来，消失的行原地淡出去，三格的高度也一起平滑地变。
+ * 还在的行从原来的位置滑到新位置，新出现的行淡进来，消失的行原地淡出去，各格的高度也一起平滑地变。
  * 做法：重画前记下每一行在列表里的位置，重画后算出每一行挪了多少，让它从旧位置动到新位置。
  */
 function renderHistorySmooth(id) {
@@ -275,7 +376,7 @@ function renderHistorySmooth(id) {
   const before = new Map([...list.children].filter(el => el.dataset.k).map(el => [el.dataset.k, { el, top: rel(el) }]));
   const heightsBefore = AGENT_IDS.map(a => histSections[a].sec.getBoundingClientRect().height);
   renderHistory(id);
-  applySectionWeights();   // 三格的高度马上重新分好（平时是攒到下一帧）
+  applySectionWeights();   // 各格的高度马上重新分好（平时是攒到下一帧）
   const rows = [...list.children].filter(el => el.dataset.k).map(el => ({ el, top: rel(el), old: before.get(el.dataset.k) }));
   const heightsAfter = AGENT_IDS.map(a => histSections[a].sec.getBoundingClientRect().height);
   const spring = { duration: SPRING_EASE.snappy.ms, easing: SPRING_EASE.snappy.css };
@@ -299,197 +400,4 @@ function renderHistorySmooth(id) {
     ghost.animate([{ opacity: 1 }, { opacity: 0 }], { duration: 150, easing: 'ease-out', fill: 'forwards' });
     setTimeout(() => ghost.remove(), 170);
   });
-}
-
-/**
- * 左栏要不要显示这一位还没发出消息的「新对话」：只在选中的这一位显示。
- * 没选中的几位当前也停在空白新对话上，以前也各自显示一行「新对话」，看起来像选中了别人的会话。
- * 已经发出、还在回答的新对话照样显示（标题是那句话）；回答出错、没拿到会话 ID 的，切走后就不再占一行。
- */
-function showsNewChat(id) {
-  return !S[id].conversationId && (id === active || viewBusy(id));
-}
-
-/** 还没保存的新对话：放在所在工作空间那一组的最上面。 */
-function newChatRow(id) {
-  const st = S[id];
-  const row = document.createElement('div');
-  row.className = 'conv-row active pending' + (viewBusy(id) ? ' running' : '');
-  row.title = st.pendingTitle ? '新对话（正在建立会话…）' : '新对话（发出第一条消息后保存到这里）';
-  row.appendChild(elSpan('conv-title', st.pendingTitle || '新对话'));
-  row.addEventListener('click', () => { if (id !== active) setActive(id); else els.input.focus(); });
-  return row;
-}
-
-/** 还在回答、还没有会话 ID、而且现在没在看的新对话。 */
-const backgroundNewRuns = id => [...S[id].runs.values()].filter(r => r.view.startsWith('new:') && r.view !== viewKey(id));
-
-/** 正在回答、已经有会话 ID、但历史列表里还没有的会话（CLI 刚建好，列表还没刷新到）：先用提问当标题占个位置。 */
-function liveItems(id) {
-  const st = S[id];
-  const known = new Set((st.conversations || []).map(c => c.id));
-  const out = [];
-  st.runs.forEach(r => {
-    if (r.view.startsWith('new:') || known.has(r.view)) return;
-    known.add(r.view);
-    out.push({ id: r.view, title: r.title || r.text.replace(/\s+/g, ' ').slice(0, 60), time: '正在回答', timestamp: r.since / 1000, cwd: r.workspace });
-  });
-  return out;
-}
-
-/**
- * 这次回答的会话 ID 有了：把回答记到这个会话名下。CLI 一报出 ID 原生层就转过来（onAgentConversation，新对话启动后几秒），
- * 回答结束时也会再带一次。以前要等回答结束才知道，长任务里左栏会同时出现「新对话」和 CLI 记录里的同一个会话，
- * 点开后者看起来像停了；现在新对话马上就是那个会话，只有一行，点开能看到进度，也不会对着它重复发送或删除。
- */
-function bindRun(id, run, cid) {
-  const st = S[id];
-  if (!cid || run.view === cid) return false;
-  const old = run.view;
-  run.view = cid;
-  if (viewKey(id) === old) {   // 正看着它：当前会话就是这个了（App 重启后也会回到这里）
-    st.conversationId = cid;
-    st.loadedId = cid;
-    st.pendingTitle = '';
-    lsSet(`${id}_conv`, cid);
-  }
-  return true;
-}
-
-function pendingRunRow(id, run) {
-  const row = document.createElement('div');
-  row.className = 'conv-row pending running';
-  row.title = '正在回答的新对话（点击查看进度）';
-  row.appendChild(elSpan('conv-title', run.title || '新对话'));
-  row.addEventListener('click', () => openPendingRun(id, run));
-  return row;
-}
-
-function conversationRow(id, item) {
-  const st = S[id];
-  const row = document.createElement('div');
-  row.className = 'conv-row' + (item.id === st.conversationId ? ' active' : '') + (runsOf(id, item.id).length ? ' running' : '')
-    + (st.unreadConvs.has(item.id) ? ' unread' : '');
-  row.title = `${item.title}\n${item.time}${item.cwd && !isHomeLike(item.cwd) ? `\n目录：${item.cwd}` : ''}`;
-  const title = document.createElement('span');
-  title.className = 'conv-title';
-  title.textContent = item.title;
-  if (isFork(id, item.id)) {   // 从别处开着的会话分叉出来的（chat/fork.js）
-    const from = (st.conversations || []).find(c => c.id === convForks[forkKey(id, item.id)]);
-    const tag = elSpan('conv-fork', '分支');
-    tag.title = from ? `从「${from.title}」分出来的` : '从另一个会话分出来的';
-    title.prepend(tag);
-  }
-  const time = document.createElement('span');
-  time.className = 'conv-time';
-  time.textContent = relTime(item.timestamp);
-  const del = document.createElement('button');
-  del.className = 'conv-del';
-  del.innerHTML = UI.trash;
-  del.title = id === 'gpt' ? '删除此会话（归档，可在 Codex 中恢复）' : '删除此会话（移到废纸篓）';
-  del.addEventListener('click', e => {
-    e.stopPropagation();
-    if (!del.classList.contains('confirm')) {
-      del.classList.add('confirm');
-      del.textContent = '确认删除';
-      setTimeout(() => { if (del.isConnected) { del.classList.remove('confirm'); del.innerHTML = UI.trash; } }, 3000);
-      return;
-    }
-    if (runsOf(id, item.id).length) { pets[id].say('正在回答这个会话，先等等～', 2000); return; }
-    postNative('deleteConversation', { agent: id, conversationId: item.id });
-  });
-  row.addEventListener('click', () => openConversation(id, item));
-  row.addEventListener('contextmenu', e => {   // 右键：手动移进 / 移出「任务会话」
-    e.preventDefault();
-    const inTasks = isTaskConversation(id, item);
-    openPopover(row, () => [{ items: [{
-      name: inTasks ? '移出任务会话' : '移到任务会话',
-      desc: inTasks ? '放回它所在的项目' : '归进历史栏底部的「任务会话」',
-      onPick: () => {
-        const auto = !!item.task || isTempPath(item.cwd);
-        if (!inTasks === auto) delete st.taskOverrides[item.id]; else st.taskOverrides[item.id] = !inTasks;
-        lsSet(`${id}_task_overrides`, JSON.stringify(st.taskOverrides));
-        renderHistory(id);
-      },
-    }] }], { placement: 'bottom' });
-  });
-  row.append(title, time, del);
-  return row;
-}
-
-function openConversation(id, item) {
-  if (id !== active) setActive(id, false);
-  const st = S[id];
-  const searching = st.bodyQuery === histQuery && st.bodyHits?.has(item.id);
-  if (st.conversationId === item.id && st.loadedId === item.id && !searching) return;
-  st.conversationId = item.id;
-  st.loadedSig = '';
-  st.loadedId = null;
-  st.pendingTitle = '';
-  st.unreadConvs.delete(item.id);
-  st.applyCwdOnLoad = true;   // 正文读回来时再按记录里的目录校一遍
-  // 列表里已经知道它的目录：当场换过去。等正文读回来才换的话，读的期间发出去会带着上一个项目的目录续接（astra 报告）
-  if (typeof item.cwd === 'string' && item.cwd) setWorkspace(id, wsKey(item.cwd), false);
-  lsSet(`${id}_conv`, item.id);
-  showEmpty(id, '正在加载历史会话…');
-  renderHistory(id);
-  renderHeader();
-  updateSendUI();
-  const hit = st.bodyQuery === histQuery && st.bodyHits?.has(item.id)
-    ? st.bodyItems?.find(it => it.id === item.id) : null;
-  postNative('loadConversation', { agent: id, conversationId: item.id, ...(hit ? { limit: hit.searchLimit } : {}) });
-  pets[id].touch();
-  pets[id].syncBusyState();
-  pets[id].say('已切换历史会话 📜', 1600);
-}
-
-/** 回到一个还在回答、还没有会话 ID 的新对话。 */
-function openPendingRun(id, run) {
-  if (id !== active) setActive(id, false);
-  const st = S[id];
-  st.conversationId = '';
-  st.loadedId = '';
-  st.newView = run.view;
-  st.pendingTitle = run.title || '';
-  st.workspace = run.workspace;
-  lsSet(`${id}_workspace`, run.workspace);
-  lsSet(`${id}_conv`, '');
-  showEmpty(id);
-  attachRuns(id);
-  renderHistory(id);
-  renderHeader();
-  updateSendUI();
-  pets[id].syncBusyState();
-}
-
-/** 开新对话；workspace 不传 = 留在当前工作空间。 */
-function newChat(id = active, quiet = false, workspace = null) {
-  if (id !== active) setActive(id, false);
-  const st = S[id];
-  st.conversationId = '';
-  st.loadedId = '';
-  st.pendingTitle = '';
-  st.newView = `new:${++viewSeq}`;   // 别的会话可能还在回答，新对话用新的编号
-  lsSet(`${id}_conv`, '');
-  if (workspace !== null) {
-    st.workspace = workspace;
-    lsSet(`${id}_workspace`, workspace);
-  }
-  st.groupState[wsKey(st.workspace)] = 0;   // 展开所在的工作空间，露出「新对话」
-  lsSet(`${id}_groups`, JSON.stringify(st.groupState));
-  showEmpty(id);
-  renderHistory(id);
-  renderHeader();
-  updateSendUI();
-  histSections[id].list.querySelector('.conv-row.pending')?.scrollIntoView({ block: 'nearest' });
-  pets[id].touch();
-  pets[id].syncBusyState();
-  if (!quiet) pets[id].say('已开启新对话 ✨', 1800);
-  els.input.focus();
-  return true;
-}
-
-/** 分组上的「＋」、左栏 📁 选好文件夹后：在这个工作空间里开新对话。 */
-function startChatIn(id, workspace) {
-  if (newChat(id, true, workspace)) pets[id].say(workspace ? `新对话 · ${baseName(workspace)} 📁` : '已开启新对话 ✨', 1800);
 }

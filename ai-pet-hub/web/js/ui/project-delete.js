@@ -3,7 +3,8 @@
 // 左栏删除整个项目：要先向原生统计这个工作空间的全部会话、等确认后才一起删，流程自成一段，所以单独放一个文件。
 
 // ===== 删除项目：先统计这个工作空间里的全部会话（列表只显示最近 50 条），确认后一起删除 =====
-let projectDelete = null;   // { id, key, anchor, ids }
+const deletingProjects = new Map();
+let projectDelete = null;   // { id, key, anchor, ids, data（原生给的全部会话，确认时按最新分组重筛） }
 
 function askDeleteProject(id, key) {
   projectDelete = { id, key, anchor: pop.anchor, ids: null };
@@ -48,6 +49,7 @@ function renderProjectConfirm(box) {
 window.onProjectConversations = data => {
   const p = projectDelete;
   if (!p || !pop || pop.anchor !== p.anchor || data.agent !== p.id || data.workspace !== p.key) return;
+  p.data = data;
   p.ids = projectDeleteIds(p.id, p.key, data);
   renderPopover();
   positionPopover();
@@ -64,6 +66,16 @@ function projectDeleteIds(id, key, data) {
 
 function confirmDeleteProject() {
   const p = projectDelete;
+  // 确认框开着时，另一个窗口可能刚把会话移进或移出「任务会话」（onTaskGroupChangedElsewhere 已更新本窗口的分组），
+  // 按打开时的名单就会多删或漏删。发出前按最新分组重新筛一遍，名单变了先让用户看到新数量再确认。
+  if (p && p.ids !== null) {
+    const ids = projectDeleteIds(p.id, p.key, p.data || { ids: p.ids });
+    if (ids.join('\n') !== p.ids.join('\n')) {
+      p.ids = ids;
+      if (pop && pop.anchor === p.anchor) { renderPopover(); positionPopover(); }
+      return;
+    }
+  }
   closePopover();
   if (!p || p.ids === null) return;
   const st = S[p.id];
@@ -73,9 +85,10 @@ function confirmDeleteProject() {
     return;
   }
   if (!p.ids.length) { forgetWorkspace(p.id, p.key); pets[p.id].say(`已删除项目「${baseName(p.key)}」🗑️`, 1800); return; }
-  projectDelete = { ...p, deleting: true };
-  if (hasBridge()) postNative('deleteConversations', { agent: p.id, conversationIds: p.ids });
-  else window.onConversationsDeleted({ agent: p.id, deleted: p.ids, failed: [] });
+  const reqId = nextRequestId();
+  deletingProjects.set(reqId,p);
+  if (hasBridge()) postNative('deleteConversations', { agent: p.id, reqId, conversationIds: p.ids });
+  else window.onConversationsDeleted({ agent: p.id, reqId, deleted: p.ids, failed: [] });
 }
 
 window.onConversationsDeleted = data => {
@@ -84,23 +97,15 @@ window.onConversationsDeleted = data => {
   if (!st) return;
   const deleted = Array.isArray(data.deleted) ? data.deleted : [];
   const failed = Array.isArray(data.failed) ? data.failed : [];
-  if (st.conversations) st.conversations = st.conversations.filter(c => !deleted.includes(c.id));
-  if (deleted.includes(st.conversationId)) {
-    st.conversationId = '';
-    st.loadedId = '';
-    lsSet(`${id}_conv`, '');
-    showEmpty(id);
-  }
-  const p = projectDelete;
-  if (p && p.deleting && p.id === id) {
-    projectDelete = null;
-    if (data.reason) {
-      renderHistory(id);
-      pets[id].say(data.reason, 6000);
+  if (deleted.length) removeConversations(id,deleted);
+  const p = deletingProjects.get(data.reqId);
+  if (p && p.id === id) {
+    deletingProjects.delete(data.reqId);
+    if (failed.length || data.reason) {
+      pets[id].say(data.reason || `有 ${failed.length} 个会话没删掉…`, 6000);
     } else {
       forgetWorkspace(id, p.key);
-      pets[id].say(failed.length ? `有 ${failed.length} 个会话没删掉…` : `已删除项目「${baseName(p.key)}」（${deleted.length} 个会话）🗑️`, 2200);
+      pets[id].say(`已删除项目「${baseName(p.key)}」（${deleted.length} 个会话）🗑️`, 2200);
     }
-  } else renderHistory(id);
-  if (id === active) renderHeader();
+  }
 };

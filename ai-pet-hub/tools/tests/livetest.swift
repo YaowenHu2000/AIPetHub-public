@@ -1,6 +1,6 @@
 // 交互式回答的真实测试（要用真的 CLI，会花一点额度）：build/selftest live <agent> <空目录> [模型]
 //   ① 每次询问：跑命令前来问，允许后命令执行  ② 拒绝：命令没执行  ③ 中途补充一句：这一轮里就看到了
-//   ④ 停止：请它自己停下来，几秒内结束
+//   ④ 停止：请它自己停下来，几秒内结束  ⑦ 提问卡：作答后它拿到答案
 import Cocoa
 
 private struct LiveRun {
@@ -17,7 +17,7 @@ private func liveAsk(_ d: AppDelegate, _ req: AskRequest, timeout: TimeInterval 
     var run = LiveRun()
     let sem = DispatchSemaphore(value: 0)
     let lock = NSLock()
-    d.jsSink = { name, payload in
+    d.hooks.jsSink = { name, payload in
         lock.lock()
         switch name {
         case "onAgentRequest": run.requests.append(payload)
@@ -34,7 +34,7 @@ private func liveAsk(_ d: AppDelegate, _ req: AskRequest, timeout: TimeInterval 
     let t0 = Date()
     d.ask(req)
     if sem.wait(timeout: .now() + timeout) == .timedOut { print("   ✗ 超时"); d.cancel(agent: req.agent, reqId: req.reqId) }
-    d.jsSink = nil
+    d.hooks.jsSink = nil
     run.seconds = Date().timeIntervalSince(t0)
     return run
 }
@@ -87,7 +87,7 @@ func runLiveTests(_ args: [String]) {
 
     }
     if want("3") {
-    print("③ 中途补充一句（Gemini 的协议不让插话：应当是 rejected，由界面排队到这一轮结束后发）")
+    print("③ 中途补充一句")
     var steered = false
     r = liveAsk(d, req("用终端命令依次运行这三条，每条单独运行：sleep 4; echo one  然后 sleep 4; echo two  然后 sleep 4; echo three 。最后告诉我三个输出。", fullPerm)) { name, p in
         guard name == "onAgentStep", !steered, let rq = (p["reqId"] as? NSNumber)?.intValue else { return }
@@ -128,7 +128,8 @@ func runLiveTests(_ args: [String]) {
     report(r.final["conversationId"] as? String == cid, "还是同一个会话")
     }
     if want("6") {
-    print("⑥ 预热：先把进程起好，发话时接手它（要 AIPETHUB_PREWARM=1）")
+    print("⑥ 预热：先把进程起好，发话时接手它")
+    d.hooks.prewarmWithoutBundle = true
     func timed(_ rq: AskRequest) -> (LiveRun, Double) {
         var first = 0.0
         let t0 = Date()
@@ -179,5 +180,21 @@ func runLiveTests(_ args: [String]) {
     report(d.warmAdopted == before4 + (agent == "claude" ? 0 : 1), "会话在别处被改过：按预热是否持有旧快照决定接手")
     report(!String(describing: warm.final["reply"] ?? "").isEmpty, "照常答了")
     d.dropWarm()
+    }
+    if want("7") {
+    // Codex 默认协作模式下没有 request_user_input 工具（要在 config.toml 开 features.default_mode_request_user_input），这时只会用文字问
+    print("⑦ 提问卡：让它用提问工具问一题，选第二个选项")
+    let tool = ["claude": "AskUserQuestion", "gpt": "request_user_input", "gemini": "ask_question"][agent] ?? ""
+    for perm in [fullPerm, askPerm] {
+        r = liveAsk(d, req("请调用 \(tool) 工具问我一个问题：我最喜欢的颜色是什么，给两个选项「红色」和「蓝色」。拿到回答后用一句话复述我的选择然后结束；没有这个工具就直接回答「没有这个工具」。不要做其他事。", perm)) { name, p in
+            guard name == "onAgentRequest", p["kind"] as? String == "question", let rid = p["requestId"] as? String,
+                  let rq = (p["reqId"] as? NSNumber)?.intValue, let q = (p["questions"] as? [[String: Any]])?.first,
+                  let label = (q["options"] as? [[String: Any]])?.last?["label"] as? String else { return }
+            d.answerRequest(agent: agent, reqId: rq, requestId: rid, body: ["decision": "allow", "answers": [(q["id"] ?? q["question"]) as? String ?? "": label]])
+        }
+        let reply = String(describing: r.final["reply"] ?? "")
+        report(r.requests.contains { $0["kind"] as? String == "question" }, "\(perm)：出现提问卡（\(r.requests.count) 张）")
+        report(reply.contains("蓝"), "\(perm)：作答后它拿到了答案（回答：\(reply.prefix(40))）")
+    }
     }
 }

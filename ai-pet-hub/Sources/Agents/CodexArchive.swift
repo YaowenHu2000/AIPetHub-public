@@ -1,9 +1,11 @@
 // 有索引的会话交给 Codex 归档，让桌面端、CLI 和磁盘上的 rollout 始终使用同一路径。
+//
+// Codex 的已索引线程通过同一个 app-server 批量调用 `thread/archive`，只有无索引的旧 rollout 才直接挪入归档目录。
 import Cocoa
 import SQLite3
 
 extension AppDelegate {
-    func archiveCodex(_ ids: [String]) -> Set<String> {
+    func archiveCodex(_ ids: [String], onBlocked: (String) -> Void) -> Set<String> {
         let requested = Set(ids.filter(isSafeId))
         guard !requested.isEmpty else { return [] }
         let state = "\(codexHome)/state_5.sqlite"
@@ -21,27 +23,27 @@ extension AppDelegate {
         }
 
         let legacy = requested.subtracting(indexed)
-        guard !legacy.isEmpty else { return archiveIndexedCodex(Array(indexed)) }
+        guard !legacy.isEmpty else { return archiveIndexedCodex(Array(indexed), onBlocked: onBlocked) }
         let files = activeRollouts().compactMap { path, _ -> (String, URL)? in
             let file = URL(fileURLWithPath: path)
             // ID 可能含连字符，不能按最后一个连字符拆名字。
             let name = path.hasSuffix(".zst") ? file.deletingPathExtension().lastPathComponent : file.lastPathComponent
             return legacy.first { name.hasSuffix("-\($0).jsonl") }.map { ($0, file) }
         }
-        var moved = Set<String>()
+        var moved = Set<String>(), failed = Set<String>()
         if !files.isEmpty {
             let archive = URL(fileURLWithPath: codexHome).appendingPathComponent("archived_sessions")
             func moveLegacy(_ db: OpaquePointer?) {
                 for (cid, file) in files {
                     if let db = db {
-                        guard let present = codexIndexed(cid, in: db) else { continue }
+                        guard let present = codexIndexed(cid, in: db) else { failed.insert(cid); continue }
                         if present { indexed.insert(cid); continue }
                     }
                     try? fm.createDirectory(at: archive, withIntermediateDirectories: true)
                     if (try? fm.moveItem(at: file, to: archive.appendingPathComponent(file.lastPathComponent))) != nil {
                         codexRolloutCache.removeValue(forKey: file.path)
                         moved.insert(cid)
-                    }
+                    } else { failed.insert(cid) }
                 }
             }
             hooks.codexLegacyArchiveLocated?()
@@ -54,7 +56,7 @@ extension AppDelegate {
                 }
             } else { moveLegacy(nil) }
         }
-        return moved.union(archiveIndexedCodex(Array(indexed)))
+        return moved.subtracting(failed).union(archiveIndexedCodex(Array(indexed), onBlocked: onBlocked))
     }
 
     private func codexIndexed(_ cid: String, in db: OpaquePointer) -> Bool? {
@@ -70,10 +72,10 @@ extension AppDelegate {
     }
 
     /// 一次批量删除共用一个进程。逐条等 CLI 确认，拒绝、启动失败或提前退出都只上报已成功的部分。
-    private func archiveIndexedCodex(_ ids: [String]) -> Set<String> {
+    private func archiveIndexedCodex(_ ids: [String], onBlocked: (String) -> Void) -> Set<String> {
         guard !ids.isEmpty, let executable = codexExecutable() else { return [] }
         let input = LiveInput(), cli = CLIProcess(input: input)
-        var done = Set<String>(), index = 0
+        var done = Set<String>(), index = 0, reason = ""
         cli.warmFilter = { line in
             guard let obj = self.jsonObject(line), obj["method"] == nil, let id = obj["id"] as? Int else { return true }
             if id == 1 {
@@ -82,6 +84,7 @@ extension AppDelegate {
             } else {
                 guard index < ids.count, id == index + 2 else { return true }
                 if obj["result"] != nil && obj["error"] == nil { done.insert(ids[index]) }
+                else if let error = obj["error"] as? [String: Any], reason.isEmpty { reason = error["message"] as? String ?? "" }
                 index += 1
             }
             if index == ids.count { input.close() }
@@ -95,6 +98,7 @@ extension AppDelegate {
             terminateTree(cli.proc.processIdentifier)
         }
         input.close()
+        if !reason.isEmpty { onBlocked(reason) }
         return done
     }
 }

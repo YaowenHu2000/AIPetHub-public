@@ -1,3 +1,4 @@
+/* 全局重置、:root 的基础颜色和尺寸变量、按当前助手换的强调色；第一个加载，其余样式表都读这里的变量，换底色、强调色先改这里 */
 * { box-sizing: border-box; margin: 0; padding: 0; }
 /* 界面默认不能选中文字；回答、预览等内容区设成 text 后，里面的所有元素都跟着可选（不要再给 * 设 none，否则子元素又选不了） */
 body { user-select: none; -webkit-user-select: none; }

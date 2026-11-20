@@ -100,6 +100,10 @@ function renderWork(steps, label, open) {
   return work;
 }
 
+function changedFileCount(n, label) {
+  return n > 60 ? `共 ${n} 个，显示前 60 个` : label;
+}
+
 function renderFilesCard(files) {
   const card = document.createElement('div');
   card.className = 'files-card';
@@ -107,16 +111,18 @@ function renderFilesCard(files) {
   const removed = files.reduce((n, f) => n + (f.removed || 0), 0);
   const head = document.createElement('div');
   head.className = 'files-head';
-  head.innerHTML = `<span>${files.length} 个文件有改动</span><span class="diff-count"><span class="add">+${added}</span> <span class="del">−${removed}</span></span>`;
+  head.innerHTML = `<span>${changedFileCount(files.length, files.length + ' 个文件有改动')}</span><span class="diff-count"><span class="add">+${added}</span> <span class="del">−${removed}</span></span>`;
   card.appendChild(head);
-  files.forEach((f, i) => {
+  files.slice(0,60).forEach((f, i) => {
     const row = document.createElement('button');
     row.className = 'file-row';
     row.dataset.index = i;
     row.title = `${f.path}\n点击预览${f.diff ? '改动' : '文件'}`;
     const icon = f.kind === 'create' ? UI.filePlus : (f.kind === 'delete' ? UI.trash : UI.pencil);
     row.innerHTML = `<span class="file-icon">${icon}</span><span class="file-name"></span><span class="file-dir"></span>`
-      + (f.kind === 'create' ? '<span class="file-badge">新建</span>' : (f.kind === 'delete' ? '<span class="file-badge del">删除</span>' : ''))
+      + (f.toolTotal ? '<span class="file-badge">工具累计编辑</span>' : '')
+      + (f.workspaceOnly ? '<span class="file-badge">同期工作区改动</span>' : '')
+      + (f.kind === 'included' ? '<span class="file-badge">本轮纳入比较</span>' : f.kind === 'create' ? '<span class="file-badge">新建</span>' : (f.kind === 'delete' ? '<span class="file-badge del">删除</span>' : ''))
       + `<span class="diff-count"><span class="add">+${f.added || 0}</span> <span class="del">−${f.removed || 0}</span></span>`;
     row.querySelector('.file-name').textContent = baseName(f.path);
     row.querySelector('.file-dir').textContent = prettyPath(f.path.replace(/\/[^/]*$/, ''));
@@ -126,11 +132,13 @@ function renderFilesCard(files) {
 }
 
 /** msg = { text, steps, files, duration } */
-function renderTurn(msg, cwd) {
+function renderTurn(msg, cwd, sig = messageSignature({ ...msg, role:'bot' })) {
   const el = document.createElement('div');
   el.className = 'msg bot turn';
   el.dataset.cwd = cwd || '';
-  el._historySig = messageSignature({ ...msg, role: 'bot' });
+  el._outcome = msg.outcome || 'completed';
+  if (msg.outcome === 'incomplete') el.dataset.incomplete = '1';
+  el._historySig = sig;
   el._files = msg.files || [];
   const steps = msg.steps || [];
   if (steps.length) {
@@ -158,7 +166,7 @@ function renderTurn(msg, cwd) {
 }
 
 /** 出错或被停止的回答下面加「重试」：用同一句话在这个会话里再问一次。 */
-function addRetry(turn, id, text, images = []) {
+function addRetry(turn, id, text, images = [], imageRefs = [], draft = null, thumbnails = null, sentPaths = null) {
   let actions = turn.querySelector('.turn-actions');
   if (!actions) {
     actions = document.createElement('div');
@@ -173,7 +181,7 @@ function addRetry(turn, id, text, images = []) {
   btn.addEventListener('click', () => {
     if (id !== active || viewBusy(id)) return;
     // 重试自己的完整请求，输入框里可能已经放着下一条的图片。
-    startRun(id, text, images);
+    startRun(id, text, images, imageRefs, draft, null, thumbnails, sentPaths);
   });
   actions.appendChild(btn);
 }
@@ -207,8 +215,15 @@ document.addEventListener('click', e => {
 // 拖进来、⌘V 粘贴（访达里复制的文件）、📎 选的文件：都附在输入框上面（composer.js）。
 // 图片发送时作为真正的图片交给模型，其他文件把路径附在话后面，CLI 自己去读（用户 2026-11-18 要能传 zip 这类文件）。
 window.onFilesDropped = data => {
+  if (data.pasteId != null) {
+    const paste = pendingPastes.get(data.pasteId);
+    if (paste?.picker && !paste.frozen && data.paths?.length && needsFreeze(paste.id,data.paths,paste)) freezeFiles(paste,data.paths);
+    else if (paste) finishPaste(paste,data);
+    return;
+  }
+  if (data.error) { pets[active].say('截图保存失败：' + data.error,5000); return; }
   const paths = Array.isArray(data.paths) ? data.paths.filter(p => typeof p === 'string' && p) : [];
-  if (paths.length) addAttachments(active, paths, data.pasted);
+  if (paths.length) receiveFiles(active,paths,{pasted:data.pasted});
 };
 
 // 粘贴截图（只有图片、没有文字时）：交给原生存成文件，再把路径插进输入框；有文字就照常粘贴文字
@@ -219,7 +234,9 @@ els.input.addEventListener('paste', e => {
   e.preventDefault();
   const file = img.getAsFile();
   if (!file || !hasBridge()) return;
+  const paste = beginAttachment(active), key = paste.key;
   const reader = new FileReader();
-  reader.onload = () => { lastPastedThumb = reader.result; postNative('savePastedImage', { data: reader.result }); };
+  reader.onload = () => { paste.thumb = reader.result; postNative('savePastedImage', {data:reader.result, pasteId:key}); };
+  reader.onerror = () => finishPaste(paste, {error:reader.error?.message || '无法读取剪贴板图片'});
   reader.readAsDataURL(file);
 });

@@ -3,23 +3,6 @@
 // 输入框周边：预热、图片附件、/ 命令和 @ 文件、↑ ↓ 翻发过的话、消息上的「编辑」、内置浏览器工具的开关、搜索后定位。
 // 接在 changes.js 后面加载。纯逻辑在 logic.js。
 
-// 每位的输入在触发时就定下值；程序回填立即落盘，键入才短暂防抖。
-const draftTimers = new Map();
-function setDraft(id, value, delay = 0) {
-  clearTimeout(draftTimers.get(id));
-  draftTimers.delete(id);
-  S[id].draft = value;
-  if (id === active && els.input.value !== value) els.input.value = value;
-  const save = () => {
-    draftTimers.delete(id);
-    // 异常/队列回填可能已经更新了草稿，旧键入不得覆盖它。
-    if (S[id].draft === value) lsSet(`${id}_draft`, value);
-  };
-  if (delay) draftTimers.set(id, setTimeout(save, delay));
-  else save();
-  closeSuggest();
-}
-
 // ===== 预热：开始打字、或者上一轮刚答完，就让原生按现在的设置把 CLI 先起好（LiveTurn.swift / Prewarm.swift），发送时少等两三秒 =====
 let warmSig = '', warmAt = 0;
 function prewarm(id, typing = false) {
@@ -37,7 +20,7 @@ function noteSent() { warmSig = ''; }
 
 // ===== 用户消息上的「编辑」：把这句话放回输入框，改了再发 =====
 function addEditButton(div, id, text) {
-  if (!text) return;
+  if (!text && !div.querySelector('.msg-images')) return;
   const b = document.createElement('button');
   b.className = 'msg-edit';
   b.title = '把这句话放回输入框，改了再发（接在现在的对话后面，不会回到当时）';
@@ -45,9 +28,25 @@ function addEditButton(div, id, text) {
   b.addEventListener('click', e => {
     e.stopPropagation();
     if (id !== active) setActive(id);
-    setDraft(id, text);
+    const ask = div._run || div._retry;
+    const prompt = ask?.draft?.text ?? ask?.text ?? text;
+    const sent = editAttachments(ask);
+    // 改选另一条提问时，只撤回上次编辑带入的图，包括仍在等待恢复的原图。
+    cancelPendingEdit(id);
+    const st = S[id];
+    if (st.attach?.some(a => a.edited)) {
+      st.attach = st.attach.filter(a => !a.edited); saveAttachments(id); renderAttachments();
+    }
+    setDraft(id, prompt);
+    if (ask?.preparingImages) {
+      ask.pendingEdit = beginAttachment(id,{edited:true});
+    } else if (sent.refs.length) {
+      // 历史原图可能只剩记录引用；沿用粘贴的等待机制，确保用户立即发送时也带上原图。
+      const {key} = beginAttachment(id,{edited:true,shown:sent.shown});
+      postNative('editChatImages', {reqId:key, paths:sent.images, refs:sent.refs});
+    } else if (sent.images.length) receiveFiles(id,sent.images,{edited:true,shown:sent.shown});
     els.input.focus();
-    els.input.selectionStart = els.input.selectionEnd = text.length;
+    els.input.selectionStart = els.input.selectionEnd = prompt.length;
     autosize();
     updateSendUI();
   });
@@ -59,11 +58,24 @@ function addEditButton(div, id, text) {
 // @ ：光标前是「@几个字」时，在工作空间里按名字找文件，选了换成它的路径。
 const agentCommands = {};
 ALL_AGENT_IDS.forEach(id => { agentCommands[id] = lsJson(`${id}_commands`, []); });
-// Codex 不报命令列表：只有压缩上下文这一个是我们替它接的（原生：CodexLive.swift）
-agentCommands.gpt = [{ name: 'compact', desc: '把前面的对话压缩成摘要，腾出上下文空间' }];
+// Codex 不报命令列表：压缩上下文是我们替它接的，其余是它的技能（原生：CodexRun.swift）。第一次查到技能之前只有压缩一个
+const codexCompact = { name: 'compact', desc: '把前面的对话压缩成摘要，腾出上下文空间' };
+if (!agentCommands.gpt.length) agentCommands.gpt = [codexCompact];
+// Codex 的项目级技能只在自己的目录里认：点了别的项目的技能会按普通文字发出。候选按原生回包带的工作空间分别存，
+// 打 / 时取当前工作空间那份；还没查过的项目只列压缩，开始打字时的预热会去查（CodexRun.swift 的 warmCodex）
+const codexCommands = lsJson('gpt_commands_by_workspace', {}) || {};
+const slashCommands = id => id !== 'gpt' ? agentCommands[id] || []
+  : codexCommands[S.gpt.workspace || ''] || [codexCompact];
 
 window.onAgentCommands = data => {
   if (!AGENTS[data.agent] || !Array.isArray(data.commands)) return;
+  if (data.agent === 'gpt' && typeof data.workspace === 'string') {
+    const list = mergeCommands(codexCommands[data.workspace] || [], data.commands).slice(0, 200);
+    delete codexCommands[data.workspace];   // 重新插到最后：只留最近用过的 50 个项目
+    codexCommands[data.workspace] = list;
+    Object.keys(codexCommands).slice(0, -50).forEach(ws => delete codexCommands[ws]);
+    lsSet('gpt_commands_by_workspace', JSON.stringify(codexCommands));
+  }
   agentCommands[data.agent] = mergeCommands(agentCommands[data.agent] || [], data.commands);   // 这次没带说明的沿用以前的
   lsSet(`${data.agent}_commands`, JSON.stringify(agentCommands[data.agent].slice(0, 200)));
   // 正在输入框里打 / 等着：列表到了就刷新（Gemini 的列表要等它接上会话才报，常常是打了 / 之后才到）
@@ -94,6 +106,9 @@ function showSuggest(kind, items, start) {
   suggest.kind = kind;
   suggest.items = items;
   suggest.start = start;
+  // 记下出候选时的文字和光标：之后光标可能被点走，接受时要据此确认 @词 还在原处
+  suggest.value = els.input.value;
+  suggest.end = els.input.selectionStart;
   suggest.index = 0;
   const box = suggestBox();
   if (!items.length) { box.hidden = true; return; }
@@ -139,9 +154,11 @@ function acceptSuggest() {
     input.selectionStart = input.selectionEnd = input.value.length;
   } else {
     const caret = input.selectionStart;
+    // 光标已离开那个 @词（或文字变了）：拿旧起点和新光标拼接会吞掉中间的话，只关掉候选、不动输入
+    if (input.value !== suggest.value || caret !== input.selectionEnd || caret <= suggest.start || caret > suggest.end) { closeSuggest(); return; }
     const before = input.value.slice(0, suggest.start);
     const insert = (/\s/.test(it.name) ? `"${it.name}"` : it.name) + ' ';
-    setDraft(active, before + insert + input.value.slice(caret));
+    setDraft(active, before + insert + input.value.slice(suggest.end));
     input.selectionStart = input.selectionEnd = before.length + insert.length;
   }
   closeSuggest();
@@ -165,7 +182,7 @@ function updateSuggest() {
   const value = input.value;
   const slash = slashQuery(value);
   if (slash !== null) {
-    const list = agentCommands[id] || [];
+    const list = slashCommands(id);
     // 还从没拿到过命令列表（Gemini 要接上一个会话才报）：说一声，而不是什么都不出
     if (!list.length && id === 'gemini') { showSuggestNote('先给 Gemini 发一句话，接上会话后这里会显示可用命令'); return; }
     showSuggest('slash', rankCommands(list, slash), 0);
@@ -210,7 +227,6 @@ const browserToolsOn = () => lsGet('browser_tools', 'on') !== 'off';
 
 // ===== 附件：粘贴的截图、拖进来 / 粘贴 / 📎 选的文件附在输入框上面。图片发送时作为真正的图片交给模型，其他文件把路径附在话后面 =====
 const ATTACH_IMAGE_RE = /\.(png|jpe?g|gif|webp|heic|heif|bmp|tiff?)$/i;
-let lastPastedThumb = '';
 
 function attachRow() {
   let row = document.querySelector('.attach-row');
@@ -231,43 +247,34 @@ function renderAttachments() {
   list.forEach((a, i) => {
     const chip = document.createElement('div');
     chip.className = 'attach-chip';
-    chip.title = a.path;
+    chip.title = a.shown || a.path;
     chip.innerHTML = (a.thumb ? '<img class="attach-thumb" alt="">' : `<span class="attach-icon">${UI.file}</span>`)
       + '<span class="attach-name"></span><button class="attach-x" title="不发这个"></button>';
     if (a.thumb) chip.querySelector('img').src = a.thumb;
-    chip.querySelector('.attach-name').textContent = baseName(a.path);
+    chip.querySelector('.attach-name').textContent = baseName(a.shown || a.path);
     chip.querySelector('.attach-x').innerHTML = UI.close;
-    chip.querySelector('.attach-x').addEventListener('click', () => { list.splice(i, 1); saveAttachments(active); renderAttachments(); updateSendUI(); });
+    chip.querySelector('.attach-x').addEventListener('click', () => {
+      list.splice(i, 1);
+      if (a.pasted) postNative('discardPastedImage', {path:a.path});
+      saveAttachments(active); renderAttachments(); updateSendUI();
+    });
     row.appendChild(chip);
   });
 }
 
-// 附件路径跟草稿一样存在本地：不发送就重开 App，话和附件都还在。
-// 粘贴截图的缩略图是整张图的 data URL，太大不存，重开后那张显示成文件图标。
-function saveAttachments(id) {
-  const paths = (S[id].attach || []).map(a => a.path);
-  lsSet(`${id}_attach`, paths.length ? JSON.stringify(paths) : '');
-}
-function loadAttachments(id) {
-  const paths = lsJson(`${id}_attach`, []);
-  S[id].attach = Array.isArray(paths) ? paths.filter(p => typeof p === 'string' && p).slice(0, 8).map(path => ({ path, thumb: '' })) : [];
-}
-ALL_AGENT_IDS.forEach(loadAttachments);
-
-function addAttachments(id, paths, pasted) {
-  const st = S[id];
-  st.attach = st.attach || [];
-  paths.forEach(p => { if (!st.attach.some(a => a.path === p)) st.attach.push({ path: p, thumb: pasted ? lastPastedThumb : '' }); });
-  lastPastedThumb = '';
-  st.attach = st.attach.slice(0, 8);
-  saveAttachments(id);
-  if (id === active) { renderAttachments(); els.input.focus(); }
-  // 最多 8 个：只对真正在附件栏里的报「附上了」，被上限挤掉的明说，免得以为都会发出去
-  const uniq = [...new Set(paths)], kept = uniq.filter(p => st.attach.some(a => a.path === p)), missed = uniq.length - kept.length;
+function addAttachments(id, paths, pasted, origin = null) {
+  const temporary = pasted ? paths : [];
+  // 编辑带回的副本与回执路径一一对应，显示原文件名。
+  const shown = origin?.shown?.length === paths.length ? Object.fromEntries(paths.flatMap((p,i) => origin.shown[i] && origin.shown[i] !== p ? [[p,origin.shown[i]]] : [])) : {};
+  const kept = mergeDraft(draftTarget(id,origin),[{paths,pasted:temporary,edited:origin?.edited ? paths : [],shown}],'add',origin?.thumb);
+  const missed = new Set(paths).size - kept.length;
+  for (const path of new Set(temporary)) if (!kept.includes(path)) postNative('discardPastedImage',{path});
+  if (id === active && (!origin || originDraftKey(origin) === currentDraftKey(id))) els.input.focus();
   const pics = kept.filter(p => ATTACH_IMAGE_RE.test(p)).length, files = kept.length - pics;
   const ok = !kept.length ? '' : pasted && !files ? '截图附上了，发送时一起给它' : `附上了 ${[pics && pics + ' 张图片', files && files + ' 个文件'].filter(Boolean).join('、')}`;
-  const over = missed ? `有 ${missed} 个没附上（最多 8 个）` : '';
+  const over = missed ? `有 ${missed} 个没附上（最多 ${attachmentLimit} 个）` : '';
   pets[id].say([ok, over].filter(Boolean).join('，') + (ok ? ' 📎' : ''), missed ? 3000 : 2000);
+  return kept;
 }
 
 /** 发送前把附件分开：图片作为真正的图片交给模型；其他文件把完整路径附在话后面（每个一行），CLI 按路径自己读。 */
@@ -326,7 +333,39 @@ function jumpToSearchHit(id) {
   // 搜索也包含已折叠步骤的文字，定位后展开，避免点进来还看不到命中。
   hit.querySelector('.work')?.classList.add('open');
   hit.querySelectorAll('.step-body').forEach(body => { if (matches(visibleText(body))) body.hidden = false; });
-  hit.scrollIntoView({ block: 'center' });
+  // 长回答整条居中时关键词可能远在屏幕外：逐层找到仍包含命中文字的最小元素（段落、步骤输出等），滚到它那里。
+  // 命中跨了几个子元素时停在它们的共同父元素上，最差也和整条居中一样。
+  let target = hit;
+  for (let next; (next = [...target.children].find(c => !c.hidden && c.getClientRects().length && matches(visibleText(c)))); ) target = next;
+  target.scrollIntoView({ block: 'center' });
+  // 长代码块可能只有一个文本节点；按命中文字的位置滚动，包括代码块自己的横向滚动条。
+  const walker = document.createTreeWalker(target, NodeFilter.SHOW_TEXT);
+  const parts = [];
+  let text = '';
+  for (let node; (node = walker.nextNode()); ) {
+    if (node.parentElement.closest('button,.katex-mathml') || !node.parentElement.getClientRects().length) continue;
+    const color = getComputedStyle(node.parentElement).color;
+    if (color === 'rgba(0, 0, 0, 0)') continue;
+    parts.push({node,start:text.length});
+    text += node.data;
+  }
+  for (const needle of needles) {
+    const match = new RegExp(needle.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'iu').exec(text);
+    if (!match) continue;
+    const end = match.index + match[0].length;
+    const first = parts.findLast(p => p.start <= match.index), last = parts.findLast(p => p.start < end);
+    const range = document.createRange();
+    range.setStart(first.node,match.index-first.start); range.setEnd(last.node,end-last.start);
+    if (!range.getClientRects().length) continue;
+    for (let el = first.node.parentElement; el && box.contains(el); el = el.parentElement) {
+      const rect = range.getBoundingClientRect(), bounds = el.getBoundingClientRect();
+      if (el.clientHeight && el.scrollHeight > el.clientHeight && (rect.top < bounds.top || rect.bottom > bounds.bottom))
+        el.scrollTop += rect.top - bounds.top - (el.clientHeight - rect.height) / 2;
+      if (el.clientWidth && el.scrollWidth > el.clientWidth && (rect.left < bounds.left || rect.right > bounds.right))
+        el.scrollLeft += rect.left - bounds.left - (el.clientWidth - rect.width) / 2;
+    }
+    break;
+  }
   hit.classList.add('search-hit');
   setTimeout(() => hit.classList.remove('search-hit'), 2600);
 }
@@ -362,11 +401,20 @@ function browsePrompts(id, dir) {
   return true;
 }
 
-// 切到另一位时，附件栏跟着换成那一位的
+// 切到另一位时，附件栏跟着换成那一位的，候选也关掉。同一位的重画不关：原生报来模型列表（打 @ 触发的预热起好后，
+// Codex、Gemini 紧跟着就报）、检测结果晚到都会重画选择器，关掉会让刚出的 @ 候选闪一下就没了，也不再重发
 const baseRenderComposer = renderComposer;
-renderComposer = function () { closeSuggest(); baseRenderComposer(); renderAttachments(); };
+let composerAgent = active;
+renderComposer = function () {
+  if (composerAgent !== active) closeSuggest();
+  composerAgent = active;
+  baseRenderComposer();
+  renderAttachments();
+};
 
 // 📎：系统的选文件窗口，可以多选（Bridge.swift 的 pickAttachments），选好的走 onFilesDropped
 const attachBtn = document.getElementById('attach-btn');
 attachBtn.innerHTML = UI.clip;
-attachBtn.addEventListener('click', () => postNative('pickAttachments'));
+attachBtn.addEventListener('click', () => {
+  if (hasBridge()) postNative('pickAttachments',{pasteId:beginAttachment(active,{file:true,picker:true}).key});
+});

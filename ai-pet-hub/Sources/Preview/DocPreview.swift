@@ -1,9 +1,11 @@
-import Cocoa
-import WebKit
-
 // 文档预览：Word、Excel、PPT 等先用系统的 Quick Look 转成网页（rtf、odt 用系统文本引擎转），
 // 再放进内置浏览器显示——和访达里按空格看到的一样，文字可以选中复制。
 // 转出来的网页缓存在 ~/Library/Caches/AIPetHub/DocPreview：原文件没变就直接用，变了重新生成，旧的自动清掉。
+//
+// 转网页用的是 `qlmanage -p -o`（和访达里按空格看到的一样）；转出来的网页加了禁止联网的内容安全策略，缓存在 `~/Library/Caches/AIPetHub/DocPreview`（按路径、
+// 修改时间和大小区分，最多保留 12 份、3 天）。
+import Cocoa
+import WebKit
 
 /// Quick Look（系统自带的 Office 预览器）能转成网页的格式。
 /// .dot、.pot、.key 不算：常见的是 Graphviz、翻译模板、密钥这些文本文件，照常按文本预览。

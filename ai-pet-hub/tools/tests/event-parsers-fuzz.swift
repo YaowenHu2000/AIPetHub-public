@@ -84,7 +84,7 @@ func testMalformedStreams() {
 
 func testDshStreamOrders() {
     print("· DeepSeek 双流顺序与缺字段状态帧")
-    let d = AppDelegate(); d.jsSink = { _, _ in }
+    let d = AppDelegate(); d.hooks.jsSink = { _, _ in }
     let req = AskRequest(agent: "deepseek", reqId: 301, prompt: "", model: "", effort: "", permissionMode: "", workspace: "", conversationId: "")
     let mux: [[String: Any]] = [
         ["type":"session/event", "event":["type":"turn/start", "data":["turn":1]]],
@@ -109,12 +109,14 @@ func testDshStreamOrders() {
         check(d.dshApplied["disconnected-" + model] == nil, "断线时配置失败不能缓存为成功")
     }
     orders(0,0,[])
+    let timers = DshFinishTimers(d)
     let live = DeepSeekLiveTurn(app:d,req:req)
     live.receiveForTest(host[0])
     live.receiveForTest(["type":"host/session-status"])
     live.receiveForTest(["type":"host/session-status","running":"unknown"])
-    Thread.sleep(forTimeInterval:1.8)
+    timers.all.forEach { $0.expire() }   // 万一当成停止安排了兜底，让它立刻到点
     check(!live.finishedForTest, "缺失/类型错误的 running 不能当作停止")
+    d.hooks.dshIdleFinishScheduled = nil
     live.input.abandon()
 }
 

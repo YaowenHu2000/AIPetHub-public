@@ -1,7 +1,9 @@
 // 一轮回答的统一模型：工作步骤 + 正文 + 改动的文件。各家 CLI 的事件都转换成它。
 import Foundation
 
-// 把三个 CLI 的实时事件和历史记录统一成「一次回答」：工作步骤 + 正式回答 + 改动的文件。
+let outputLimitHint = "这一轮达到输出上限，没有写完。可以发一句「继续」。"
+
+// 把四位 CLI 的实时事件和历史记录统一成「一次回答」：工作步骤 + 正式回答 + 改动的文件。
 // 网页据此显示可折叠的「已工作 N 秒」、正文和文件卡片（参考反重力）。
 let maxDetail = 2000
 
@@ -13,33 +15,101 @@ let maxDiff = 60_000
 /// 以前是 0.25–0.4 秒一次，字是一小撮一小撮蹦出来的。
 let textPushInterval = 0.07
 
-func clip(_ s: String, _ n: Int) -> String { s.count > n ? String(s.prefix(n)) + "…" : s }
+/// 只走前 n 个字符就判断是否超长：历史里的长输出多是桥接的 NSString，先 count 整段会让 Claude 长会话每次打开都慢上数秒。
+func clip(_ s: String, _ n: Int) -> String {
+    let head = s.prefix(n)
+    return head.endIndex == s.endIndex ? s : String(head) + "…"
+}
 
 func trimmed(_ s: String?) -> String { (s ?? "").trimmingCharacters(in: .whitespacesAndNewlines) }
 
 func fileBaseName(_ p: String) -> String { (p as NSString).lastPathComponent }
 
 func lineCount(_ s: String) -> Int {
-    if s.isEmpty { return 0 }
-    let n = s.split(separator: "\n", omittingEmptySubsequences: false).count
-    return s.hasSuffix("\n") ? n - 1 : n
+    guard !s.isEmpty else { return 0 }
+    return s.utf8.reduce(0) { $0 + ($1 == 10 ? 1 : 0) } + (s.utf8.last == 10 ? 0 : 1)
+}
+
+private func patchLines(_ text: String) -> [Substring] {
+    guard !text.isEmpty else { return [] }
+    let lf = text.replacingOccurrences(of: "\r\n", with: "\n")
+    var lines = lf.split(separator: "\n", omittingEmptySubsequences: false)
+    if lf.hasSuffix("\n") { lines.removeLast() }
+    return lines
 }
 
 func diffCounts(_ diff: String) -> (added: Int, removed: Int) {
-    var added = 0, removed = 0
-    for line in diff.split(separator: "\n", omittingEmptySubsequences: false) {
-        if line.hasPrefix("+++") || line.hasPrefix("---") { continue }
-        if line.hasPrefix("+") { added += 1 } else if line.hasPrefix("-") { removed += 1 }
+    var added = 0, removed = 0, oldLeft = 0, newLeft = 0
+    func span(_ field: Substring) -> Int { field.split(separator: ",").dropFirst().first.flatMap { Int($0) } ?? 1 }
+    for line in patchLines(diff) {
+        if line.hasPrefix("@@") {
+            let fields = line.split(separator: " ", maxSplits: 3)
+            if fields.count >= 3, fields[1].hasPrefix("-"), fields[2].hasPrefix("+") {
+                oldLeft = span(fields[1]); newLeft = span(fields[2])
+            } else { oldLeft = Int.max; newLeft = Int.max }
+            continue
+        }
+        if line.hasPrefix("diff --git ") { oldLeft = 0; newLeft = 0; continue }
+        // hunk 里的 --- 和 +++ 可以是 Markdown 正文；只有段外的文件头才跳过。
+        if oldLeft == 0 && newLeft == 0 && (line.hasPrefix("--- ") || line.hasPrefix("+++ ")) { continue }
+        switch line.first {
+        case "+": added += 1; if newLeft > 0 { newLeft -= 1 }
+        case "-": removed += 1; if oldLeft > 0 { oldLeft -= 1 }
+        case " ":
+            if oldLeft > 0 { oldLeft -= 1 }
+            if newLeft > 0 { newLeft -= 1 }
+        default: break
+        }
     }
     return (added, removed)
 }
 
 /// 没有现成 diff 时，用「旧内容全删、新内容全加」表示一次替换；每段以 @@ 开头，前端据此逐段定位到文件里。
 func simpleDiff(old: String, new: String) -> String {
-    var out: [String] = ["@@"]
-    if !old.isEmpty { out += old.split(separator: "\n", omittingEmptySubsequences: false).map { "-" + $0 } }
-    if !new.isEmpty { out += new.split(separator: "\n", omittingEmptySubsequences: false).map { "+" + $0 } }
+    (["@@"] + patchLines(old).map { "-" + $0 } + patchLines(new).map { "+" + $0 }).joined(separator: "\n")
+}
+
+/// 逐行的增删序列（" " 未改、"-" 删、"+" 加）→ 只带改动前后 3 行上下文、像 git diff 一样按 @@ 分段的 diff。
+/// 上下文是整份文件时，预览不必带整份文件，截到长度上限后也还看得到改动；增删行数和整份序列一样。
+/// fromFirstLine：序列从文件第 1 行开始时写上行号，网页先按行号找位置；只是文件里的一段时写裸 @@，网页按内容找。
+func contextDiff(_ ops: [(sign: Character, text: String)], fromFirstLine: Bool, context: Int = 3) -> String {
+    var ranges: [Range<Int>] = []
+    for i in ops.indices where ops[i].sign != " " {
+        let lo = max(0, i - context), hi = min(ops.count, i + context + 1)
+        if let last = ranges.last, lo <= last.upperBound { ranges[ranges.count - 1] = last.lowerBound..<hi } else { ranges.append(lo..<hi) }
+    }
+    var out: [String] = [], old = 0, new = 0, at = 0
+    for range in ranges {
+        old += range.lowerBound - at; new += range.lowerBound - at   // 两段之间都是未改的行
+        let part = ops[range]
+        let oldCount = part.filter { $0.sign != "+" }.count, newCount = part.filter { $0.sign != "-" }.count
+        out.append(fromFirstLine ? "@@ -\(oldCount == 0 ? old : old + 1),\(oldCount) +\(newCount == 0 ? new : new + 1),\(newCount) @@" : "@@")
+        out += part.map { String($0.sign) + $0.text }
+        old += oldCount; new += newCount; at = range.upperBound
+    }
     return out.joined(separator: "\n")
+}
+
+/// 文件里的一段原文换成新文，逐行比对（最少增删）出真正改了的行，没改的留作上下文；不知道这段在第几行，用裸 @@。
+/// 原文为了在文件里唯一常带着没改的行，整段算成删了重写会把它们同时记成增删。
+/// 整段原文都留作上下文、不裁到 3 行：网页只能靠内容找位置，离改动远的那行往往正是让这段唯一的锚点，裁掉会标到别处同样的结构上。
+func lineDiff(old: String, new: String) -> String {
+    let a = patchLines(old).map(String.init), b = patchLines(new).map(String.init)
+    var removed = Set<Int>(), inserted = Set<Int>()
+    for change in b.difference(from: a) {
+        switch change {
+        case .remove(let offset, _, _): removed.insert(offset)
+        case .insert(let offset, _, _): inserted.insert(offset)
+        }
+    }
+    var ops: [(sign: Character, text: String)] = [], i = 0, j = 0
+    while i < a.count || j < b.count {
+        if i < a.count, removed.contains(i) { ops.append(("-", a[i])); i += 1 }
+        else if j < b.count, inserted.contains(j) { ops.append(("+", b[j])); j += 1 }
+        else if i < a.count, j < b.count { ops.append((" ", b[j])); i += 1; j += 1 }
+        else { break }
+    }
+    return contextDiff(ops, fromFirstLine: false, context: ops.count)
 }
 
 func makeStep(_ kind: String, _ title: String, detail: String? = nil, path: String? = nil, status: String = "ok") -> [String: Any] {
@@ -58,6 +128,16 @@ func textOf(_ content: Any?) -> String {
     if let strings = content as? [String] { return strings.joined(separator: "\n") }
     return ""
 }
+
+/// 只在来源已认领同一次异常结束后使用。CLI 可能晚写全正文，也可能只留下工具前的说明。
+func restoredEndingText(recorded: String, saved: String) -> String {
+    if saved.isEmpty || recorded.hasPrefix(saved) { return recorded }
+    // 最近结局的备份有字数上限，截断符也要从前缀比较里去掉。
+    if saved.hasSuffix("…"), saved.count == endingTextLimit + 1, recorded.hasPrefix(saved.dropLast()) { return recorded }
+    return saved
+}
+
+let endingTextLimit = 50_000
 
 final class TurnBuilder {
     private(set) var steps: [[String: Any]] = []
@@ -112,6 +192,7 @@ final class TurnBuilder {
             f["added"] = (f["added"] as? Int ?? 0) + c.added
             f["removed"] = (f["removed"] as? Int ?? 0) + c.removed
             let joined = ((f["diff"] as? String).map { $0 + "\n" } ?? "") + d
+            if joined.count > maxDiff { f["truncated"] = true }
             f["diff"] = joined.count > maxDiff ? String(joined.prefix(maxDiff)) : joined
         }
         if kind == "create" || kind == "delete" { f["kind"] = kind }
@@ -128,6 +209,17 @@ final class TurnBuilder {
         if let i = out.lastIndex(where: { $0["kind"] as? String == "text" }) {
             let t = trimmed(out[i]["detail"] as? String)
             if final.isEmpty { final = t; out.remove(at: i) } else if t == final { out.remove(at: i) }
+        }
+        if outcome == "interrupted" {
+            // 只改 CLI 明确写成取消的工具回执，保留同轮更早的普通命令错误。
+            let cancelled = ["interrupted by user", "error: interrupted by user", "tool use was interrupted by a message from the user",
+                             "[request interrupted by user for tool use]", "tool call aborted before dispatch"]
+            for j in out.indices where out[j]["status"] as? String == "error" {
+                let receipt = trimmed(out[j]["output"] as? String).lowercased()
+                if cancelled.contains(receipt) || receipt.hasSuffix("<error>command was aborted before completion</error>") {
+                    out[j]["status"] = "interrupted"
+                }
+            }
         }
         // 进程结束不代表工具成功；只有工具结果才能把它变成 ok。
         for j in out.indices where out[j]["status"] as? String == "running" {

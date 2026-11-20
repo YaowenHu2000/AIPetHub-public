@@ -1,6 +1,12 @@
 'use strict';
 
 // 模型面板：fast、思考强度滑杆、选模型那一页，以及 CLI 报上来新的模型列表时换掉菜单。
+//
+// 打开模型菜单先显示缓存，再按需通过后台用量查询获取当前 CLI 的列表。
+//
+// Claude、Codex、Gemini 按位去重，预热和后台查询收到的模型也会更新已打开的菜单。
+//
+// CLI 回报部分模型目录时保留已有型号和选择，等完整目录到达后再迁移已下架的型号。
 
 // ===== 模型面板（参考 Codex 桌面版）：上面一行「⚡ fast ｜ 思考强度 ｜ 还原」，中间是模型名（点进去选模型），下面一条滑杆调思考强度，最底下是剩余用量 =====
 let subTimer = 0;
@@ -56,7 +62,9 @@ function showModelView(view) {
   box.style.width = ''; box.style.height = '';
   renderPopover();
   positionPopover();
-  if (!changed) { morph = null; return; }
+  // 同一页重画（「还原」、用量回包）会打断正在进行的换页动画：动画收尾时才清的 overflow 也要在这里清，
+  // 否则面板一直不能滚，底部选项再也够不着
+  if (!changed) { if (morph) box.style.overflow = ''; morph = null; return; }
   const b = box.getBoundingClientRect();
   const rect = r => ({ left: r.left, top: r.top, width: r.width, height: r.height });
   morph = { from: rect(a), to: rect(b) };
@@ -266,18 +274,24 @@ window.onAgentModels = data => {
   if (!AGENTS[id] || !Array.isArray(data.models) || !data.models.length) return;
   if (data.complete !== false) modelReportedAt[id] = Date.now();   // Claude 主目录和 Gemini 会话可能只报部分模型
   const list = mergeModels(BUILTIN_MODELS[id], data.models, Object.keys(EFFORTS));
+  // 部分目录只能补充已知型号，完整目录才能确认用户选的型号已经下架。
+  if (data.complete === false) list.push(...AGENTS[id].models.filter(old => !list.some(m => m.v === old.v)));
   if (JSON.stringify(list) === JSON.stringify(AGENTS[id].models)) return;
   AGENTS[id].models = list;
   lsSet(`${id}_models`, JSON.stringify(list));
   const st = S[id];
   // 旧菜单把带 xhigh 等后缀的型号单列。CLI 现在把它归到基础型号时，保留用户选中的档位。
-  const oldVariant = id === 'gemini' && list.find(m => m.efforts?.some(e => m.v + '-' + e === st.model));
+  const oldVariant = data.complete !== false && id === 'gemini' && list.find(m => m.efforts?.some(e => m.v + '-' + e === st.model));
   if (oldVariant) {
     st.effortByModel[oldVariant.v] = st.model.slice(oldVariant.v.length + 1);
     lsSet(id + '_efforts', JSON.stringify(st.effortByModel));
   }
   const next = oldVariant?.v || migrateModel(st.model, list, MODEL_ALIASES, (data.models.find(m => m.isDefault) || {}).v || AGENTS[id].model);
   if (next !== st.model) {
+    if (id === 'claude' && MODEL_ALIASES[st.model] === next && st.effortByModel[st.model]) {
+      st.effortByModel[next] = st.effortByModel[st.model];
+      lsSet(id + '_efforts', JSON.stringify(st.effortByModel));
+    }
     st.model = next;
     lsSet(`${id}_model`, next);
   }

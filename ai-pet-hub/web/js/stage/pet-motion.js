@@ -161,7 +161,10 @@ Pet.prototype.toggleRoam = function () {
     this.walking = true;
     ensureWalkLoop();
   } else if (this.state === 'walk' || BUSY_STATES.has(this.state)) {
-    this.setState('idle');
+    // 回答进行中只记下偏好：动画仍跟着工作阶段，否则气泡写着思考中、人却站着发呆。答完由 tick 按偏好接着散步。
+    // 不忙时（演示姿势刚被清掉）照旧回到空闲。
+    const rest = this.restingState();
+    if (rest !== this.state) this.setState(rest);
   }
   this.renderStatus();
 };

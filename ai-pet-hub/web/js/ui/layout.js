@@ -1,17 +1,17 @@
 'use strict';
 
-// 拖动调整布局：左栏三格的高度、左栏和角色舞台的宽度。
+// 拖动调整布局：左栏各格（每位一格）的高度、左栏和角色舞台的宽度。
 
-// ===== 左栏三格上下拖动 =====
+// ===== 左栏各格上下拖动 =====
 let sectionWeights = (() => {
   const w = lsJson('section_weights', null);
   return Array.isArray(w) && w.length === AGENT_IDS.length && w.every(x => typeof x === 'number' && x > 0) ? w : AGENT_IDS.map(() => 1);
 })();
 
 /**
- * 左栏三格各占多高。不是死按比例分：哪一格的内容用不完它那一份，就只给它内容那么高，
+ * 左栏各格各占多高。不是死按比例分：哪一格的内容用不完它那一份，就只给它内容那么高，
  * 省下来的让给内容放不下的格（还是按比例分），这样不会一格下面空着一大片、另一格却挤得要滚。
- * 三格都放得下时，多出来的空白留在最下面那一格的下面。
+ * 各格都放得下时，多出来的空白留在最下面那一格的下面。
  * byContent = false（正在拖分隔条）时就按比例来：手拖到哪就是哪，松手后再按内容收。
  */
 function applySectionWeights(byContent = true) {
@@ -149,6 +149,11 @@ function applyWidths() {
   const squeezed = stageOn && used() > room;
   document.body.classList.toggle('stage-squeezed', squeezed);
   if (squeezed || !stageOn) tw = 0;
+  // 收起舞台还放不下（窄窗口再放大字号）：预览临时占满聊天那一栏，窗口变宽后自动还原；
+  // 不这样三栏的最小宽度加起来比窗口宽，预览的关闭按钮会被挤到窗口外。不动用户自己的 preview-max；
+  // 但最大化时侧栏加预览最大化的最小宽度也放不下，同样打上这个类，让预览去掉最小宽度，不然在单栏里点放大按钮会跑出窗口
+  const single = previewOn && used() > room;
+  document.body.classList.toggle('preview-squeezed', single);
   document.documentElement.style.setProperty('--sidebar-w', `${sw}px`);
   document.documentElement.style.setProperty('--stage-w', `${tw}px`);
   document.documentElement.style.setProperty('--preview-w', `${pw}px`);

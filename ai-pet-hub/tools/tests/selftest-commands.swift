@@ -2,17 +2,13 @@
 import Cocoa
 import WebKit
 
+// 这些子命令调真实 CLI，期限比离线测试的统一上限长
 private func waitFor(_ d: AppDelegate, _ fn: String, timeout: TimeInterval = 120, _ trigger: () -> Void) -> [String: Any]? {
-    let sem = DispatchSemaphore(value: 0)
-    var got: [String: Any]?
-    d.jsSink = { name, payload in
-        if name == fn, got == nil { got = payload; sem.signal() }
-    }
-    trigger()
-    _ = sem.wait(timeout: .now() + timeout)
-    d.jsSink = nil
-    return got
+    awaitCallback(d, fn, limit: timeout, trigger)
 }
+
+/// 手动子命令在主线程上等 WebKit：期限按各处实际要等的写，到点就往下走（有的只是借它停一会儿）
+private func spin(_ timeout: TimeInterval, until cond: () -> Bool) -> Bool { waitUntil(limit: timeout, runLoop: true, interval: 0.05, cond) }
 
 /// 打印一条消息；回答会附带工作步骤和改动文件的摘要。
 private func printMessage(_ m: [String: Any]) {
@@ -44,8 +40,8 @@ func runMaintenanceCommand(_ args: [String], _ d: AppDelegate) {
     case "list":
         for agent in ["gemini", "claude", "gpt", "deepseek"] where args.count < 3 || args[2] == agent {
             let t0 = Date()
-            guard let listed = waitFor(d, "onConversationsListed", { d.listConversations(agent: agent) }),
-                  let items = listed["items"] as? [[String: Any]] else { print("[\(agent)] 列表超时"); continue }
+            let listed = waitFor(d, "onConversationsListed", { d.listConversations(agent: agent) })
+            guard let items = listed?["items"] as? [[String: Any]] else { print("[\(agent)] 列表\(listed?["unavailable"].map { "读取失败：\($0)" } ?? "超时")"); continue }
             print("[\(agent)] \(items.count) 条历史，用时 \(String(format: "%.2f", Date().timeIntervalSince(t0)))s")
             // list <N>：多列几条，并带上会话 ID（清理测试会话时用）
             let n = args.count >= 2 ? (Int(args[1]) ?? 4) : 4
@@ -105,7 +101,7 @@ func runMaintenanceCommand(_ args: [String], _ d: AppDelegate) {
             var final: [String: Any] = [:]
             var early: (cid: String, secs: Double)?
             let t0 = Date()
-            d.jsSink = { name, payload in
+            d.hooks.jsSink = { name, payload in
                 if name == "onAgentStep" { steps += 1 }
                 // 会话 ID 一报出来就转给网页（新对话靠它马上变成正式会话），不等回答结束
                 if name == "onAgentConversation", (payload["reqId"] as? Int) == req.reqId {
@@ -116,7 +112,7 @@ func runMaintenanceCommand(_ args: [String], _ d: AppDelegate) {
             d.ask(req)
             if let after = cancelAfter { DispatchQueue.global().asyncAfter(deadline: .now() + after) { d.cancel(agent: agent) } }
             _ = sem.wait(timeout: .now() + 600)
-            d.jsSink = nil
+            d.hooks.jsSink = nil
             return (final, steps, Date().timeIntervalSince(t0), early)
         }
         /// 新对话：会话 ID 要在回答结束前就报出来，而且和最后的一致；续接的会话 ID 不变，不该再报。
@@ -154,7 +150,7 @@ func runMaintenanceCommand(_ args: [String], _ d: AppDelegate) {
         let sem = DispatchSemaphore(value: 0)
         var cancelAt: Date?
         var final: [String: Any] = [:]
-        d.jsSink = { name, payload in
+        d.hooks.jsSink = { name, payload in
             if name == "onAgentStep", cancelAt == nil, let st = payload["step"] as? [String: Any],
                st["kind"] as? String == "command", st["status"] as? String == "running" {
                 cancelAt = Date()
@@ -165,7 +161,7 @@ func runMaintenanceCommand(_ args: [String], _ d: AppDelegate) {
         d.ask(req)
         DispatchQueue.global().asyncAfter(deadline: .now() + 90) { if cancelAt == nil { d.cancel(agent: agent) } }
         _ = sem.wait(timeout: .now() + 180)
-        d.jsSink = nil
+        d.hooks.jsSink = nil
         Thread.sleep(forTimeInterval: 5)   // 等 SIGTERM / SIGKILL 生效
         let pg = Process()
         pg.executableURL = URL(fileURLWithPath: "/usr/bin/pgrep")
@@ -206,7 +202,7 @@ func runMaintenanceCommand(_ args: [String], _ d: AppDelegate) {
         let lock = NSLock()
         var done: [Int: (res: [String: Any], at: Date)] = [:]
         let sem = DispatchSemaphore(value: 0)
-        d.jsSink = { name, payload in
+        d.hooks.jsSink = { name, payload in
             guard name == "onAgentResponse", let r = payload["reqId"] as? Int else { return }
             lock.lock(); done[r] = (payload, Date()); lock.unlock()
             sem.signal()
@@ -223,7 +219,7 @@ func runMaintenanceCommand(_ args: [String], _ d: AppDelegate) {
         d.cancel(agent: agent, reqId: 1)   // 只停 A
         _ = sem.wait(timeout: .now() + 60)
         lock.lock(); let all = done; lock.unlock()
-        d.jsSink = nil
+        d.hooks.jsSink = nil
         let rb = all[2]?.res, ra = all[1]?.res
         print("[\(agent)] 先完成的：\(firstDone == [2] ? "B ✓" : "\(firstDone) ✗")；"
               + "B 回复=\(preview(rb?["reply"] as? String ?? "（无）", 30)) 用时 \(String(format: "%.0f", (all[2]?.at ?? Date()).timeIntervalSince(t0)))s，"
@@ -249,12 +245,7 @@ func runMaintenanceCommand(_ args: [String], _ d: AppDelegate) {
         d.container = FlippedView(frame: NSRect(x: 0, y: 0, width: 800, height: 600))
         win.contentView = d.container
         var states: [[String: Any]] = []
-        d.jsSink = { name, payload in if name == "onBrowserState" { states.append(payload) } }
-        func spin(_ timeout: TimeInterval, until cond: () -> Bool) -> Bool {
-            let end = Date().addingTimeInterval(timeout)
-            while Date() < end { if cond() { return true }; RunLoop.main.run(until: Date().addingTimeInterval(0.05)) }
-            return cond()
-        }
+        d.hooks.jsSink = { name, payload in if name == "onBrowserState" { states.append(payload) } }
         func js(_ code: String) -> Any? {
             var out: Any?, done = false
             d.browser?.evaluateJavaScript(code) { r, e in out = r ?? e; done = true }
@@ -343,7 +334,7 @@ func runMaintenanceCommand(_ args: [String], _ d: AppDelegate) {
         d.browserCommand("back")
         let back = spin(10) { (states.last?["url"] as? String) == docURL && states.last?["error"] as? Bool == false }
         print("后退回到文档预览 \(ok(back))：title=\(states.last?["title"] ?? "")")
-        d.jsSink = nil
+        d.hooks.jsSink = nil
     case "weberror":   // 内置浏览器的错误页：打不开 → 刷新还打不开（不多占历史）→ 服务器起来后刷新 → 正常显示、错误状态清掉
         guard args.count >= 3, let port = Int(args[1]) else { print("用法：weberror <空闲端口> <临时目录>"); return }
         _ = NSApplication.shared
@@ -352,12 +343,7 @@ func runMaintenanceCommand(_ args: [String], _ d: AppDelegate) {
         d.container = FlippedView(frame: NSRect(x: 0, y: 0, width: 800, height: 600))
         win.contentView = d.container
         var states: [[String: Any]] = []
-        d.jsSink = { name, payload in if name == "onBrowserState" { states.append(payload) } }
-        func spin(_ timeout: TimeInterval, until cond: () -> Bool) -> Bool {
-            let end = Date().addingTimeInterval(timeout)
-            while Date() < end { if cond() { return true }; RunLoop.main.run(until: Date().addingTimeInterval(0.05)) }
-            return cond()
-        }
+        d.hooks.jsSink = { name, payload in if name == "onBrowserState" { states.append(payload) } }
         let ok = { (b: Bool) in b ? "✓" : "✗" }
         let site = "http://127.0.0.1:\(port)/"
         let first = args[2] + "/first.html"
@@ -391,7 +377,7 @@ func runMaintenanceCommand(_ args: [String], _ d: AppDelegate) {
         d.browserCommand("back")
         print("后退回到前一页 \(ok(spin(10) { states.last?["title"] as? String == "第一页" }))：\(hist())  最后几次回报：\(states.suffix(3).map { "\($0["title"] ?? "")|\($0["url"] ?? "")" })")
         server.terminate()
-        d.jsSink = nil
+        d.hooks.jsSink = nil
     case "dump":   // 导出最近会话的消息（JSON），给网页渲染测试用；会话内容只写到本地文件
         guard args.count >= 2 else { print("用法：dump <输出.json> [每位条数]"); return }
         let limit = args.count >= 3 ? Int(args[2]) ?? 12 : 12
@@ -456,7 +442,7 @@ func runMaintenanceCommand(_ args: [String], _ d: AppDelegate) {
         let sem = DispatchSemaphore(value: 0)
         var liveSteps: [String] = []
         var final: [String: Any] = [:]
-        d.jsSink = { name, payload in
+        d.hooks.jsSink = { name, payload in
             if name == "onAgentStep", let st = payload["step"] as? [String: Any] {
                 liveSteps.append("#\(payload["index"] ?? "?") [\(st["kind"] ?? "")] \(st["title"] ?? "") \(st["status"] ?? "")")
             } else if name == "onAgentResponse" {
@@ -467,7 +453,7 @@ func runMaintenanceCommand(_ args: [String], _ d: AppDelegate) {
         let t0 = Date()
         d.ask(req)
         _ = sem.wait(timeout: .now() + 300)
-        d.jsSink = nil
+        d.hooks.jsSink = nil
         print("实时步骤事件 \(liveSteps.count) 个：")
         liveSteps.prefix(12).forEach { print("   \($0)") }
         print("用时 \(String(format: "%.1f", Date().timeIntervalSince(t0)))s conv=\(final["conversationId"] ?? "")")

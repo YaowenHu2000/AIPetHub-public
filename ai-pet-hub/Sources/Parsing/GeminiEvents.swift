@@ -60,6 +60,14 @@ final class AgyStreamParser {
 
     init(turn: TurnBuilder) { self.turn = turn }
 
+    // 单次模式可能在两次页面刷新之间退出；收尾时把已读到的末段交给同一个 TurnBuilder。
+    func finishStreamingText() {
+        for (key, value) in texts where turn.step(key)?["status"] as? String == "running" {
+            let text = trimmed(value)
+            if turn.step(key)?["detail"] as? String != text { turn.update(key, ["detail": text]) }
+        }
+    }
+
     /// 这次运行出错的原因；正常结束返回 nil。两种情况：result 的 status 不是 SUCCESS（最常见的是连不上服务器、
     /// 重试几次后放弃，这时 response 只是出错前最后一段中途说明），或者根本没有 result 就非正常退出了（崩溃、被杀）。
     func failure(exitStatus: Int32, stderr: String) -> String? {
@@ -284,14 +292,19 @@ func agyToolStep(name: String, params: [String: Any]) -> [String: Any] {
 }
 
 /// agy 改文件的参数里通常带原文 / 新文，尽量还原成 diff。
+/// 替换类按行比对：重开时读的是 agy 实际补丁（GeminiDatabase.swift 的 agyRecordedDiff），实时只有参数，两边的增删行数要对得上。
+/// 2026-11-19 本机 510 条有补丁记录的 Target/Replacement：逐行比对和补丁行数相同的 424 条，其余是 agy 的补丁多带了几行；整段算成删了重写只对得上 105 条。
 func agyDiff(_ params: [String: Any]) -> String? {
-    if let content = params["CodeContent"] as? String { return simpleDiff(old: "", new: content) }
+    if let content = (params["CodeContent"] ?? params["Content"]) as? String { return simpleDiff(old: "", new: content) }
+    if let target = params["Target"] as? String, let replacement = params["Replacement"] as? String {
+        return lineDiff(old:target, new:replacement)
+    }
     if let chunks = params["ReplacementChunks"] as? [[String: Any]] {
-        return chunks.map { simpleDiff(old: $0["TargetContent"] as? String ?? "", new: $0["ReplacementContent"] as? String ?? "") }
-            .joined(separator: "\n")
+        return chunks.map { lineDiff(old: $0["TargetContent"] as? String ?? "", new: $0["ReplacementContent"] as? String ?? "") }
+            .filter { !$0.isEmpty }.joined(separator: "\n")
     }
     if let target = params["TargetContent"] as? String {
-        return simpleDiff(old: target, new: params["ReplacementContent"] as? String ?? "")
+        return lineDiff(old: target, new: params["ReplacementContent"] as? String ?? "")
     }
     return nil
 }

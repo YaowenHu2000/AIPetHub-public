@@ -5,6 +5,7 @@ func testHistoryReadEfficiency() {
     print("· 历史读取：压缩投影、UTF-8 分行与搜索图片标签")
     let app = AppDelegate(), fm = FileManager.default
     let root = NSTemporaryDirectory() + "aipethub-history-efficiency-" + UUID().uuidString
+    app.hooks.sentImagesDir = root + "/aipethub-sent-images/"
     try! fm.createDirectory(atPath: root, withIntermediateDirectories: true)
     defer { TestHooks.chatThumbnailRequested = nil; try? fm.removeItem(atPath: root) }
     let packed = root + "/rollout.jsonl.zst", cli = root + "/zstd"
@@ -43,16 +44,16 @@ func testHistoryReadEfficiency() {
     TestHooks.chatThumbnailRequested = { thumbnails += 1 }
     let done = DispatchSemaphore(value: 0)
     var hits: [String] = []
-    app.jsSink = { name, payload in
+    app.hooks.jsSink = { name, payload in
         if name == "onConversationsSearched", payload["complete"] as? Bool == true {
             hits = payload["ids"] as? [String] ?? []; done.signal()
         }
     }
     app.searchConversations(agent: "claude", query: "label-needle", files: [("labels", history)])
-    check(done.wait(timeout: .now() + 10) == .success, "图片标签搜索返回")
+    check(waitSignal(done), "图片标签搜索返回")
     eq(hits, ["labels"], "去掉临时图片路径后仍能搜索短标签")
     eq(thumbnails, 0, "搜索不请求缩略图，包括已有缓存的图片")
-    app.jsSink = nil
+    app.hooks.jsSink = nil
     TestHooks.chatThumbnailRequested = nil
     let large = root + "/large.png", broken = root + "/broken.png", link = root + "/link.png", truncated = root + "/truncated.png"
     let bitmap = NSBitmapImageRep(bitmapDataPlanes: nil, pixelsWide: 900, pixelsHigh: 700, bitsPerSample: 8,
@@ -91,4 +92,25 @@ func testHistoryReadEfficiency() {
     app.attachChatImages(&recovered, payload: ["agent": "gpt", "conversationId": cid], labelsOnly: true)
     eq(renderer.messages(recovered), [""], "从 rollout 恢复的图片不会被误报为缺失")
     eq(thumbnails, 0, "从 rollout 恢复图片标签也不生成缩略图")
+
+    // 四位的命令输出都经 clip 截到 maxOutput；历史里的输出来自 JSONSerialization（桥接的 NSString），
+    // 先数完整段长度会让长会话每次打开都慢上数秒。用同一段内容数一遍长度作参照，负载高时两边一起变慢。
+    let clipLine = "2026-11-20 12:00:00 INFO 测试输出 é 👩🏽‍💻\n"
+    func bridged(_ s: String) -> String {
+        let data = try! JSONSerialization.data(withJSONObject: ["c": s])
+        return (try! JSONSerialization.jsonObject(with: data) as! [String: Any])["c"] as! String
+    }
+    let hugeOutput = String(repeating: clipLine, count: 120_000)
+    let countCopy = bridged(hugeOutput), clipCopy = bridged(hugeOutput)
+    var started = Date()
+    _ = countCopy.count
+    let countTime = Date().timeIntervalSince(started)
+    started = Date()
+    let clipped = clip(clipCopy, maxOutput)
+    let clipTime = Date().timeIntervalSince(started)
+    check(clipTime * 10 < countTime, "截取长输出不先数完整段（截取 \(clipTime) 秒，数一遍 \(countTime) 秒）")
+    eq(clipped, String(hugeOutput.prefix(maxOutput)) + "…", "长输出截取结果不变")
+    let edge = "ab👩🏽‍💻é"
+    eq([0, 1, 3, 4, 5].map { clip(edge, $0) }, ["…", "a…", "ab👩🏽‍💻…", edge, edge], "按字符截取的边界不变：刚好等长不加省略号")
+    eq(clip("", 0), "", "空串不加省略号")
 }

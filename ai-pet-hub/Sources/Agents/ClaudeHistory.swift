@@ -1,28 +1,41 @@
 // Claude Code 的历史会话：直接读它的 JSONL 记录。
+//
+// Claude 续聊期间出现已回答的旁支时，工作步骤保留同期旁支的可见文字。
+//
+// Claude 停止时保留已显示的正文，重开时跳过 CLI 的合成占位句，并保留已完成的工具步骤。
+// 本机记录的崩溃或输出上限优先于仅凭工具结束推断的成功。
+//
+// Claude 输出中崩溃时也在本机保留提问、附件路径和已显示的正文；重开按会话和提问时间补回，CLI 后来写全同轮时使用原记录。
+//
+// Claude 首问崩溃时若会话文件尚未创建，重开仍显示原问和失败正文，重试会新建会话。
+//
+// 认领本机结局的一轮，工作时长算到本机记下的结束时刻：失败或停止前的等待不会写进记录。
 import Cocoa
 
 extension AppDelegate {
-    func claudeProjectRoots() -> [String] {
+    func claudeProjectRoots(onError: (String) -> Void = { _ in }) -> [String] {
         // 没装 reclaude、用标准 claude 时：读它的配置目录（CLAUDE_CONFIG_DIR，默认 ~/.claude）
         if let cmd = claudeCommand(), !cmd.reclaude {
             let env = trimmed(ProcessInfo.processInfo.environment["CLAUDE_CONFIG_DIR"])
             let p = (env.isEmpty ? "\(home)/.claude" : (env as NSString).expandingTildeInPath) + "/projects"
-            return isDirectory(p) ? [p] : []
+            return [p]
         }
         var roots: [String] = []
         let accounts = "\(home)/.rec/claude/accounts"
+        if let error = historyAccessError(accounts, mode: R_OK | X_OK) { onError(error) }
         for acc in ((try? fm.contentsOfDirectory(atPath: accounts)) ?? []).sorted() where !acc.hasPrefix(".") {
             let p = "\(accounts)/\(acc)/config/projects"
-            if isDirectory(p) { roots.append(p) }
+            roots.append(p)
         }
         // 装了 reclaude 时克劳蒂娜只用 reclaude：历史会话只读 ~/.rec/claude/accounts/*/config/projects，不再看 ~/.claude-pro、~/.claude
         return roots
     }
 
     /// 调用方在 claudeQueue 上；同 ID 的副本先沿用列表确定的路径，没有缓存时和列表一样取最新。
-    func findClaudeSession(cid: String, files: [(cid: String, path: String, mtime: Date)]? = nil) -> String? {
+    func findClaudeSession(cid: String, files: [(cid: String, path: String, mtime: Date)]? = nil, onError: (String) -> Void = { _ in }) -> String? {
         if let cached = claudeCache[cid], fm.fileExists(atPath: cached.path) { return cached.path }
-        return (files ?? claudeSessionFiles()).first { $0.cid == cid && fm.fileExists(atPath: $0.path) }?.path
+        if let cached = claudeCache[cid], let error = historyAccessError(cached.path) { onError(error) }
+        return (files ?? claudeSessionFiles(onError: onError)).first { $0.cid == cid && fm.fileExists(atPath: $0.path) }?.path
     }
 
     /// 一行会话记录对应的可展示文字；工具调用、子代理、元信息等返回 nil。
@@ -30,6 +43,10 @@ extension AppDelegate {
     /// 它不是用户说的话，是「这一轮被中断了」的标记。
     func claudeInterruptMarker(_ text: String) -> Bool {
         text.trimmingCharacters(in: .whitespacesAndNewlines).hasPrefix("[Request interrupted by user")
+    }
+
+    private func isClaudePlaceholder(_ message: [String:Any]?) -> Bool {
+        message?["model"] as? String == "<synthetic>" && trimmed(textBlocks(message?["content"])) == "No response requested."
     }
 
     func claudeDisplayText(_ obj: [String: Any]) -> String? {
@@ -41,6 +58,7 @@ extension AppDelegate {
             return nil
         }
         guard let msg = obj["message"] as? [String: Any] else { return nil }
+        if isClaudePlaceholder(msg) { return nil }
         let text = stripTagBlocks(textBlocks(msg["content"]), tags: ["system-reminder"])
         if text.isEmpty || claudeInterruptMarker(text) { return nil }
         for prefix in ["<local-command", "<command-name>", "<command-message>", "<bash-input>", "<bash-stdout>",
@@ -110,7 +128,10 @@ extension AppDelegate {
                                    "time": timeLabel(mtime), "timestamp": mtime.timeIntervalSince1970, "cwd": cwd]
         // 别的工具派出去的 `claude -p`（entrypoint 为 sdk-cli）归进「任务会话」。App 自己起的 Claude 从这个版本起写 aipethub；
         // 在那之前 App 的会话也是 sdk-cli、分不出来，所以只认分界时间之后开始的。
+        if entrypoint == "sdk-py" || entrypoint == "sdk-ts" { item["task"] = true }
         if entrypoint == "sdk-cli", let t = started, t >= claudeTaskSince { item["task"] = true }
+        // 子任务继承启动环境，所以新版入口还要核对首次握手时 CLI 报给 App 的会话编号。
+        if entrypoint == "aipethub-session", !UserDefaults.standard.bool(forKey: "claudeDirectSession." + cid) { item["task"] = true }
         return item
     }
 
@@ -125,12 +146,15 @@ extension AppDelegate {
     }
 
     /// 所有 Claude 会话文件，最新的在前。
-    func claudeSessionFiles() -> [(cid: String, path: String, mtime: Date)] {
+    func claudeSessionFiles(matching cid: String? = nil, onError: (String) -> Void = { _ in }) -> [(cid: String, path: String, mtime: Date)] {
         var files: [(cid: String, path: String, mtime: Date)] = []
-        for root in claudeProjectRoots() {
+        for root in claudeProjectRoots(onError: onError) {
+            if let error = historyAccessError(root, mode: R_OK | X_OK) { onError(error) }
             for proj in (try? fm.contentsOfDirectory(atPath: root)) ?? [] where !proj.hasPrefix(".") {
                 let dir = "\(root)/\(proj)"
-                for name in (try? fm.contentsOfDirectory(atPath: dir)) ?? [] where name.hasSuffix(".jsonl") {
+                if isDirectory(dir), let error = historyAccessError(dir, mode: R_OK | X_OK) { onError(error) }
+                let names = cid.map { [$0 + ".jsonl"] } ?? (try? fm.contentsOfDirectory(atPath: dir)) ?? []
+                for name in names where name.hasSuffix(".jsonl") {
                     let path = "\(dir)/\(name)"
                     if let m = modificationDate(path) { files.append((String(name.dropLast(6)), path, m)) }
                 }
@@ -142,9 +166,10 @@ extension AppDelegate {
     /// 列表项（带缓存）：文件没变就不重新读。
     func claudeItem(_ f: (cid: String, path: String, mtime: Date)) -> [String: Any]? {
         let ts = f.mtime.timeIntervalSince1970
-        if let cached = claudeCache[f.cid], cached.path == f.path, abs(cached.mtime - ts) < 0.001 { return cached.item }
+        if let cached = claudeCache[f.cid], cached.path == f.path, abs(cached.mtime - ts) < 0.001,
+           cached.item?["task"] as? Bool != true || !UserDefaults.standard.bool(forKey: "claudeDirectSession." + f.cid) { return cached.item }
         let item = claudeSummary(path: f.path, cid: f.cid, mtime: f.mtime)
-        claudeCache[f.cid] = (ts, item, f.path)
+        if let item { claudeCache[f.cid] = (ts, item, f.path) }
         return item
     }
 
@@ -152,11 +177,16 @@ extension AppDelegate {
         claudeQueue.async { [self] in
             var items: [[String: Any]] = []
             var seen = Set<String>()
-            for f in claudeSessionFiles() where items.count < historyListLimit && !seen.contains(f.cid) {
+            var reason: String?
+            let files = claudeSessionFiles(onError:{ reason = $0 })
+            if let reason { sendToJS("onConversationsListed",["agent":"claude","unavailable":reason]); return }
+            for f in files where items.count < historyListLimit && !seen.contains(f.cid) {
                 seen.insert(f.cid)
                 if let item = claudeItem(f) { items.append(item) }
             }
-            sendToJS("onConversationsListed", ["agent": "claude", "items": items])
+            items += localFirstItems("claude", excluding:seen)
+            items.sort { ($0["timestamp"] as? Double ?? 0) > ($1["timestamp"] as? Double ?? 0) }
+            sendToJS("onConversationsListed", ["agent": "claude", "items": Array(items.prefix(historyListLimit))])
         }
     }
 
@@ -171,24 +201,42 @@ extension AppDelegate {
             ids.append(f.cid)
             if item["task"] as? Bool == true { onTask(f.cid) }
         }
+        for item in localFirstItems("claude", excluding:seen) where trimmedPath(item["cwd"] as? String ?? "") == target {
+            if let cid = item["id"] as? String { ids.append(cid) }
+        }
         return ids
     }
 
     func loadClaude(cid: String, reqId: Int? = nil) {
         claudeQueue.async { [self] in
+            let readAt = historyReadAt()
             var messages: [[String: Any]] = []
             var cwd = ""
             var context: [String: Any]?
-            let sessionPath = findClaudeSession(cid: cid)
-            if let path = sessionPath,
-               let data = try? Data(contentsOf: URL(fileURLWithPath: path), options: .alwaysMapped) {
-                (messages, cwd) = claudeTurns(data) { message, timestamp in
-                    context = claudeHistoryContext(message, timestamp: timestamp)
-                }
+            var readError: String?
+            var terminal = false
+            let sessionPath = findClaudeSession(cid: cid) { readError = $0 }
+            if let path = sessionPath {
+                readError = nil
+                do {
+                    let data = try Data(contentsOf: URL(fileURLWithPath: path), options: .alwaysMapped)
+                    (messages, cwd) = claudeTurns(data, cid: cid, endedTail:{ terminal = $0 }) { message, timestamp in
+                        context = claudeHistoryContext(message, timestamp: timestamp)
+                    }
+                } catch { readError = error.localizedDescription }
+            }
+            if sessionPath == nil, readError == nil,
+               let workspace = localEndings(agent:"claude", cid:cid).last?["newWorkspace"] as? String {
+                messages = claudeTurns(Data(), cid:cid, endedTail:{ terminal = $0 }).0
+                cwd = workspace
             }
             var payload: [String: Any] = [
-                "agent": "claude", "conversationId": cid, "cwd": cwd, "missing": sessionPath == nil
+                "agent": "claude", "conversationId": cid, "cwd": cwd, "missing": sessionPath == nil && readError == nil && messages.isEmpty, "readAt": readAt
             ]
+            payload["historyError"] = readError
+            if terminal || ["failed","interrupted"].contains(messages.last?["outcome"] as? String ?? "") {
+                payload["lastTurn"] = ["running":false]
+            }
             payload["context"] = context
             sendToJS("onConversationLoaded", recentHistory(messages, into: payload, reqId: reqId))
         }
@@ -250,8 +298,26 @@ extension AppDelegate {
         return Set(rootOf.filter { withAnswer.contains($0.value) }.keys)
     }
 
+    /// 同期旁支单列在工作步骤中，保留终端的问答，也避免把它当成 CLI 下轮可见的上下文。
+    func claudeBranchNotes(_ data: Data, ids: Set<String>) -> [(at: Date, text: String)] {
+        guard !ids.isEmpty else { return [] }
+        var notes: [(Date, String)] = []
+        forEachLine(data) { line in
+            if let id = claudeLineUuid(line), ids.contains(id), let obj = jsonObject(line),
+               let ms = contextTime(obj["timestamp"] as? String), let text = claudeDisplayText(obj) {
+                notes.append((Date(timeIntervalSince1970: ms / 1000), (obj["type"] as? String == "user" ? "用户：" : "Claude：") + text))
+            }
+            return true
+        }
+        return notes
+    }
+
+    func claudeBranchStep(_ text: [String]) -> [String: Any] {
+        makeStep("tool", "同时有其他客户端续写，查看主线以外的记录", detail: text.joined(separator: "\n\n"))
+    }
+
     /// 会话 jsonl → 一问一答的回合：用户消息 + （工作步骤、正式回答、改动的文件）。
-    func claudeTurns(_ data: Data, lastUsage: (([String: Any], String?) -> Void)? = nil) -> ([[String: Any]], String) {
+    func claudeTurns(_ data: Data, cid: String = "", endedTail: ((Bool) -> Void)? = nil, lastUsage: (([String: Any], String?) -> Void)? = nil) -> ([[String: Any]], String) {
         var messages: [[String: Any]] = []
         var cwd = ""
         var turn: TurnBuilder?
@@ -259,7 +325,11 @@ extension AppDelegate {
         var turnStart: Date?
         var lastTime: Date?
         var interrupted = false   // 这一轮是被用户停下的（记录里有中断标记）
+        var confirmed = Set<Int>(), ended = false
+        var prefaces: [Int:(index:Int, step:[String:Any])] = [:]
         var apiError: String?     // 这一轮以 API 报错收尾（记录里是一条 isApiErrorMessage 的回答）
+        let endings = localEndings(agent: "claude", cid: cid)
+        var questions: [(index: Int, at: Double)] = []
         var pendingAutoCompact = false   // 自动压缩落在两轮之间：记到下一轮的工作过程里
         let iso = ISO8601DateFormatter()
         iso.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
@@ -269,12 +339,23 @@ extension AppDelegate {
         let compactMark = Data("\"compact_boundary\"".utf8)   // 压缩：手动的是一条提示，自动的是那一轮里的一步（和实时一样）
         func compactStep(_ t: TurnBuilder) { t.add(makeStep("tool", "压缩上下文", status: "ok")); pendingAutoCompact = false }
 
+        let sideBranch = claudeSideBranch(data)
+        let branchNotes = claudeBranchNotes(data, ids: sideBranch)
         func flush() {
             guard let t = turn else { return }
+            if !branchNotes.isEmpty, let start = turnStart, let end = lastTime {
+                let concurrent = branchNotes.filter { $0.at >= start && $0.at <= end }.map(\.text)
+                if !concurrent.isEmpty { t.add(claudeBranchStep(concurrent)) }
+            }
+            if !endings.isEmpty, let i = t.steps.lastIndex(where: { $0["kind"] as? String == "text" }),
+               t.steps.dropFirst(i + 1).contains(where: { !["text","think"].contains($0["kind"] as? String ?? "") }) {
+                prefaces[messages.count] = (i, t.steps[i])
+            }
             let unfinished = t.steps.contains { $0["status"] as? String == "running" }
             let outcome = apiError != nil ? "failed" : interrupted ? "interrupted" : (unfinished ? "incomplete" : "completed")
             var bot = t.finish(finalText: nil, outcome: outcome, error: apiError)
-            interrupted = false; apiError = nil
+            if ended { confirmed.insert(messages.count) }
+            ended = false; interrupted = false; apiError = nil
             if let s = turnStart, let e = lastTime, e > s { bot["duration"] = e.timeIntervalSince(s) }
             if !trimmed(bot["text"] as? String).isEmpty || !((bot["steps"] as? [Any]) ?? []).isEmpty {
                 bot["role"] = "bot"
@@ -285,7 +366,6 @@ extension AppDelegate {
         }
 
         var lastAnswer: [String: Any]?
-        let sideBranch = claudeSideBranch(data)   // 分叉出去的旁支不显示
         forEachLine(data) { line in
             if !sideBranch.isEmpty, let id = claudeLineUuid(line), sideBranch.contains(id) { return true }
             // 回答进行中补充的话：算在这一轮里，显示成工作过程里的「你补充说」（和当时看到的一样）
@@ -331,7 +411,10 @@ extension AppDelegate {
                 let images = claudeImageSources(obj)
                 if let text = claudeDisplayText(obj) ?? (images.isEmpty ? nil : "") {   // 只发了图片也算一句
                     flush()
+                    if !endings.isEmpty { questions.append((messages.count, ts?.timeIntervalSince1970 ?? 0)) }
                     messages.append(images.isEmpty ? ["role": "user", "text": text] : ["role": "user", "text": text, "imageSources": images])
+                    messages[messages.count - 1]["turnKey"] = obj["uuid"]
+                    messages[messages.count - 1]["createdAt"] = ts?.timeIntervalSince1970
                     turn = TurnBuilder()
                     turnStart = ts
                     lastTime = ts
@@ -349,6 +432,11 @@ extension AppDelegate {
                 apiError = said.isEmpty ? "这一轮出错了。" : said
                 if let ts = ts { lastTime = ts }
             } else if type == "assistant" {
+                // CLI 续问时为中断轮补写的空答复不能盖过已显示的正文。
+                if isClaudePlaceholder(obj["message"] as? [String:Any]) { return true }
+                let stop = (obj["message"] as? [String: Any])?["stop_reason"] as? String
+                if stop == "end_turn" || stop == "stop_sequence" { ended = true }
+                if stop == "max_tokens" { apiError = outputLimitHint }
                 if turn == nil, pendingAutoCompact { turn = TurnBuilder(); turnStart = ts; if let t = turn { compactStep(t) } }
                 if lastUsage != nil, let message = obj["message"] as? [String: Any], message["usage"] is [String: Any],
                    message["model"] as? String != "<synthetic>" { lastAnswer = obj }
@@ -359,6 +447,67 @@ extension AppDelegate {
             return true
         }
         flush()
+        var terminal = confirmed.contains(messages.count - 1)
+        // 从后往前插入，后轮不会改变前轮的位置；CLI 后来写全了同一问，就直接使用记录。
+        let recordEnd = messages.count
+        for ending in endings.reversed() {
+            guard let start = ending["start"] as? Double, let end = ending["end"] as? Double,
+                  let prompt = ending["prompt"] as? String else { continue }
+            let next = questions.first { $0.at >= start - 0.001 }
+            let at = next?.index ?? recordEnd
+            if let next, next.at <= end + 0.001 { restorePathAttachments(&messages[at], textKey:"text", ending:ending) }
+            let matched = next.map { $0.at <= end + 0.001 && messages[$0.index]["text"] as? String == prompt } ?? false
+            let savedText = ending["text"] as? String ?? ""
+            let savedOutcome = ending["outcome"] as? String ?? "failed"
+            var bot = TurnBuilder().finish(finalText: savedText, outcome: savedOutcome, error: ending["reason"] as? String)
+            bot["role"] = "bot"
+            bot["endingReqId"] = ending["reqId"]
+            // 失败、停止前的等待没写进记录：工作时长从提问算到本机记下的结束时刻，和实时一样
+            func stretch(_ i: Int) {
+                guard let asked = next?.at, end > asked else { return }
+                messages[i]["duration"] = max(messages[i]["duration"] as? Double ?? 0, end - asked)
+            }
+            if matched {
+                if messages.indices.contains(at + 1), messages[at + 1]["role"] as? String == "bot" {
+                    let disk = messages[at + 1], outcome = disk["outcome"] as? String
+                    let text = trimmed(disk["text"] as? String)
+                    // 只有工具回执时“完成”只是推测。已明确结束或后来补齐的正文仍以 CLI 记录为准。
+                    if outcome == savedOutcome {
+                        messages[at + 1]["text"] = restoredEndingText(recorded:text, saved:savedText)
+                        messages[at + 1]["endingReqId"] = ending["reqId"]
+                        stretch(at + 1)
+                    }
+                    if outcome == "incomplete" || (outcome == "completed" && !confirmed.contains(at + 1) && (text.isEmpty || savedText.hasPrefix(text) || prefaces[at + 1] != nil)) {
+                        var steps = disk["steps"] as? [[String: Any]] ?? []
+                        if outcome == "incomplete", steps.last?["title"] as? String == "未完成" { steps.removeLast() }
+                        // 回执没落盘的步骤和实时一样按整轮结局收尾；已有回执的保留原状态。
+                        for j in steps.indices where steps[j]["status"] as? String == "running" {
+                            if savedOutcome == "interrupted" { steps[j]["status"] = "interrupted" }
+                            else if savedOutcome == "failed" { steps[j]["status"] = "error" }
+                        }
+                        if let preface = prefaces[at + 1], !savedText.isEmpty, savedText != text {
+                            steps.insert(preface.step, at:min(preface.index, steps.count))
+                        }
+                        messages[at + 1]["steps"] = steps + (bot["steps"] as? [[String: Any]] ?? [])
+                        if at + 1 == messages.count - 1 { terminal = true }
+                        messages[at + 1]["outcome"] = savedOutcome
+                        messages[at + 1]["text"] = restoredEndingText(recorded:text, saved:savedText)
+                        messages[at + 1]["endingReqId"] = ending["reqId"]
+                        stretch(at + 1)
+                    }
+                } else {
+                    if at + 1 == messages.count { terminal = true }
+                    messages.insert(bot, at: at + 1)
+                    stretch(at + 1)
+                }
+            } else {
+                if at == messages.count { terminal = true }
+                let images = (ending["images"] as? [String] ?? []).map { ["path": $0] }
+                if end > start { bot["duration"] = end - start }
+                messages.insert(contentsOf: [["role":"user", "text":prompt, "imageSources":images], bot], at: at)
+            }
+        }
+        endedTail?(terminal)
         if let row = lastAnswer, let message = row["message"] as? [String: Any] { lastUsage?(message, row["timestamp"] as? String) }
         return (messages, cwd)
     }

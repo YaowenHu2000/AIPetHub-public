@@ -74,7 +74,10 @@ function annotateFile(content, diff) {
   const added = new Set();
   const ghosts = new Map();
   const unplaced = [];
-  for (const hunk of parseHunks(diff)) {
+  const hunks = parseHunks(diff);
+  // 增删总数按 diff 本身算：定位不到的片段（比如文件被清空）照样列出来，顶部的数不能漏掉它们
+  const count = t => hunks.reduce((n, h) => n + h.lines.filter(l => l.t === t).length, 0);
+  for (const hunk of hunks) {
     const pos = locateHunk(lines, hunk);
     if (pos < 0) { unplaced.push(hunk); continue; }
     let idx = pos;
@@ -89,13 +92,12 @@ function annotateFile(content, diff) {
     }
   }
   const rows = [];
-  let removed = 0;
   lines.forEach((text, i) => {
-    (ghosts.get(i) || []).forEach(g => { rows.push({ type: 'del', text: g, no: null }); removed++; });
+    (ghosts.get(i) || []).forEach(g => rows.push({ type: 'del', text: g, no: null }));
     rows.push({ type: added.has(i) ? 'add' : 'ctx', text, no: i + 1 });
   });
-  (ghosts.get(lines.length) || []).forEach(g => { rows.push({ type: 'del', text: g, no: null }); removed++; });
-  return { rows, unplaced, added: added.size, removed, addedLines: added, ghosts };
+  (ghosts.get(lines.length) || []).forEach(g => rows.push({ type: 'del', text: g, no: null }));
+  return { rows, unplaced, added: count('+'), removed: count('-'), addedLines: added, ghosts };
 }
 
 // Markdown 渲染在 markdown.js（和聊天回答共用），这里传入改动标注

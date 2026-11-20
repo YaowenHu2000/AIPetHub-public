@@ -1,5 +1,7 @@
 # 桌宠骨骼动画（分层美术 + 骨骼）
 
+下面的命令都在 `ai-pet-hub/` 下运行。
+
 App 里的桌宠用「分层美术 + 骨骼」实时动：静止时和原画一模一样；头和身体永远是同一套图，不会像逐帧那样一帧画得和另一帧不一样。
 
 - **美术**由 AI 在原画上做「整图修改」得到：一层层拿掉手臂、头、身体，每次都把后面被挡住的地方画全；表情、口型、视线、眨眼、工作姿势的手臂也都是整图修改。
@@ -12,8 +14,8 @@ App 里的桌宠用「分层美术 + 骨骼」实时动：静止时和原画一�
 ## 出图（本地 CPA 代理，`imgapi.py`）
 
 ```sh
-python make_jobs.py pets/<角色>.json <母版 1024.png> <出图目录>   # 生成任务：a / b / c / iso 四批
-python imgapi.py <出图目录>/jobs_a.json 14                        # 并行跑；b（拿掉头）要等 noarms、c（拿掉身体）要等 nohead，iso 要等姿势图
+python3 tools/rig/make_jobs.py tools/rig/pets/<角色>.json <母版 1024.png> <出图目录>   # 生成任务：a / b / c / iso 四批
+python3 tools/rig/imgapi.py <出图目录>/jobs_a.json 14                                  # 并行跑；b（拿掉头）要等 noarms、c（拿掉身体）要等 nohead，iso 要等姿势图
 ```
 
 - 走本机生图代理的 `/v1/images/edits`（地址和密钥：环境变量 `CPA_URL` / `CPA_KEY`，或者 `tools/rig/cpa.local`），默认模型 `gpt-image-2.6-sunburst`；每次都要 `quality=high`（上游目前实际返回 medium、1254 像素，每张图旁边的 .json 里记着）。
@@ -21,14 +23,14 @@ python imgapi.py <出图目录>/jobs_a.json 14                        # 并行�
 - 每位约 29 张：noarms / noears / nohead / nobody，眨眼 2 张，表情 7 种（笑、吃惊、委屈、认真、思考、害羞、得意），口型 4 种，视线 4 个方向，
   4 个姿势（思考 / 查阅 / 施工 / 拖拽）和对应的「只留手臂」图。
 
-## 处理：`build_layered.sh <母版> <规格 specs/<角色>.json> <出图目录> <输出目录>`
+## 处理：`tools/rig/build_layered.sh <母版> <规格 tools/rig/specs/<角色>.json> <出图目录> <输出目录>`
 
 1. `peel_layers.py`：母版和每张剥层图用同样的种子切分（分水岭沿线稿描边）。每层可见处用母版原像素；被挡住的地方从「那张图里这个位置正好是这一层」的剥层图补，
    颜色先对齐；剥层图说这里露出来的是更后面的层，这一层就保持透明（不能抹颜色盖住后面的层）。
 2. `expressions.py`：表情 / 口型 / 视线 / 眨眼图只留脸上真的变了的地方（眼睛类只在眼睛和眉毛、嘴类只在嘴、表情在眼睛 + 嘴 + 脸颊），做成脸部补丁。
 3. `pose_layers.py`：姿势手臂的范围用「只留手臂」的图（AI 会把手臂挪位置，用特征点对回姿势图）当蒙版，像素取姿势图自己的，左右各一层挂在肩膀骨骼上。
 4. `make_rig_layered.py`：合成 rig.json（图层顺序、骨骼、软体变形、脸部补丁、画布图层）。
-5. `export_rig.py <输出目录> <id> web/rig/<id>`：转成 WebP（每位不到 1 MB）+ `rig.js`；App 和 `web/lab/layer-demo.html` 都读这个。
+5. `python3 tools/rig/export_rig.py <输出目录> <id> web/rig/<id>`（build_layered.sh 不包含这一步）：转成 WebP（每位不到 1 MB）+ `rig.js`；App 和 `web/lab/layer-demo.html` 都读这个。
 
 改了 `web/rig/src/` 之后重新打包（three.js 和运行库打成一个普通脚本，file:// 下不用模块、不用 fetch）：
 

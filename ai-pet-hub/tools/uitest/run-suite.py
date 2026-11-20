@@ -5,6 +5,7 @@ import json
 import os
 from pathlib import Path
 import shutil
+import shlex
 import signal
 import struct
 import subprocess
@@ -17,6 +18,16 @@ HERE = Path(__file__).resolve().parent
 ROOT = HERE.parent.parent
 
 
+def suite_source(script):
+    # 太长的套件把正文拆进同名目录里带序号的片段：按文件名顺序拼回主文件的 //@parts 处，和没拆时是同一段代码、同一个作用域
+    text = (HERE / script).read_text()
+    parts = HERE / Path(script).stem
+    if parts.is_dir():
+        assert '  //@parts\n' in text, script + ' 有片段目录却没有 //@parts 这一行'
+        text = text.replace('  //@parts\n', ''.join(p.read_text() for p in sorted(parts.glob('*.js'))), 1)
+    return text
+
+
 def processes():
     rows = {}
     for line in subprocess.check_output(['ps', '-axo', 'pid=,ppid=,lstart=,command='], text=True).splitlines():
@@ -24,6 +35,20 @@ def processes():
         if len(fields) == 8:
             rows[int(fields[0])] = (int(fields[1]), ' '.join(fields[2:7]), fields[7])
     return rows
+
+
+# 和 App 的 claudeCommand()（ClaudeRun.swift）同一个查找顺序：装了 reclaude 就只用 `reclaude cli`，测试里起的外部会话才和 App 读到的是同一处记录
+def real_claude():
+    forced = os.environ.get('AIPETHUB_CLAUDE')
+    if forced:
+        return [forced]
+    reclaude = Path.home() / '.local/bin/reclaude'
+    if reclaude.is_file():
+        return [str(reclaude), 'cli']
+    found = shutil.which('claude')
+    if not found:
+        raise RuntimeError('找不到真实 Claude CLI')
+    return [found]
 
 
 def git_fixture(repo):
@@ -90,11 +115,14 @@ def run():
     def remaining(rows):
         return {pid: row for pid, row in known.items() if rows.get(pid, (None, None))[1] == row[1]}
     try:
+        # 测试窗口和从程序坞打开的 App 一样，不带上发起测试的那个会话的代理和会话变量（见 build.sh 的安装一节）；
+        # 分叉前置的外部 CLI 也用这份，否则它会把会话写进发起测试那个会话的配置目录，App 的列表里找不到
+        host = ('HTTP_PROXY', 'HTTPS_PROXY', 'http_proxy', 'https_proxy', 'NODE_EXTRA_CA_CERTS', 'CLAUDECODE', 'CLAUDE_CONFIG_DIR')
+        env = {k: v for k, v in os.environ.items() if k not in host and not k.startswith(('RECLAUDE_', 'CLAUDE_CODE_', 'CLAUDE_AGENT_SDK_', 'ANTHROPIC_', 'ANTIGRAVITY_', 'AGY_'))}
         fork_sid = os.environ.get('FORK_SID', '')
         if agent == 'claude' and script == 'e2e-input-history.js' and not fork_sid:
-            cli = os.environ.get('AIPETHUB_CLAUDE') or shutil.which('claude')
             fork_log = (directory / 'fork-cli.log').open('w')
-            external = subprocess.Popen([cli, '-p', '--model', model, '--input-format', 'stream-json', '--output-format', 'stream-json', '--verbose'], cwd=repo, stdin=subprocess.PIPE, stdout=fork_log, stderr=subprocess.STDOUT, text=True)
+            external = subprocess.Popen(real_claude() + ['-p', '--model', model, '--input-format', 'stream-json', '--output-format', 'stream-json', '--verbose'], cwd=repo, stdin=subprocess.PIPE, stdout=fork_log, stderr=subprocess.STDOUT, text=True, env=env)
             owned.add(external.pid)
             external.stdin.write(json.dumps({'type': 'user', 'message': {'role': 'user', 'content': '只回复：甲'}}) + '\n')
             external.stdin.flush()
@@ -117,17 +145,24 @@ def run():
                 time.sleep(.1)
             if not fork_sid:
                 raise RuntimeError('分叉前置 CLI 未在100秒内完成')
-        constants = dict(REPO=str(repo), DIR=str(directory), PAGE=str(directory / 'page.html'), AGENT=agent, MODEL=model, ASK_PERM=ask[agent], FULL_PERM=full[agent], PDF_FILE=os.environ.get('PDF') or str(directory / 'red.png'), FORK_SID=fork_sid, LIFECYCLE_PHASE=os.environ.get('UITEST_LIFECYCLE_PHASE', 'main'), LIFECYCLE_FIXTURE=os.environ.get('UITEST_LIFECYCLE_FIXTURE', ''))
+        constants = dict(REPO=str(repo), DIR=str(directory), PAGE=str(directory / 'page.html'), AGENT=agent, MODEL=model, ASK_PERM=ask[agent], FULL_PERM=full[agent], PDF_FILE=os.environ.get('PDF') or str(directory / 'red.png'), FORK_SID=fork_sid, LIFECYCLE_PHASE=os.environ.get('UITEST_LIFECYCLE_PHASE', 'main'), LIFECYCLE_FIXTURE=os.environ.get('UITEST_LIFECYCLE_FIXTURE', ''),
+                         WAIT=int(os.environ.get('UITEST_WAIT', 240000)))   # until 等「某件事发生」的统一上限（毫秒），见 assertions.js
         source = 'const ' + ', '.join(k + '=' + json.dumps(v) for k, v in constants.items()) + ';\n'
-        source += (HERE / 'prelude.js').read_text() + '\n' + (HERE / 'assertions.js').read_text() + '\n' + (HERE / script).read_text()
+        source += (HERE / 'prelude.js').read_text() + '\n' + (HERE / 'assertions.js').read_text() + '\n' + suite_source(script)
         (directory / 'run.js').write_text(source)
         executable = os.environ.get('AIPETHUB_TEST_APP') or str(ROOT / 'build/AIPetHub.app/Contents/MacOS/AIPetHub')
         if executable.endswith('.app'):
             executable += '/Contents/MacOS/AIPetHub'
-        # 测试窗口和从程序坞打开的 App 一样，不带上发起测试的那个会话的代理和会话变量（见 build.sh 的安装一节）
-        host = ('HTTP_PROXY', 'HTTPS_PROXY', 'http_proxy', 'https_proxy', 'NODE_EXTRA_CA_CERTS', 'CLAUDECODE', 'CLAUDE_CONFIG_DIR')
-        env = {k: v for k, v in os.environ.items() if k not in host and not k.startswith(('RECLAUDE_', 'CLAUDE_CODE_', 'CLAUDE_AGENT_SDK_', 'ANTHROPIC_', 'ANTIGRAVITY_', 'AGY_'))}
         env['AIPETHUB_UITEST_REAL'] = os.environ.get('REAL', '')
+        if script == 'e2e-stream.js':
+            helper = directory / 'cli'
+            fixtures = ROOT / 'tools/fixtures'
+            (directory / 'mode').write_text('stream')
+            helper.write_text('#!/bin/sh\ncase "$1" in web) cd ' + shlex.quote(str(directory)) + '\nexec env FIXTURE_MODE=dr-stream ' +
+                              shlex.join(['/usr/bin/python3', str(fixtures/'fake-dsh.py')]) + ' "$@";; esac\nexec ' +
+                              shlex.join(['/usr/bin/python3', str(fixtures/'fake-cli.py'), 'backend', str(helper)]) + ' "$@"\n')
+            helper.chmod(0o755)
+            env.update(AIPETHUB_TEST_CLI=str(helper), AIPETHUB_TEST_GEMINI_CLI_DIR=str(directory/'antigravity-cli'), CODEX_HOME=str(directory/'codex'))
         with (directory / 'app.log').open('w') as log:
             app = subprocess.Popen([executable, '--uitest', str(directory / 'run.js'), str(directory / 'raw-result.json')], stdout=log, stderr=subprocess.STDOUT, env=env)
             owned.add(app.pid)
@@ -145,9 +180,8 @@ def run():
                 raise RuntimeError('窗口脚本执行失败：' + str(raw_result.get('error', inner)))
             result = inner
             checks = result.get('checks', [])
-            # 发布前 e2e-clean 是保留工具；核心套件必须至少执行一个断言。
-            legacy = script == 'e2e-clean.js'
-            passed = result.get('ok') is True and not result.get('error') and (legacy or (len(checks) > 0 and all(c.get('ok') is True for c in checks)))
+            # 每套都至少要执行一个断言：一条都没跑到不算通过
+            passed = result.get('ok') is True and not result.get('error') and len(checks) > 0 and all(c.get('ok') is True for c in checks)
             result['ok'] = passed
             result['status'] = 'failed' if not passed else 'skipped' if result.get('skips') else 'passed'
         elif os.environ.get('UITEST_EXPECT_SIGNAL') == '1' and app.returncode in (0, -signal.SIGTERM):
@@ -166,7 +200,8 @@ def run():
                 external.wait(timeout=5)
             except subprocess.TimeoutExpired:
                 external.terminate()
-        end = time.monotonic() + 6
+        # dsh web 的包装每 2 秒才看一次父进程，机器忙时几秒不够：条件一成立就往下走，上限同 until
+        end = time.monotonic() + int(os.environ.get('UITEST_WAIT', 240000)) / 1000
         while time.monotonic() < end:
             if not remaining(track()):
                 break

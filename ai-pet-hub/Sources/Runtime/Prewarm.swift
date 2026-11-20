@@ -1,10 +1,19 @@
 // 预热：用户开始打字、或上一轮刚答完时，先按当前设置把 CLI 起好、做完开场，发送时直接接手，回答的开头少等两三秒。
+//
+// 用户开始打字或上一轮答完时，App 按会话、模型、权限和工作空间预热。
+// Codex 和 Gemini 答完后只握手。
+//
+// 新会话仍在发送时创建。
+// Codex 在握手后查询模型和这个工作目录的技能（还没在这个项目里发过话时，打 / 也能列出它的技能）。
+// 每位最多保留一个预热进程，其余预热 10 分钟过期。
+//
+// Claude 只预热新对话，已有会话在发送时按最新记录续接。
 import Cocoa
 
 extension AppDelegate {
     // 回答的开头有一段等待是 CLI 自己在启动（起进程、读配置、接上会话）。用户开始打字、或者上一轮刚答完时，
     // 先按当前的设置把进程起好、开场白做完，等着；发送时设置对得上就直接接手它，这段等待就省了。
-    // 每位最多留一个。打字接入旧会话后空闲 90 秒就释放写锁，其余预热最多保留 10 分钟。
+    // 每位最多留一个。Gemini 打字接入旧会话后空闲 90 秒就释放写锁，其余预热最多保留 10 分钟。
     /// 这次提问会用什么设置起进程：对得上才能接手预热的那个。
     func warmKey(_ req: AskRequest) -> String {
         [req.agent, req.model, req.effort, req.permissionMode, validWorkspace(req.workspace) ?? "", req.conversationId,
@@ -44,7 +53,7 @@ extension AppDelegate {
     }
 
     /// 预热之后，这个会话又在别处（终端里）接着聊过：预热的进程读到的是旧内容，不能用。
-    /// Codex / agy 从 resume 答复那一刻起比对主文件和 WAL。Claude 沿用原来的启动宽限。
+    /// agy 从 resume 答复那一刻起比对主文件和 WAL。Claude 沿用原来的启动宽限。
     func changedElsewhere(_ warm: CLIProcess) -> Bool {
         if let saved = warm.warmBaseline {
             guard let file = warm.warmFile else { return true }
@@ -76,25 +85,17 @@ extension AppDelegate {
         return false
     }
 
-    /// 把一个预热好的进程放进去等着（把原来那个换掉）。
-    func keepWarm(_ agent: String, _ cli: CLIProcess) {
-        procLock.lock()
-        let old = warmProcs[agent]
-        warmProcs[agent] = cli
-        procLock.unlock()
-        if let o = old, o.proc.isRunning { terminateTree(o.proc.processIdentifier) }
-    }
-
     /// 网页：用户开始打字了 / 上一轮刚答完——按现在的设置预热。已经有对得上的就不动。
     func prewarm(_ req: AskRequest, typing: Bool = true) {
-        guard Bundle.main.bundleIdentifier != nil || ProcessInfo.processInfo.environment["AIPETHUB_PREWARM"] == "1" else { return }
+        guard Bundle.main.bundleIdentifier != nil || hooks.prewarmWithoutBundle else { return }
         if !req.workspace.isEmpty, validWorkspace(req.workspace) == nil { return }
         if req.agent == "deepseek" {
             DispatchQueue.global(qos: .utility).async { _ = self.dshReady() }
             return
         }
         let agent = req.agent, key = warmKey(req)
-        let attach = typing && !req.conversationId.isEmpty && ["gpt", "gemini"].contains(agent)
+        // Codex 续接即拿下会话写锁，别的 Codex 客户端（终端、桌面版）在释放前都接不上；只打字不该挡住它们，所以 Codex 发送时才续接。
+        let attach = typing && !req.conversationId.isEmpty && agent == "gemini"
         procLock.lock()
         let existing = warmProcs[agent]
         let reuse = existing?.warmKey == key && existing?.proc.isRunning == true
@@ -119,11 +120,11 @@ extension AppDelegate {
             if let old = existing, old.proc.isRunning { terminateTree(old.proc.processIdentifier) }
             let cli: CLIProcess?
             switch agent {
-            case "claude": cli = claudeLiveElsewhere(req.conversationId) == nil ? warmClaude(req) : nil
+            case "claude":
+                cli = warmClaude(req)
             case "gpt": cli = warmCodex(req)
             default: cli = warmGemini(req)
             }
-            if agent == "claude" { cli?.warmFile = conversationFile(agent: agent, cid: req.conversationId) }
             cli?.warmKey = key
             procLock.lock()
             let current = warmIntents[agent]
@@ -144,9 +145,7 @@ extension AppDelegate {
             guard let self = self, let cli = cli, let input = cli.input else { return false }
             self.procLock.lock(); let waiting = self.warmProcs[req.agent] === cli; self.procLock.unlock()
             guard waiting else { return false }
-            if req.agent == "gpt", let setup = self.codexSetup(req) {
-                self.codexOpenThread(req, input, model: setup.model, effort: setup.effort, sandbox: setup.sandbox)
-            } else if req.agent == "gemini", self.geminiResumeBlock(req.conversationId, fresh: false) == nil {   // 打字时每个按键都会到这里：复用 2 秒内的扫描结果，发送前会现查
+            if req.agent == "gemini", self.geminiResumeBlock(req.conversationId, fresh: false) == nil {   // 打字时每个按键都会到这里：复用 2 秒内的扫描结果，发送前会现查
                 self.acpOpenSession(req, input)
             } else { return false }
             return true
@@ -169,6 +168,23 @@ extension AppDelegate {
             self.procLock.unlock()
             if let cli = cli, cli.proc.isRunning { terminateTree(cli.proc.processIdentifier) }
         }
+    }
+
+    /// 删除会话前：打字续接的预热一直持着这个会话的库（停打 90 秒才放），而删除的持库检查连本 App 也算，会被它挡住。
+    /// 只结束还在缓存里等着的预热（正在回答的已被取走，不受影响），并等它退出；还在起的预热清掉意图，起好后自行结束、不会续接。
+    func releaseWarm(agent: String, cid: String) {
+        func sameConversation(_ key: String) -> Bool {
+            let parts = key.components(separatedBy: "\u{1}")   // 第 6 段是会话 ID，见 warmKey
+            return parts.count > 5 && parts[5] == cid
+        }
+        procLock.lock()
+        let warm = warmProcs[agent].flatMap { sameConversation($0.warmKey) ? $0 : nil }
+        if warm != nil { warmProcs[agent] = nil }
+        if let intent = warmIntents[agent], sameConversation(intent.key) { warmIntents[agent] = nil }
+        procLock.unlock()
+        guard let w = warm, w.proc.isRunning else { return }
+        terminateTree(w.proc.processIdentifier)
+        w.proc.waitUntilExit()
     }
 
     /// 等了太久没用上的、以及退出 App 时：都结束掉。

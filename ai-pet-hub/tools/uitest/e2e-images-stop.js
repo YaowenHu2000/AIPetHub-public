@@ -13,7 +13,7 @@ try {
   const imageReply = await ask('这张图片是什么颜色？只回答颜色的名字。'), cid = S[id].conversationId;
   check('所选模型随真实提问发给原生', sent.some(e => e.action === 'askAgent' && e.payload.model === MODEL && e.payload.images?.includes(DIR + '/red.png')));
   check('发送后附件栏清空', document.querySelectorAll('.attach-chip').length === 0);
-  await until(() => box.querySelector('.msg.user img'), 5000, '用户消息缩略图');
+  await until(() => box.querySelector('.msg.user img'), '用户消息缩略图');
   check('图片消息保留缩略图', !!box.querySelector('.msg.user img')); note('图片实际回答', imageReply.reply);
 
   // 回答进行中带图片补充；原生是否接收、气泡和图片是否清理才是断言，不判颜色词。
@@ -21,7 +21,7 @@ try {
   const attempts = [];
   for (let attempt = 0; attempt < 2 && !imageRound; attempt++) {
     const req = await start('用终端命令运行：sleep 6; echo ok。请在前台等它结束，然后只回答 ok。');
-    await until(() => events.some(e => e.name === 'onAgentStep' && e.data.reqId === req && e.data.step?.kind === 'command' && e.data.step.status === 'running') || response(req), 120000, '带图补充前的命令');
+    await until(() => events.some(e => e.name === 'onAgentStep' && e.data.reqId === req && e.data.step?.kind === 'command' && e.data.step.status === 'running') || response(req), '带图补充前的命令');
     if (!response(req)) imageRound = req;
     else { const r = await done(req); attempts.push(r); if (/^⚠️/.test(r.reply || '')) throw new Error('图片补充前置命令返回 CLI 错误'); }
   }
@@ -38,9 +38,9 @@ try {
 
   // 原 misc 停止后可重新发送，并进一步确认对账不会丢重试按钮。
   const stopReq = await start('从 1 数到 400，每个数字单独占一行，不要省略，不要用工具。');
-  await until(() => (box.querySelector('.live-answer')?.textContent.length || 0) > 20 || response(stopReq), 120000, '流式回答开始');
+  await until(() => (box.querySelector('.live-answer')?.textContent.length || 0) > 20 || response(stopReq), '流式回答开始');
   if (!response(stopReq)) {
-    stop(); await until(() => !isBusy(id), 15000, '停止完成');
+    stop(); await until(() => !isBusy(id), '停止完成');
     check('停止后发送按钮可用', !els.sendBtn.disabled);
     const stopped = lastTurn(), retry = stopped?.querySelector('.answer-copy.retry');
     check('停止回答有重试按钮', !!retry);
@@ -49,7 +49,7 @@ try {
     const reads = [nextRequestId(), nextRequestId()];
     S[id].loadedSig = 'force';
     reads.forEach(reqId => postNative('loadConversation', { agent: id, conversationId: cid, sync: true, reqId }));
-    await until(() => reads.every(reqId => held.has(reqId)), 15000, '两份停止后的历史都已读完');
+    await until(() => reads.every(reqId => held.has(reqId)), '两份停止后的历史都已读完');
     await releaseHistory();
     check('停止回答同步后节点保留', lastTurn() === stopped);
     check('停止回答同步后重试按钮保留', !!retry?.isConnected);

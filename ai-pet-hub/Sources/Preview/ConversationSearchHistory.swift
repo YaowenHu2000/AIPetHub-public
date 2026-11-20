@@ -11,8 +11,32 @@ struct ConversationSearchSource {
 }
 
 extension AppDelegate {
-    func searchStamp(_ source: ConversationSearchSource, excluding: Set<String> = []) -> String {
-        ([source.revision] + source.paths.filter { !excluding.contains($0) }.flatMap { path in
+    /// 时间随结局一起落盘；按会话汇总所有仍保留的记录，较早一条被淘汰也要重新渲染。
+    func endingMarks(_ agent: String) -> [String:String] {
+        procLock.lock(); defer { procLock.unlock() }
+        var marks: [String:String] = [:]
+        if agent == "gpt" {
+            let rows = hooks.codexKnownEndings ?? UserDefaults.standard.dictionary(forKey:"codexKnownEndings") as? [String:[String:Any]] ?? [:]
+            for (turn,row) in rows.sorted(by: { $0.key < $1.key }) {
+                marks[row["cid"] as? String ?? "", default:""] += "|\(turn):\(row["at"] ?? "")"
+            }
+        } else {
+            let rows = hooks.localEndings ?? UserDefaults.standard.array(forKey:"localTurnEndings") as? [[String:Any]] ?? []
+            for row in rows where row["agent"] as? String == agent {
+                if let cid = row["cid"] as? String { marks[cid, default:""] += "|\(row["end"] ?? "")" }
+            }
+        }
+        return marks
+    }
+
+    func searchEndingMark(_ source: ConversationSearchSource, marks: [String:String]? = nil) -> String {
+        let all = marks ?? endingMarks(source.kind == "codex-db" ? "gpt" : source.kind)
+        // 旧版 Codex 只记轮次编号，无法缩小到一个会话。
+        return (all[""] ?? "") + (all[source.cid] ?? "")
+    }
+
+    func searchStamp(_ source: ConversationSearchSource, excluding: Set<String> = [], ending: String? = nil) -> String {
+        ([ending ?? searchEndingMark(source), source.kind == "deepseek" ? source.revision + ":" + DshServer.logMark(source.cid) : source.revision] + source.paths.filter { !excluding.contains($0) }.flatMap { path in
             [path, path + "-wal"].map { file in
                 guard let attr = try? fm.attributesOfItem(atPath: file) else { return file + ":missing" }
                 return "\(file):\((attr[.modificationDate] as? Date)?.timeIntervalSince1970 ?? 0):\(attr[.size] ?? 0)"
@@ -20,7 +44,7 @@ extension AppDelegate {
         }).joined(separator: "|")
     }
 
-    func searchSources(agent: String, files: [(cid: String, path: String)]?) -> (sources: [ConversationSearchSource], error: String?) {
+    func searchSources(agent: String, files: [(cid: String, path: String)]?, metadataOnly: Bool = false) -> (sources: [ConversationSearchSource], error: String?) {
         func source(_ cid: String, _ paths: [String], _ kind: String, title: String = "", cwd: String = "", timestamp: Double? = nil) -> ConversationSearchSource {
             let date = timestamp ?? paths.compactMap { modificationDate($0)?.timeIntervalSince1970 }.max() ?? 0
             return ConversationSearchSource(cid: cid, paths: paths, kind: kind,
@@ -33,10 +57,17 @@ extension AppDelegate {
                     rows.map { (cid: $0.cid, path: $0.path, mtime: modificationDate($0.path) ?? .distantPast) }.sorted { $0.mtime > $1.mtime }
                 } ?? claudeSessionFiles()
                 var seen = Set<String>()
-                return candidates.compactMap { entry in
+                let rows: [ConversationSearchSource] = candidates.compactMap { entry in
                     guard seen.insert(entry.cid).inserted else { return nil }
-                    let path = findClaudeSession(cid: entry.cid, files: candidates) ?? entry.path
-                    return source(entry.cid, [path], "claude")
+                    let selected = findClaudeSession(cid: entry.cid, files: candidates) ?? entry.path
+                    let path = files == nil || candidates.contains(where: { $0.cid == entry.cid && $0.path == selected }) ? selected : entry.path
+                    var row = source(entry.cid, [path], "claude")
+                    if let item = claudeItem((entry.cid, path, modificationDate(path) ?? entry.mtime)) { row.item = item }
+                    return row
+                }
+                guard files == nil else { return rows }
+                return rows + localFirstItems("claude", excluding:seen).compactMap { item in
+                    (item["id"] as? String).map { ConversationSearchSource(cid:$0, paths:[], kind:"claude", item:item) }
                 }
             }
             return (selected, nil)
@@ -47,14 +78,52 @@ extension AppDelegate {
             var rows: [ConversationSearchSource] = [], seen = Set<String>(), excluded = Set<String>()
             var errors: [String] = []
             let state = "\(codexHome)/state_5.sqlite", history = "\(codexHome)/thread_history_1.sqlite"
+            let dir = "\(codexHome)/sessions"
+            var paths: [String:String] = [:]
+            var legacyPaths: [String:String] = [:]
+            if let walker = fm.enumerator(atPath:dir) {
+                hooks.rolloutLookupWalk?()
+                for case let rel as String in walker {
+                    let name = (rel as NSString).lastPathComponent
+                    guard name.hasPrefix("rollout-"), name.hasSuffix(".jsonl") || name.hasSuffix(".jsonl.zst") else { continue }
+                    let stem = name.dropLast(name.hasSuffix(".zst") ? 10 : 6)
+                    // 旧索引可能使用短编号；保留原先按「-编号」定位旧文件的方式。
+                    if UUID(uuidString:String(stem.suffix(36))) == nil {
+                        for dash in stem.indices where stem[dash] == "-" {
+                            legacyPaths[String(stem[stem.index(after:dash)...])] = dir + "/" + rel
+                        }
+                    }
+                    guard stem.count >= 36 else { continue }
+                    let cid = String(stem.suffix(36))
+                    if paths[cid] == nil || !name.hasSuffix(".zst") { paths[cid] = dir + "/" + rel }
+                }
+            }
+            lazy var archived = archivedRolloutIds()
+            func unindexed(_ cid: String, _ paths: [String], _ rollout: String?) -> ConversationSearchSource? {
+                if rollout == nil, archived.contains(cid) { return nil }
+                if let rollout, codexRolloutMeta(rollout)?["source"] is [String: Any] { return nil }
+                var entry = source(cid, paths, "gpt")
+                if let path = rollout, let mtime = modificationDate(path),
+                   let item = codexQueue.sync(execute: { cachedRolloutSummary(path, mtime) }) { entry.item = item }
+                return entry
+            }
             let stateReadable: Void? = withReadableSQLite(state) { db in
-                queryRows(db, "SELECT id, title, cwd, updated_at, rollout_path, archived, source FROM threads;") { row in
+                var first = "''", title = "title"
+                queryRows(db,"PRAGMA table_info(threads)") {
+                    if columnText($0,1) == "first_user_message" { first = "first_user_message" }
+                    if columnText($0,1) == "name" { title = codexNamedTitle }
+                }
+                queryRows(db, "SELECT id, \(title), cwd, updated_at, rollout_path, archived, source, \(first) FROM threads;") { row in
                     let cid = columnText(row, 0)
                     guard isSafeId(cid) else { return }
                     if sqlite3_column_int(row, 5) != 0 || columnText(row, 6).hasPrefix("{") { excluded.insert(cid); return }
-                    let rollout = findRollout(cid: cid, hint: columnText(row, 4))
+                    let hint = columnText(row,4)
+                    let rollout = metadataOnly ? nil : ([hint,hint + ".zst"].first { !hint.isEmpty && fm.fileExists(atPath:$0) } ?? paths[cid] ?? legacyPaths[cid])
+                    let title = columnText(row, 1)
+                    let prompt = trimmed(title).isEmpty ? stripPersonaPrefix(columnText(row, 7)) : ""
                     rows.append(source(cid, [state, history] + (rollout.map { [$0] } ?? []), "gpt",
-                        title: columnText(row, 1), cwd: columnText(row, 2), timestamp: Double(sqlite3_column_int64(row, 3))))
+                        title: prompt.isEmpty ? title : titleFrom(prompt, fallbackId:cid), cwd: columnText(row, 2), timestamp: Double(sqlite3_column_int64(row, 3))))
+                    if columnText(row, 6) == "exec" { rows[rows.count - 1].item["task"] = true }
                     seen.insert(cid)
                 }
             }
@@ -63,33 +132,31 @@ extension AppDelegate {
                 queryRows(db, "SELECT DISTINCT thread_id FROM thread_items;") { row in
                     let cid = columnText(row, 0)
                     guard isSafeId(cid), !seen.contains(cid), !excluded.contains(cid) else { return }
-                    let rollout = findRollout(cid: cid, hint: "")
-                    rows.append(source(cid, [history] + (rollout.map { [$0] } ?? []), "gpt")); seen.insert(cid)
+                    let rollout = paths[cid] ?? legacyPaths[cid]
+                    if let item = unindexed(cid, [history] + (rollout.map { [$0] } ?? []), rollout) { rows.append(item) }
+                    seen.insert(cid)
                 }
             }
             if historyReadable == nil, fm.fileExists(atPath: history) { errors.append("Codex 正文数据库无法读取") }
-            let dir = "\(codexHome)/sessions"
-            if let walker = fm.enumerator(atPath: dir) {
-                while let rel = walker.nextObject() as? String {
-                    guard rel.hasSuffix(".jsonl") || rel.hasSuffix(".jsonl.zst") else { continue }
-                    let name = ((rel as NSString).lastPathComponent).replacingOccurrences(of: ".jsonl.zst", with: "").replacingOccurrences(of: ".jsonl", with: "")
-                    guard name.hasPrefix("rollout-"), name.count >= 36 else { continue }
-                    let cid = String(name.suffix(36))
-                    guard isSafeId(cid), !seen.contains(cid), !excluded.contains(cid) else { continue }
-                    rows.append(source(cid, ["\(dir)/\(rel)"], "gpt")); seen.insert(cid)
-                }
+            for (cid,path) in paths where isSafeId(cid) && !seen.contains(cid) && !excluded.contains(cid) {
+                if let item = unindexed(cid,[path],path) { rows.append(item) }
             }
             return (rows.sorted { ($0.item["timestamp"] as? Double ?? 0) > ($1.item["timestamp"] as? Double ?? 0) }, errors.isEmpty ? nil : errors.joined(separator: "；"))
         case "deepseek":
             if let error = dshReady() { return ([], error) }
+            let marks = DshServer.logMarks()
             let result = dshServer.call("session.list")
-            guard let rows = (result.value as? [String: Any])?["items"] as? [[String: Any]] else { return ([], result.error ?? "DeepSeek 会话列表读取失败") }
-            let groups = (try? fm.contentsOfDirectory(atPath: "\(home)/.dsh/sessions")) ?? []
+            guard let listed = (result.value as? [String: Any])?["items"] as? [[String: Any]] else { return ([], result.error ?? "DeepSeek 会话列表读取失败") }
+            // 别处续写、改名过的会话按末页核对标题和时间，和侧栏共用同一份核对结果
+            let rows = deepseekQueue.sync { dshCheckedListRows(listed, marks: marks) }
+            let root = DshServer.sessionsRoot
+            let groups = (try? fm.contentsOfDirectory(atPath: root)) ?? []
             return (rows.compactMap { row in
                 guard let cid = row["sessionId"] as? String, row["blank"] as? Bool != true else { return nil }
-                let paths = groups.map { "\(home)/.dsh/sessions/\($0)/\(cid)/session.jsonl.zstd" }.filter { fm.fileExists(atPath: $0) }
+                let paths = groups.map { "\(root)/\($0)/\(cid)/session.jsonl.zstd" }.filter { fm.fileExists(atPath: $0) }
                 let title = (((row["projections"] as? [String: Any])?["values"] as? [String: Any])?["title"] as? String) ?? ""
                 var entry = source(cid, paths, "deepseek", title: title, cwd: row["cwd"] as? String ?? "", timestamp: ((row["updatedAt"] as? NSNumber)?.doubleValue ?? 0) / 1000)
+                entry.item["task"] = deepseekQueue.sync { dshScriptSession(row, cid) == true }
                 entry.revision = "\(row["updatedAt"] ?? "")"
                 return entry
             }, nil)
@@ -103,7 +170,20 @@ extension AppDelegate {
                     if fm.fileExists(atPath: geminiTranscriptPath(store.key(id))) { keys.insert(geminiKey(id, in: store)) }
                 }
             }
-            return (keys.map { source($0, [geminiConversationDb($0), geminiStore($0).summaries, geminiTranscriptPath($0)], "gemini") }, nil)
+            let summaries = geminiQueue.sync { () -> [String: [String: Any]] in
+                var items: [[String: Any]] = [], seen = Set<String>()
+                for store in geminiStores {
+                    keys.subtract(appendGeminiHistory(store, items: &items, seen: &seen))
+                }
+                let local = localFirstItems("gemini", excluding:seen)
+                keys.formUnion(local.compactMap { $0["id"] as? String })
+                return Dictionary(uniqueKeysWithValues: (items + local).compactMap { item in (item["id"] as? String).map { ($0, item) } })
+            }
+            return (keys.map { cid in
+                var row = source(cid, [geminiConversationDb(cid), geminiStore(cid).summaries, geminiTranscriptPath(cid)], "gemini")
+                if let item = summaries[cid] { row.item = item }
+                return row
+            }, nil)
         }
     }
 
@@ -112,12 +192,16 @@ extension AppDelegate {
         let path = source.paths.first ?? ""
         switch source.kind {
         case "claude":
+            if source.paths.isEmpty { return (claudeTurns(Data(),cid:source.cid).0, source.item["cwd"] as? String ?? "", nil) }
             guard let data = try? Data(contentsOf: URL(fileURLWithPath: path), options: .mappedIfSafe) else { return ([], "", "部分会话没搜：Claude 记录无法读取") }
-            let (messages, cwd) = claudeTurns(data)
+            let (messages, cwd) = claudeTurns(data, cid: source.cid)
             return (messages, cwd, nil)
         case "deepseek":
+            if let reason = dshReloadIfChangedElsewhere(source.cid, attaching: false) {
+                return ([], "", "部分会话没搜：" + reason)
+            }
             let history = readDeepSeekHistory(cid: source.cid, pageLimit: nil)
-            return (dshTurns(history.rows), source.item["cwd"] as? String ?? "", history.error.map { "部分会话没搜：" + $0 })
+            return (dshTurns(history.rows, endings: localEndings(agent: "deepseek", cid: source.cid)), source.item["cwd"] as? String ?? "", history.error.map { "部分会话没搜：" + $0 })
         case "codex-db":
             guard searchDatabaseReadable(path, sql: "SELECT item_json FROM thread_items LIMIT 0") else { return ([], "", "部分会话没搜：Codex 正文数据库无法读取") }
             return (codexDbTurns(source.cid, databasePath: path), "", nil)
@@ -134,6 +218,7 @@ extension AppDelegate {
         default:
             let history = readGeminiConversation(cid: source.cid, databasePath: explicit ? path : nil)
             let messages = history["messages"] as? [[String: Any]] ?? []
+            if let reason = history["historyError"] as? String { return (messages, "", "部分会话没搜：" + reason) }
             if messages.isEmpty, fm.fileExists(atPath: path), !searchDatabaseReadable(path, sql: "SELECT step_type, step_payload FROM steps LIMIT 0") {
                 return ([], "", "部分会话没搜：Gemini 正文数据库无法读取")
             }

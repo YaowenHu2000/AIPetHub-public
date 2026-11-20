@@ -105,12 +105,15 @@ final class ClaudeStreamParser {
     let turn: TurnBuilder
     var sessionId = ""
     var result: String?
+    var outputLimited = false
     var isError = false
     private(set) var completed = false
     var subtype = ""
     var durationMs: Double?
     /// 这一轮压缩过上下文（/compact）：结果怎么样，给人看的一句话。压缩不经过模型，没有回答正文，这句话就是这一轮的回答
     var compactNote: String?
+    /// 真的压成了：记录里会写一条 compact_boundary（重开时读成一条压缩提示）。没压成（「Not enough messages」等）记录里什么都没有
+    var compacted = false
     private var pending: [String: PendingFile] = [:]
     // --include-partial-messages：回答文字边生成边推给界面（Claude 不给思考内容，思考仍然只是一步占位）
     private var currentMessage = ""
@@ -152,8 +155,16 @@ final class ClaudeStreamParser {
             blocks.filter { $0["type"] as? String == "tool_result" }.forEach { claudeToolResult($0, turn: turn, pending: &pending) }
         case "result":
             completed = true
+            outputLimited = obj["stop_reason"] as? String == "max_tokens"
             result = obj["result"] as? String
             isError = (obj["is_error"] as? Bool) == true
+            if isError, let errors = obj["errors"] as? [String] {
+                var details = [trimmed(result)].filter { !$0.isEmpty }
+                for reason in errors.map({ trimmed($0) }) where !reason.isEmpty && !details.contains(reason) {
+                    details.append(reason)
+                }
+                if !details.isEmpty { result = details.joined(separator: "\n") }
+            }
             subtype = obj["subtype"] as? String ?? ""
             durationMs = (obj["duration_ms"] as? NSNumber)?.doubleValue
         case "system":
@@ -167,8 +178,10 @@ final class ClaudeStreamParser {
                 if turn.step("compact") == nil { turn.add(makeStep("tool", "压缩上下文", status: ok ? "ok" : "error"), key: "compact") }
                 else { turn.update("compact", ["status": ok ? "ok" : "error"]) }
                 compactNote = ok ? claudeCompactDoneNote : claudeCompactProblem(obj["compact_error"] as? String ?? "")
-            } else if sub == "compact_boundary", compactNote == nil {
-                compactNote = claudeCompactDoneNote
+                if ok { compacted = true }
+            } else if sub == "compact_boundary" {
+                compacted = true
+                if compactNote == nil { compactNote = claudeCompactDoneNote }
             }
         default:
             break

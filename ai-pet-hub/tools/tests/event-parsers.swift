@@ -4,6 +4,14 @@ import Cocoa
 import SQLite3
 
 func testHelpers() {
+    let lookup = AppDelegate()
+    lookup.pathLookupCache["ls"] = ("/不存在的旧目录/ls", Date())
+    lookup.hooks.jsSink = { _, _ in }
+    lookup.pathLookupCache["cat"] = (nil, Date())
+    _ = lookup.handleAppAction("probeAgents", ["agents":[String](), "refresh":true])
+    check(lookup.lookupOnPath("cat") != nil, "手动重检应清掉未安装缓存")
+    let found = lookup.lookupOnPath("ls")
+    check(found.map { FileManager.default.isExecutableFile(atPath: $0) } == true, "B4-16 失效路径重新查找，实际 \(found ?? "无")")
     // 这一轮的结局要交给网页，它据此显示「重试」：Claude 中途崩了、正文只有半句时，只靠正文开头的 ⚠️ 猜不出来（astra 报告）
     eq(responseOutcome(agent: "claude", turn: ["outcome": "failed"]) as? String, "failed", "Claude 的失败结局交给网页")
     eq(responseOutcome(agent: "gpt", turn: ["outcome": "interrupted"]) as? String, "interrupted", "Codex 的结局照旧交给网页")
@@ -14,6 +22,20 @@ func testHelpers() {
     board.clearContents(); board.setString("只是一段文字", forType: .string)
     eq(pastedFilePaths(board), [], "剪贴板只有文字时不当文件")
     board.releaseGlobally()
+    let paste = AppDelegate()
+    var pasteError = ""
+    paste.hooks.pastedImageDirectory = "/dev/null/不能建立目录"
+    paste.hooks.jsSink = { name, value in if name == "onFilesDropped" { pasteError = str(value,"error") } }
+    paste.savePastedImage("data:image/png;base64,YQ==")
+    let temporary = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+    defer { try? FileManager.default.removeItem(at: temporary) }
+    paste.hooks.pastedImageDirectory = temporary.path
+    var screenshot = ""
+    paste.hooks.jsSink = { _, value in screenshot = (value["paths"] as? [String])?.first ?? "" }
+    paste.savePastedImage("data:image/png;base64,YQ==")
+    _ = paste.handleAppAction("discardPastedImage", ["path":screenshot])
+    check(!screenshot.isEmpty && !FileManager.default.fileExists(atPath:screenshot), "B4-18 移除草稿后截图不留在目录中，实际存在 \(FileManager.default.fileExists(atPath:screenshot))")
+    check(!pasteError.isEmpty, "B4-17 不能建立截图目录时返回文件系统原因，实际 \(pasteError)")
     print("· 工具函数")
     eq(lineCount(""), 0, "空串行数")
     eq(lineCount("a\nb"), 2, "两行")
@@ -23,6 +45,10 @@ func testHelpers() {
     let c = diffCounts("--- a\n+++ b\n@@\n-x\n-y\n+z\n 上下文")
     eq(c.added, 1, "diff 新增行数（不算 +++ 文件头）")
     eq(c.removed, 2, "diff 删除行数（不算 --- 文件头）")
+    let markdown = diffCounts("--- a/x\r\n+++ b/x\r\n@@ -1,2 +1,2 @@\r\n----\r\n-old\r\n++++\r\n+new\r\n")
+    eq([markdown.added,markdown.removed], [2,2], "B3-19 CRLF 补丁的 Markdown 分隔线仍算正文")
+    eq(lineCount("a\r\nb\r\n"), 2, "B3-19 CRLF 两行")
+    eq(diffCounts(simpleDiff(old:"a\r\nb\r\n", new:"c\r\nd\r\n")).added, 2, "B3-19 CRLF 替换不多算最后一行")
     eq(clip("abcdef", 3), "abc…", "clip")
     eq(codexChangeKind("add"), "create", "Codex 改动类型：字符串")
     eq(codexChangeKind(["type": "delete"]), "delete", "Codex 改动类型：历史记录里的对象")
@@ -61,6 +87,17 @@ func testTurnBuilder() {
 
 func testClaude() {
     print("· Claude Code 流式事件")
+    let capped = TurnBuilder(), cp = ClaudeStreamParser(turn: capped)
+    cp.feed(json(#"{"type":"result","subtype":"success","is_error":false,"stop_reason":"max_tokens","result":"已有正文"}"#))
+    let req = AskRequest(agent:"claude", reqId:1, prompt:"test", model:"", effort:"", permissionMode:"", workspace:"", conversationId:"")
+    let failed = TurnBuilder(), fp = ClaudeStreamParser(turn: failed)
+    fp.feed(json(#"{"type":"result","subtype":"error_during_execution","is_error":true,"errors":["第一处错误","第二处错误"]}"#))
+    let errorReply = AppDelegate().claudeReply(req, res: CLIResult(out:"", err:"", status:1, cancelled:false), parser:fp, turn:failed)
+    check(errorReply.reply.contains("第一处错误") && errorReply.reply.contains("第二处错误"), "B3-12 显示 Claude 所有错误明细，实际=\(errorReply.reply)")
+    let r = AppDelegate().claudeReply(req, res: CLIResult(out:"", err:"", status:0, cancelled:false), parser:cp, turn:capped)
+    eq(r.reply, "已有正文", "B5 Claude 输出上限保留正文")
+    eq(str(r.turn, "outcome"), "failed", "B5 Claude 最终停止原因优先于 success")
+    check(str((r.turn?["steps"] as? [[String: Any]])?.last, "detail").contains("输出上限"), "B5 Claude 结束步骤说明上限")
     let t = TurnBuilder()
     let p = ClaudeStreamParser(turn: t)
     let lines = [
@@ -216,6 +253,17 @@ func testAgy() {
 func testCodexApp() {
     print("· Codex app-server 通知（交互式）")
     let t = TurnBuilder()
+    let limited = CodexAppParser(turn: TurnBuilder())
+    limited.notify("turn/completed", json(#"{"turn":{"status":"failed","error":{"message":"Incomplete response returned, reason: max_output_tokens"}}}"#))
+    eq(limited.status, "failed", "B5 Codex 输出上限仍按失败收尾")
+    check(limited.errors.last?.contains("输出上限") == true, "B5 Codex 明确显示输出上限")
+    let app = AppDelegate(), input = LiveInput()
+    let req = AskRequest(agent: "gpt", reqId: 1, prompt: "继续", model: "model", effort: "low",
+                         permissionMode: "default", workspace: "", conversationId: "thread", browserTools: false)
+    app.codexOpenThread(req, input, model: req.model, effort: req.effort, sandbox: "read-only")
+    input.close()
+    let request = app.jsonObject(String(decoding: input.pipe.fileHandleForReading.readDataToEndOfFile(), as: UTF8.self))
+    eq((request?["params"] as? [String: Any])?["excludeTurns"] as? Bool, true, "B4 续问不回传历史回合")
     let p = CodexAppParser(turn: t)
     var userTexts: [String] = []
     p.onUserMessage = { userTexts.append($0) }
@@ -340,6 +388,68 @@ func testDsh() {
     eq(files.map { str($0, "path") }, ["/tmp/w/a.txt"], "改动的文件")
     eq(str(files.first, "diff").contains("-hi") && str(files.first, "diff").contains("+ho"), true, "改了哪里")
     // 读历史：同一批事件拼成一问一答
+    let manual: [String: Any] = ["type":"compaction/end", "data":["turn":NSNull(), "compactionId":"manual"]]
+    let failed: [String: Any] = ["type":"compaction/end", "data":["turn":NSNull(), "error":"failed"]]
+    eq(dshTurns(rows + [["event":failed], ["event":manual]]).map { str($0, "role") }, ["user","bot","compact"], "B4-2 手动压缩只保留成功提示")
+    let autoBuilder = TurnBuilder(), compactID = "auto"
+    let auto = DshParser(turn: autoBuilder)
+    for (type, fields) in [("start", ["turn": 1] as [String:Any]), ("summary", ["summary":"压缩后的摘要"]), ("end", ["turn":1])] {
+        auto.feed(["type":"compaction/" + type, "data":fields.merging(["compactionId":compactID]) { a, _ in a }])
+        eq(str(autoBuilder.steps.last, "status"), type == "end" ? "ok" : "running", "B4-3 自动压缩阶段 " + type)
+    }
+    eq(autoBuilder.steps.map { str($0, "detail") }, ["压缩后的摘要"], "B4-3 三个事件合为一步")
+    let myRpc = "aph-ask-工具"
+    let ownRows: [[String:Any]] = [
+        ["event":["type":"user/message","time":23150,"data":["source":["kind":"user","rpcId":myRpc],"content":[["type":"text","text":"提问"]]]]],
+        ["event":["type":"assistant/message","data":["message":["content":[["type":"text","text":"工具前说明"]]]]]],
+        ["event":["type":"turn/end","data":["reason":["kind":"aborted"]]]]
+    ]
+    eq(dshTurns(ownRows).first?["createdAt"] as? Double, 23.15, "首次对账使用 DeepSeek 提问事件的秒时间")
+    eq(str(dshTurns(ownRows).first, "turnKey"), myRpc, "同步认领 DeepSeek 原提问调用编号")
+    let crash = dshTurns(ownRows,endings:[["rpc":myRpc,"text":"工具后正文","reason":"服务退出"]]).last
+    eq(str(crash,"text"),"工具后正文","DeepSeek 工具前说明不能顶替同一调用的末段")
+    // 上一轮缺结束事件：下一轮的 turn/start 先收好上一轮，结局不丢，两问之间的空闲也不算工作时长。
+    func framed(_ turn: Int, _ type: String, _ time: Double, _ data: [String:Any] = [:]) -> [String:Any] {
+        ["event":["type":type, "time":time, "data":data.merging(["turn":turn]) { a, _ in a }]]
+    }
+    func asked(_ i: Int, _ time: Double) -> [String:Any] {
+        framed(i, "user/message", time, ["source":["kind":"user","rpcId":"q\(i)"], "content":[["type":"text","text":"问\(i)"]]])
+    }
+    func answered(_ i: Int, _ time: Double) -> [String:Any] {
+        framed(i, "assistant/message", time, ["message":["content":[["type":"text","text":"答\(i)"]]]])
+    }
+    let later = [framed(2,"turn/start",3_601_000), asked(2,3_601_000), answered(2,3_602_000), framed(2,"turn/end",3_603_000,["reason":["kind":"completed"]])]
+    for hasText in [false, true] {
+        let earlier = [framed(1,"turn/start",1000), asked(1,1000)] + (hasText ? [answered(1,3000)] : [])
+        let ending: [String:Any] = ["rpc":"q1","reqId":71,"text":hasText ? "答1" : "","outcome":"interrupted","start":1.0,"end":3.0]
+        let alone = dshTurns(earlier, endings:[ending]), continued = dshTurns(earlier + later, endings:[ending])
+        eq(continued.map { str($0,"role") }, ["user","bot","user","bot"], "DeepSeek 上一轮缺结束事件（正文=\(hasText)）再问一句仍各成一轮")
+        eq(continued.prefix(2).map { "\(str($0,"text"))|\(str($0,"outcome"))|\($0["duration"] as? Double ?? 0)" },
+           alone.map { "\(str($0,"text"))|\(str($0,"outcome"))|\($0["duration"] as? Double ?? 0)" },
+           "DeepSeek 上一轮缺结束事件（正文=\(hasText)）再问一句不改变上一轮的结局和时长")
+    }
+    let titled = dshTurns(rows + [["event":["type":"session/title", "time":1999999999000]]])
+    eq(titled.last?["duration"] as? Double, dshTurns(rows).last?["duration"] as? Double, "B4-7 DeepSeek 标题不延长工作时长")
+    for (receipt, expected) in [("tool call aborted before dispatch","interrupted"),("permission denied","error")] {
+        let stoppedJSON = raw.replacingOccurrences(of:"(no output)",with:receipt)
+            .replacingOccurrences(of:"\"isError\":false",with:"\"isError\":true")
+            .replacingOccurrences(of:"\"kind\":\"completed\"",with:"\"kind\":\"aborted\"")
+        let stoppedRows = stoppedJSON.split(separator:"\n").compactMap { json(String($0)) as [String:Any]? }
+        let steps = dshTurns(stoppedRows).last?["steps"] as? [[String:Any]]
+        eq(str(steps?.first { str($0,"kind") == "command" },"status"),expected,"DeepSeek 重开用户取消的命令并保留真实失败")
+    }
+    // 真实 dsh 停止运行中的命令：回执文字是 Error: tool call aborted，isError 为真，同时带结构化的 ABORTED。
+    // 同轮读文件的真实失败、改文件的成功要各自保留。
+    let abortedJSON = raw.replacingOccurrences(of: #"{"type":"text","text":"(no output)"}],"isError":false}],"role":"user","id":"79a04147-b39c-48a4-983e-528d23b3f83e"}"#,
+                                               with: #"{"type":"text","text":"Error: tool call aborted"}],"isError":true}],"role":"user","id":"79a04147-b39c-48a4-983e-528d23b3f83e"},"error":{"name":"AbortError","code":"ABORTED"}"#)
+        .replacingOccurrences(of: #""view":{"card":"terminal","output":"(no output)","exitCode":0}"#, with: #""view":{"card":"terminal"}"#)
+        .replacingOccurrences(of: #"(End of file - total 1 lines)\n</content>"}],"isError":false"#, with: #"permission denied"}],"isError":true"#)
+        .replacingOccurrences(of: "\"kind\":\"completed\"", with: "\"kind\":\"aborted\"")
+    check(abortedJSON.contains("ABORTED") && abortedJSON.contains("permission denied"), "DeepSeek ABORTED 夹具替换生效")
+    let abortedSteps = (dshTurns(abortedJSON.split(separator: "\n").compactMap { json(String($0)) as [String: Any]? }).last?["steps"] as? [[String: Any]] ?? [])
+        .filter { ["command", "read", "edit"].contains(str($0, "kind")) }
+    eq(abortedSteps.map { "\(str($0, "kind")):\(str($0, "status"))" }, ["command:interrupted", "read:error", "edit:ok"],
+       "DeepSeek 重开被停止的命令（结构化 ABORTED）仍是中断，同轮其他步骤保留各自结果")
     let turns = dshTurns(rows)
     eq(turns.map { str($0, "role") }, ["user", "bot"], "一问一答")
     eq(str(turns.first, "text").hasPrefix("用 bash 执行"), true, "提问")
@@ -371,6 +481,24 @@ func testDsh() {
         source["rpcId"] = rpc
         return ["event": ["type": "user/message", "seq": 1, "time": 1794398190000, "data": ["role": "user", "source": source, "content": content]]]
     }
+    let steerRpc = dshSteerPrefix + "next"
+    let nextRows = rows + [["event":["type":"turn/start","data":["turn":2]]],
+                           dshUser([["type":"text","text":"补充要求"]],rpc:steerRpc)]
+    let nextTurns = dshTurns(nextRows,endings:[["rpc":steerRpc,"text":"补充后的半段","outcome":"failed"]])
+    eq([str(nextTurns.last,"text"),str(nextTurns.last,"outcome")],["补充后的半段","failed"],"DeepSeek 新轮接收补充时补回对应崩溃正文")
+    let tick = Date()
+    TestHooks.dshPushNow = { tick }
+    for reason in ["aborted","interrupted"] {
+        var events = [dshUser([["type":"text","text":"数数"]])]
+        for text in ["一","二"] {
+            events.append(["event":["type":"assistant/chunk","data":["chunk":["type":"text-delta","text":text]]]])
+        }
+        events.append(["event":["type":"turn/end","data":["reason":["kind":reason]]]])
+        let bot = dshTurns(events).last
+        eq(str(bot,"text"), "一二", "B2-10 \(reason) 节流窗口内最后一段正文保留")
+        eq(str(bot,"outcome"), "interrupted", "B2-10 \(reason) 可重试")
+    }
+    TestHooks.dshPushNow = nil
     var pictured = rows.filter { (($0["event"] as? [String: Any])?["type"] as? String) != "user/message" }
     pictured.insert(dshUser([imageBlock, ["type": "text", "text": "请看这张图片。"]]), at: 0)
     pictured.insert(dshUser([imageBlock], rpc: "aph-steer-s2"), at: pictured.count / 2)
@@ -379,7 +507,7 @@ func testDsh() {
     eq(str(withImages.first, "text"), "请看这张图片。", "DS01 图片块不混进提问文字")
     eq((withImages.first?["imageSources"] as? [[String: Any]])?.compactMap { $0["ref"] as? String }, ["sha256:\(sha)"], "DS01 提问带上图片来源（附件编号）")
     let dsAsked = AppDelegate()
-    dsAsked.jsSink = { _, _ in }
+    dsAsked.hooks.jsSink = { _, _ in }
     dsAsked.attachChatImages(&withImages, payload: ["agent": "deepseek", "conversationId": "session-fixture", "cwd": "/tmp"])
     let dsThumb = (withImages.first?["images"] as? [[String: Any]])?.first
     check((dsThumb?["src"] as? String ?? "").hasPrefix("data:image/"), "DS01 重开历史有缩略图")
@@ -393,6 +521,29 @@ func testDsh() {
     bad.feed(json(#"{"type":"turn/end","seq":15,"data":{"turn":1,"reason":{"kind":"error","error":{"message":"Authentication Fails","code":"AUTH","status":401}}}}"#))
     eq(bad.ended?.kind ?? "", "error", "出错的一轮")
     eq(dshReadableError(bad.ended?.message ?? "", code: bad.ended?.code ?? "").contains("密钥"), true, "密钥不对时说人话")
+    // DR1：提问卡的答复换成 dsh 会收的格式（选项标签进 selected，自己写的进 custom，单选不同时带两样）
+    let qs: [[String: Any]] = [["id": "m", "question": "多选？", "multiSelect": true, "options": [["label": "甲"], ["label": "乙"]]],
+                               ["id": "s", "question": "单选？", "options": [["label": "丙"]]]]
+    let same = [["id":"left","question":"选哪个？"], ["id":"right","question":"选哪个？"]]
+    let card = dshCard(["type":"question/requested","questions":same])
+    eq((card.fields["questions"] as? [[String:Any]])?.map { str($0,"id") }, ["left","right"], "B4-22 DeepSeek 同名题保留原编号")
+    eq(dshQuestionAnswers(same, ["answers":["left":"甲","right":"乙"]]).map { str($0,"custom") }, ["甲","乙"], "B4-22 DeepSeek 同名题各自取答案")
+    let picked = dshQuestionAnswers(qs, ["decision": "allow", "answers": ["多选？": "甲、乙、别的", "单选？": "自己写的"]])
+    eq(picked.map { ($0["selected"] as? [String]) ?? [] }, [["甲", "乙"], []], "DR1 选项标签进 selected")
+    eq(picked.map { $0["custom"] as? String ?? "" }, ["别的", "自己写的"], "DR1 自己写的进 custom")
+    let separated = dshQuestionAnswers([["id":"m", "multiSelect":true, "options":[["label":"甲、乙"],["label":"丙"]]]],
+        ["answers":["m":"甲、乙、丙、手写、补充"], "answerParts":["m":["selected":["甲、乙","丙"], "custom":"手写、补充"]]])
+    eq(separated.first?["selected"] as? [String], ["甲、乙","丙"], "R3 DeepSeek 多选保留含顿号的完整选项")
+    eq(separated.first?["custom"] as? String, "手写、补充", "R3 DeepSeek 自填不混入选项")
+    let skipped = dshQuestionAnswers(qs, ["decision": "deny", "message": "按你的判断"])
+    eq(skipped.map { $0["custom"] as? String ?? "" }, ["按你的判断", "按你的判断"], "DR1 不回答时把说明交给模型")
+    // DR3：先写出正文、再以输出上限结束的一轮，重开历史要和实时一致：正文留着、结局 failed（有「重试」）、原因在结束步骤
+    let capped = dshTurns([dshUser([["type": "text", "text": "写长一点"]]),
+                           ["event": ["type": "assistant/message", "data": ["turn": 1, "step": 1, "message": ["content": [["type": "text", "text": "begin OK"]]]]]],
+                           ["event": ["type": "turn/end", "data": ["turn": 1, "reason": ["kind": "max-tokens"]]]]])
+    eq(str(capped.last, "text"), "begin OK", "DR3 历史里输出到上限的一轮正文留着")
+    eq(str(capped.last, "outcome"), "failed", "DR3 历史里输出到上限算 failed，和实时一样给「重试」")
+    eq(str((capped.last?["steps"] as? [[String: Any]])?.last, "detail").contains("上限"), true, "DR3 历史的结束步骤写明是输出到上限")
     eq(str(dshToolStep(name: "web_search", args: ["query": "天气"], view: [:]), "kind"), "web", "联网搜索")
     eq(str(dshToolStep(name: "mystery", args: [:], view: ["card": "terminal", "title": "ls"]), "kind"), "command", "名字不认识时看卡片种类")
 }
@@ -400,6 +551,14 @@ func testDsh() {
 func testLineSplitter() {
     print("· 按行切分子进程输出")
     let s = LineSplitter()
+    let chunk = Data(repeating: 97, count: 8192)
+    let started = ProcessInfo.processInfo.systemUptime
+    for _ in 0..<1024 { _ = s.feed(chunk) }
+    let large = s.feed(Data("\n".utf8))
+    let elapsed = ProcessInfo.processInfo.systemUptime - started
+    print(String(format: "B4 8 MiB 单行分 1024 块读取：%.4f 秒", elapsed))
+    check(elapsed < 3, "B4 分块读取大回包不反复扫描前缀")
+    eq(large.first?.utf8.count, 8 << 20, "B4 大回包完整读出")
     var lines = s.feed(Data("{\"a\":1}\n{\"b\"".utf8))
     eq(lines, ["{\"a\":1}"], "半行先留着")
     lines = s.feed(Data(":2}\n".utf8))
@@ -424,12 +583,22 @@ func testCompact() {
     eq(str(t.steps.first, "status"), "ok", "Claude：压完了这一步是好的")
     eq(p.compactNote ?? "", "前面的对话已经压缩成摘要，腾出了上下文空间。", "Claude：压完了的那句话")
     eq(t.steps.count, 1, "Claude：只有一步")
+    eq(p.compacted, true, "Claude：压成了，记录里会多一条压缩提示")
+    let p3 = ClaudeStreamParser(turn: TurnBuilder())
+    p3.feed(json(#"{"type":"system","subtype":"compact_boundary","compact_metadata":{"trigger":"manual"}}"#))
+    eq(p3.compacted, true, "Claude：只报 compact_boundary 的版本也算压成了")
     let t2 = TurnBuilder()
     let p2 = ClaudeStreamParser(turn: t2)
     p2.feed(json(#"{"type":"system","subtype":"status","status":"compacting"}"#))
     p2.feed(json(#"{"type":"system","subtype":"status","status":null,"compact_result":"failed","compact_error":"Not enough messages to compact."}"#))
     eq(str(t2.steps.first, "status"), "error", "Claude：没压成这一步是失败的")
     eq(p2.compactNote ?? "", "没有压缩：对话还太短，没有可以压缩的内容。", "Claude：对话太短的那句话")
+    eq(p2.compacted, false, "Claude：没压成，记录里没有压缩提示（2026-11-18 claude 2.1.322 实测没有 compact_boundary）")
+    // 交给网页的回答里带着它（AskFlow 原样转成 onAgentResponse 的 compacted）
+    let app = AppDelegate(), ok = CLIResult(out: "", err: "", status: 0, cancelled: false)
+    let compactReq = AskRequest(agent: "claude", reqId: 1, prompt: "/compact", model: "", effort: "low", permissionMode: "default", workspace: "", conversationId: "s1")
+    eq(app.claudeReply(compactReq, res: ok, parser: p, turn: t).turn?["compacted"] as? Bool, true, "Claude：压成了的回答带 compacted=true")
+    eq(app.claudeReply(compactReq, res: ok, parser: p2, turn: t2).turn?["compacted"] as? Bool, false, "Claude：没压成的回答带 compacted=false")
     eq(dshCompactReply("No compactable history yet."), "还没有可以压缩的历史：对话还太短。", "dsh：没有可压缩的")
     eq(dshCompactReply(["text": "Compaction could not produce a useful summary. The conversation is unchanged; the attempt is recorded in the session log."]).hasPrefix("没有压缩"), true, "dsh：摘要没用不算出错")
     eq(dshCompactReply(["result": ["message": "Compacted 12 items (~3400 tokens)."]]), "前面的对话已经压缩成摘要，腾出了上下文空间。\n\nCompacted 12 items (~3400 tokens).", "dsh：压完了，原话附在后面")

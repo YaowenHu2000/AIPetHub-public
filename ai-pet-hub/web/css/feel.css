@@ -55,7 +55,7 @@ body.window-inactive .composer-box:focus-within { --sq-line: var(--rim); box-sha
 .dock-btn, .card-gear { opacity: 0; }
 .pet-card:hover .dock-btn, .pet-card:hover .card-gear, .card-gear.open { opacity: 1; }
 
-/* ---------- 少画线：顶栏下面的线平时不画，聊天内容滚到它下面才出现；左栏三位之间的线淡一点 ---------- */
+/* ---------- 少画线：顶栏下面的线平时不画，聊天内容滚到它下面才出现；左栏各位之间的线淡一点 ---------- */
 .hist-splitter::after { left: 14px; right: 14px; opacity: 0.6; }
 .hist-splitter:hover::after, .hist-splitter.dragging::after { opacity: 1; }
 
@@ -90,7 +90,7 @@ body.window-inactive .pet-card.active:not([data-phase]) { box-shadow: none; }
 }
 /* 左栏里正在回答 / 没看过的小点，文件改动的「新建」标签这些小色块不加：太碎，加了反而脏 */
 
-/* ===== 对齐（数字是 tools/uitest/measure.js 量出来的，改了这里再量一遍） ===== */
+/* ===== 对齐（数字是在真实窗口里量出来的，改了要在 REAL=1 的窗口测试截图里再核一遍） ===== */
 
 /* ---------- 左栏：图标一列、文字一列、右边的数字一列 ----------
    三层（名字、工作空间、会话）的图标都放在 16px 宽的格子里，中心在第 22px；文字都从第 36px 开始；
@@ -131,7 +131,7 @@ body.window-inactive .pet-card.active:not([data-phase]) { box-shadow: none; }
    · 左栏：窗口最底下垫着系统的毛玻璃（AppDelegate 里的 NSVisualEffectView，固定深色外观），左栏的底留 90%，带一点桌面的颜色；
      网页自己不画底，别的栏都是不透明的，盖住它。
    · 弹出面板：底留 86%，后面的内容模糊着透上来一点（背景模糊加在画底的那个伪元素上）。
-   这两样只有在真实窗口里才看得出对不对（tools/uitest/e2e-chrome.js，REAL=1），只截网页内容的截图看不出背景模糊。 */
+   这两样只有在真实窗口里才看得出对不对（REAL=1 的窗口测试截图，tools/uitest/prelude.js 的 realShot），只截网页内容的截图看不出背景模糊。 */
 html, body { background: transparent; }
 /* 左栏的底：带一点靛紫的深色（不是中性灰），上面略亮、往下沉下去；留 90%，桌面的颜色只透上来一点点 */
 :root { --side-glass: linear-gradient(180deg, rgba(27, 23, 48, 0.9), rgba(17, 15, 32, 0.92)); }

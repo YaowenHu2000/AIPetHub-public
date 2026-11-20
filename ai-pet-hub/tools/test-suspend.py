@@ -5,6 +5,8 @@
 import json, os, pathlib, signal, subprocess, tempfile, time
 ROOT = pathlib.Path(__file__).resolve().parent.parent
 os.chdir(ROOT)
+# 和 tools/tests/support.swift 的 testWaitLimit 读同一个环境变量：等「某件事发生」的上限，条件一成立就往下走
+WAIT = float(os.environ.get('AIPETHUB_TEST_WAIT', 60))
 rows = []
 for mode in ['app', 'cli', 'both']:
     with tempfile.TemporaryDirectory(prefix='aipethub-suspend-') as tmp:
@@ -14,7 +16,7 @@ for mode in ['app', 'cli', 'both']:
             p = subprocess.Popen(['build/selftest', 'suspend-case', tmp], stdout=log, stderr=log)
             owned = {p.pid}
             try:
-                until = time.monotonic()+12
+                until = time.monotonic()+WAIT   # 只防卡死：机器忙（别的测试同时在编译、跑）时 12 秒等不到 ready.json
                 while not (d/'ready.json').exists() and time.monotonic()<until and p.poll() is None:
                     time.sleep(.02)
                 info = json.loads((d/'ready.json').read_text())
@@ -27,14 +29,20 @@ for mode in ['app', 'cli', 'both']:
                 targets = [p.pid] if mode == 'app' else [cli] if mode == 'cli' else [p.pid,cli]
                 for pid in targets: os.kill(pid,signal.SIGSTOP)
                 (d/'external-status').write_text('idle')
-                time.sleep(4.5)
-                state = subprocess.run(['/bin/ps','-o','stat=','-p',str(cli)],capture_output=True,text=True)
-                cli_exited = state.returncode != 0 or 'Z' in state.stdout
+                time.sleep(4.5)   # 刺激本身：App 端要求运行状态缓存已过 4 秒，不是在等什么发生
+                def exited():
+                    state = subprocess.run(['/bin/ps','-o','stat=','-p',str(cli)],capture_output=True,text=True)
+                    return state.returncode != 0 or 'Z' in state.stdout
+                cli_exited = exited()
+                # App 暂停时 CLI 自己答完退出（假 CLI 慢模式本身要 2 秒，起 Python 也要时间）：等到退出为止，不在固定时刻只看一眼
+                until = time.monotonic()+WAIT
+                while mode == 'app' and not cli_exited and time.monotonic() < until:
+                    time.sleep(.05); cli_exited = exited()
                 for pid in reversed(targets):
                     try: os.kill(pid,signal.SIGCONT)
                     except ProcessLookupError: pass
                 (d/'resumed').touch()
-                assert p.wait(timeout=20) == 0, (d/'log').read_text()
+                assert p.wait(timeout=WAIT) == 0, (d/'log').read_text()
                 r = json.loads((d/'result.json').read_text())
                 assert r['reply']=='fixture-ok' and r['usage']>0 and r['timer'] and r['empty'] and r['warmReaped'], r
                 assert (r['oldStatus'],r['newStatus'])==('busy','idle'), r
@@ -57,3 +65,5 @@ for mode in ['app', 'cli', 'both']:
                         except ProcessLookupError: pass
                     p.wait()
 print(json.dumps(rows,ensure_ascii=False,indent=2))
+# test.sh 的汇总只取最后一行，JSON 的「]」看不出结果
+print(f'全部通过（{len(rows)} 种模式）')

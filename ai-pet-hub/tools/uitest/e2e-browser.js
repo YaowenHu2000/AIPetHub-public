@@ -13,8 +13,8 @@ try {
   const ask = async text => {
     events.length = 0; response = null;
     els.input.value = text; send();
-    await until(() => response || viewBusy(id), 5000, '开始回答');
-    await until(() => response && !isBusy(id), 240000, '回答结束');
+    await until(() => response || viewBusy(id), '开始回答');
+    await until(() => response && !isBusy(id), '回答结束');
     check('CLI 回合完成且无错误', !response.error && !response.cancelled && !/^⚠️/.test(response.reply || ''), response);
     const turn = [...box.querySelectorAll('.msg.bot.turn')].at(-1);
     check('回答显示在会话里', !!turn?.querySelector('.answer')?.textContent.trim());
@@ -37,7 +37,7 @@ try {
     const called = name => events.some(e => (e.step?.title || '').includes(name));
     if (called('browser_open')) {
       check('browser_open 的工具步骤显示', [...turn.querySelectorAll('.step')].some(s => s.textContent.includes('browser_open')));
-      await until(() => pane.tabs.some(t => t.kind === 'browser') && !pane.el.hidden, 8000, '浏览器面板打开');
+      await until(() => pane.tabs.some(t => t.kind === 'browser') && !pane.el.hidden, '浏览器面板打开');
       check('浏览器地址指向测试页', decodeURI(browser.file || browser.url || '').endsWith('/page.html'), browser.file || browser.url);
     }
     for (const name of ['browser_eval', 'browser_screenshot']) {
@@ -57,7 +57,7 @@ try {
   window.onConversationLoaded = data => { previous(data); if (data.agent === id && data.conversationId === S[id].conversationId) loaded = true; };
   try {
     S[id].loadedSig = ''; postNative('loadConversation', { agent: id, conversationId: S[id].conversationId });
-    await until(() => loaded, 15000, '浏览器会话历史读回');
+    await until(() => loaded, '浏览器会话历史读回');
     check('历史用户消息不泄漏 App 自动提示', ![...box.querySelectorAll('.msg.user')].some(e => e.textContent.includes('AIPetHub 提示')));
   } finally { window.onConversationLoaded = previous; }
 } catch (error) { out.error = String(error); }

@@ -1,9 +1,11 @@
-// 三位的剩余用量（模型菜单底下那几行）：各自问自己的 CLI，统一成「名字、还剩百分之几、什么时候重置」。
+// 四位的剩余用量（模型菜单底下那几行）：各自问自己的 CLI，统一成「名字、还剩百分之几、什么时候重置」。
 //   Claude：起一个 CLI 进程，发 get_usage 这个控制请求
 //   Codex ：起 app-server，initialize 之后一起问 model/list 和 account/rateLimits/read
 //   Gemini：`agy -p /usage`，一行一项、用制表符隔开
 // 不在点开菜单时才查：App 启动后在后台每 5 分钟查一轮，菜单打开时直接给手头最新的那份（带上是什么时候查的）。
 // 这次没查到就留着上一次的；查到的结果记在本机，下次打开 App 马上就有。
+//
+// 查询用的 CLI 提前退出时读完已到的输出就收尾，没查到最多再试一次，不等满 45 秒期限。
 import Cocoa
 
 extension AppDelegate {
@@ -74,7 +76,7 @@ extension AppDelegate {
         }
     }
 
-    /// 起一个 CLI，发几行话，等到 done 说够了（或者超时）就结束它。每来一行输出交给 onLine。
+    /// 起一个 CLI，发几行话，等到 done 说够了（或者它自己退出了、或者超时）就结束它。每来一行输出交给 onLine。
     private func askCLI(_ executable: String, _ arguments: [String], cwd: String? = nil, send lines: [[String: Any]], timeout: TimeInterval,
                         onLine: @escaping (String, LiveInput) -> Bool) {
         let cli = CLIProcess(input: LiveInput())
@@ -87,11 +89,15 @@ extension AppDelegate {
             if onLine(line, input) { finished = true; done.signal() }
             return true
         }
-        guard (try? cli.start(executable: executable, arguments: arguments, cwd: cwd ?? home, environment: cliEnvironment())) != nil else { cli.input?.abandon(); return }
+        // 进程自己退出（没登录、版本不认这些参数）也要叫醒：否则菜单要白等满期限，外层再重试一次又是一整个期限
+        guard (try? cli.start(executable: executable, arguments: arguments, cwd: cwd ?? home, environment: cliEnvironment(),
+                              onExit: { done.signal() })) != nil else { cli.input?.abandon(); return }
         lines.forEach { cli.input?.send($0) }
         _ = done.wait(timeout: .now() + timeout)
         if cli.proc.isRunning { terminateTree(cli.proc.processIdentifier) }
-        _ = cli.waitForExit()   // 等它真的退出（terminateTree 最多 3 秒后强杀），顺便停掉读输出的监听
+        // 等它真的退出（terminateTree 最多 3 秒后强杀），顺便停掉读输出的监听。
+        // 退出前已写出的答复在这里读完才交给 onLine，外层看到的结果不会因为先被退出叫醒而漏掉
+        _ = cli.waitForExit()
         cli.input?.close()
     }
 
@@ -251,7 +257,7 @@ extension AppDelegate {
     /// 用的是 dsh 自己在用的那把密钥：先看它配置里指定的环境变量（llm-deepseek.apiKeyEnv，默认 DEEPSEEK_API_KEY），
     /// 环境里没有再读 ~/.dsh/.credentials.yaml 里同名的那一行。密钥只用来发这一个请求，不记到别处。
     private func deepseekUsage() -> [[String: Any]]? {
-        let settings = (try? String(contentsOfFile: "\(home)/.dsh/settings.yaml", encoding: .utf8)) ?? ""
+        let settings = (try? String(contentsOfFile: "\(DshServer.dataRoot)/settings.yaml", encoding: .utf8)) ?? ""
         let field = { (name: String, text: String) -> String? in
             guard let r = text.range(of: "(?m)^\\s*\(name):\\s*(\\S.*)$", options: .regularExpression) else { return nil }
             var v = String(text[r]).components(separatedBy: ":").dropFirst().joined(separator: ":")
@@ -260,7 +266,7 @@ extension AppDelegate {
         }
         let env = ProcessInfo.processInfo.environment
         let keyName = field("apiKeyEnv", settings) ?? "DEEPSEEK_API_KEY"
-        let creds = (try? String(contentsOfFile: "\(home)/.dsh/.credentials.yaml", encoding: .utf8)) ?? ""
+        let creds = (try? String(contentsOfFile: "\(DshServer.dataRoot)/.credentials.yaml", encoding: .utf8)) ?? ""
         guard let key = env[keyName].flatMap({ $0.isEmpty ? nil : $0 }) ?? field(NSRegularExpression.escapedPattern(for: keyName), creds), !key.isEmpty else { return nil }
         let base = (field("baseURL", settings) ?? env["DEEPSEEK_BASE_URL"] ?? "https://api.deepseek.com").trimmingCharacters(in: CharacterSet(charactersIn: "/"))
         guard let url = URL(string: base + "/user/balance") else { return nil }

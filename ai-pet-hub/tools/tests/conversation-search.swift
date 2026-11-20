@@ -12,17 +12,154 @@ func testConversationSearch() {
         try! content.write(toFile: path, atomically: true, encoding: .utf8)
         return path
     }
-    func search(_ query: String, _ paths: [(String, String)], agent: String = "claude") -> [String: Any] {
+    func search(_ query: String, _ paths: [(String, String)]?, agent: String = "claude") -> [String: Any] {
         let done = DispatchSemaphore(value: 0)
         var result: [String: Any] = [:]
-        app.jsSink = { name, payload in
+        app.hooks.jsSink = { name, payload in
             if name == "onConversationsSearched", payload["complete"] as? Bool != false { result = payload; done.signal() }
         }
         app.searchConversations(agent: agent, query: query, files: paths)
-        check(done.wait(timeout: .now() + 20) == .success, "正文搜索及时返回")
-        app.jsSink = nil
+        check(waitSignal(done), "正文搜索及时返回")
+        app.hooks.jsSink = nil
         return result
     }
+    do {
+        let original = ProcessInfo.processInfo.environment["CLAUDE_CONFIG_DIR"]
+        setenv("CLAUDE_CONFIG_DIR", root, 1)
+        let fake = root + "/claude"
+        try! installFakeCLI(at:fake, behavior:"backend")
+        _ = write("agents.json","[]")
+        app.hooks.cliExecutable = fake
+        app.hooks.geminiCliDir = root + "/gemini/cli"
+        defer {
+            if let original { setenv("CLAUDE_CONFIG_DIR", original, 1) } else { unsetenv("CLAUDE_CONFIG_DIR") }
+            app.hooks.cliExecutable = nil
+        }
+        for agent in ["claude","gemini"] {
+            let cid = UUID().uuidString
+            let req = AskRequest(agent:agent,reqId:1,prompt:"首问",model:"",effort:"",permissionMode:"",workspace:root,conversationId:"")
+            app.rememberLocalEnding(req,cid:cid,text:"断点桃花",outcome:"failed",position:0)
+            var items = [[String:Any]]()
+            app.hooks.jsSink = { name, data in if name == "onConversationsListed" { items = data["items"] as? [[String:Any]] ?? [] } }
+            app.listConversations(agent:agent); app.queue(for:agent).sync {}
+            let listed = items.filter { str($0,"id") == cid }
+            eq(listed.map { str($0,"cwd") }, [root], agent+" 未建记录的首问可从原项目打开")
+            eq(search("断点桃花",nil,agent:agent)["ids"] as? [String], [cid], agent+" 未建记录的首问可按中断正文搜索")
+            var project = [String]()
+            app.hooks.jsSink = { name,data in if name == "onProjectConversations" { project = data["ids"] as? [String] ?? [] } }
+            app.projectConversations(agent:agent, workspace:root); app.queue(for:agent).sync {}
+            eq(project, [cid], agent+" 首问也在所属项目的会话清单中")
+            if agent == "gemini" {
+                app.hooks.localEndings?[0].removeValue(forKey:"newWorkspace")
+                eq(search("断点桃花",nil,agent:agent)["ids"] as? [String], [cid], "旧版未记目录的 Gemini 首问仍可找回")
+            }
+            check(app.deleteOne(agent:agent,cid:cid), agent+" 仅有本机记录的首问可手动删除")
+            eq(search("断点桃花",nil,agent:agent)["ids"] as? [String], [], agent+" 明确删除后首问从搜索消失")
+            app.hooks.localEndings = []
+        }
+        app.hooks.localEndings = []
+    }
+    let pendingId = UUID().uuidString
+    let pendingPath = write("pending.jsonl", #"{"type":"user","message":{"content":"开头记录"}}"# + "\n")
+    _ = search("开头记录",[(pendingId,pendingPath)])
+    app.hooks.geminiCliDir = root + "/gemini/cli"
+    let gemPath = root + "/pending.sqlite"
+    var gemDB: OpaquePointer?
+    sqlite3_open(gemPath, &gemDB)
+    sqlite3_exec(gemDB,"CREATE TABLE steps(idx INTEGER, step_type INTEGER, step_payload BLOB);",nil,nil,nil)
+    sqlite3_close(gemDB)
+    _ = search("半截桃子", [(pendingId,gemPath)], agent:"gemini")
+    let savedRoot = TestHooks.dshSessionsRoot
+    TestHooks.dshSessionsRoot = root + "/dsh"
+    for agent in ["claude","gemini","deepseek","gpt"] {
+        let source = ConversationSearchSource(cid:pendingId,paths:[pendingPath],kind:agent,item:[:])
+        let before = app.searchStamp(source)
+        if agent == "gpt" {
+            app.noteCodexKnownEnding(turnId:"fixture-turn",outcome:"failed",text:"半截桃子",error:"fixture")
+        } else {
+            let req = AskRequest(agent:agent,reqId:12,prompt:"后来的问题",model:"",effort:"",permissionMode:"",workspace:root,conversationId:pendingId)
+            app.rememberLocalEnding(req,cid:pendingId,text:"半截桃子",outcome:"failed", position:0)
+        }
+        check(app.searchStamp(source) != before, agent + " 本机结局更新使正文缓存失效")
+    }
+    TestHooks.dshSessionsRoot = savedRoot
+    eq(search("半截桃子",[(pendingId,pendingPath)])["ids"] as? [String], [pendingId], "缓存过的 Claude 历史能搜到本机补记的半截回答")
+    eq(search("半截桃子", [(pendingId,gemPath)], agent:"gemini")["ids"] as? [String], [pendingId], "缓存过的 Gemini 历史能搜到本机补记的半截回答")
+    let meta = write("old-meta.jsonl", #"{"type":"user","cwd":"/project/山谷","message":{"content":"只有正文"}}"# + "\n" + #"{"type":"custom-title","customTitle":"北岸记录"}"# + "\n")
+    for term in ["北岸", "山谷", "岸"] {
+        let result = search(term, [("old-meta",meta)])
+        eq((result["items"] as? [[String:Any]])?.compactMap { $0["id"] as? String } ?? [], ["old-meta"], "B3-15 全量候选按标题或工作空间搜索 " + term)
+        eq(result["ids"] as? [String], [], "仅标题或目录命中时无需跳正文")
+    }
+    app.hooks.codexEnvironment = ["CODEX_HOME":root]
+    try! fm.createDirectory(atPath:root + "/sessions", withIntermediateDirectories:true)
+    let oldCodex = UUID().uuidString
+    _ = write("sessions/rollout-old-" + oldCodex + ".jsonl",
+              #"{"type":"session_meta","payload":{"id":"\#(oldCodex)","cwd":"/山谷","source":"exec"}}"# + "\n" +
+              #"{"type":"event_msg","payload":{"type":"user_message","message":"稻谷回访"}}"# + "\n")
+    let oldItem = app.searchSources(agent:"gpt", files:nil).sources.first { $0.cid == oldCodex }?.item
+    eq(str(oldItem,"title"), "稻谷回访", "单字搜索的旧 rollout 候选带首问")
+    eq(str(oldItem,"cwd"), "/山谷", "单字搜索的旧 rollout 候选带目录")
+    eq(oldItem?["task"] as? Bool, true, "独立 exec 搜索命中仍归任务")
+    let indexed = UUID().uuidString, stateDB = root + "/state_5.sqlite"
+    var indexDB: OpaquePointer?
+    sqlite3_open(stateDB,&indexDB)
+    sqlite3_exec(indexDB,"CREATE TABLE threads(id,title,first_user_message,cwd,updated_at,rollout_path,archived,source); INSERT INTO threads VALUES('\(indexed)','','白鹭观察','',1,'',0,'cli');",nil,nil,nil)
+    sqlite3_exec(indexDB,"WITH RECURSIVE n(i) AS (VALUES(1) UNION ALL SELECT i+1 FROM n WHERE i<301) INSERT INTO threads SELECT printf('new-%04d',i),'近期会话','白鹭','',i+1,'',0,'cli' FROM n;",nil,nil,nil)
+    sqlite3_close(indexDB)
+    var walks = 0
+    app.hooks.rolloutLookupWalk = { walks += 1 }
+    let matches = search("鹭",nil,agent:"gpt")["items"] as? [[String:Any]] ?? []
+    check(walks <= 1, "单字查标题不会逐条遍历 rollout，实际=\(walks)")
+    app.hooks.rolloutLookupWalk = nil
+    eq(matches.count, 1, "有标题的近期会话仍只按显示标题匹配单字")
+    eq(matches.first { str($0,"id") == indexed }?["title"] as? String, "白鹭观察", "Codex 全量单字搜索使用空标题会话的首问")
+    sqlite3_open(stateDB,&indexDB)
+    sqlite3_exec(indexDB,"INSERT INTO threads VALUES('legacy-short','旧标题','','',1,'/旧目录/rollout-test-legacy-short.jsonl',0,'cli');",nil,nil,nil)
+    sqlite3_close(indexDB)
+    let moved = write("sessions/rollout-test-legacy-short.jsonl", #"{"type":"session_meta","payload":{"id":"legacy-short"}}"#)
+    let located = app.searchSources(agent:"gpt",files:nil).sources.first { $0.cid == "legacy-short" }?.paths ?? []
+    check(located.contains(moved), "迁移后短编号仍可按文件名找到，实际=\(located)")
+    // 当前 Codex 改名只写 threads.name，title 仍是首问；侧栏和搜索都要显示新名称。
+    sqlite3_open(stateDB,&indexDB)
+    sqlite3_exec(indexDB,"ALTER TABLE threads ADD COLUMN name TEXT; UPDATE threads SET name='苍鹭改名' WHERE id='new-0301'; UPDATE threads SET name='' WHERE id='\(indexed)';",nil,nil,nil)
+    sqlite3_close(indexDB)
+    let renamed = search("苍鹭改名",nil,agent:"gpt")["items"] as? [[String:Any]] ?? []
+    eq(renamed.map { str($0,"id") }, ["new-0301"], "Codex 按改后的名称能搜到")
+    eq(renamed.first.map { str($0,"title") }, "苍鹭改名", "Codex 搜索结果显示改后的名称")
+    eq(search("白鹭观察",nil,agent:"gpt")["items"].flatMap { ($0 as? [[String:Any]])?.first { str($0,"id") == indexed } }.map { str($0,"title") }, "白鹭观察", "名称为空时仍用首问")
+    var codexListed = [[String:Any]]()
+    app.hooks.jsSink = { name, data in if name == "onConversationsListed" { codexListed = data["items"] as? [[String:Any]] ?? [] } }
+    app.listCodex(); app.codexQueue.sync {}
+    app.hooks.jsSink = nil
+    eq(codexListed.first { str($0,"id") == "new-0301" }.map { str($0,"title") }, "苍鹭改名", "Codex 侧栏显示改后的名称")
+    eq(codexListed.first { str($0,"id") == "new-0300" }.map { str($0,"title") }, "近期会话", "没改名的仍用原标题")
+    try? fm.removeItem(atPath:stateDB)
+    let child = UUID().uuidString
+    _ = write("sessions/rollout-child-" + child + ".jsonl",
+              #"{"type":"session_meta","payload":{"id":"\#(child)","source":{"subagent":"fixture"}}}"# + "\n")
+    check(!app.searchSources(agent:"gpt", files:nil).sources.contains { $0.cid == child }, "Codex 搜索排除孤立子代理 rollout")
+    var fullReads = 0
+    app.hooks.codexFullRolloutRead = { path in if path.contains(child) { fullReads += 1 } }
+    let childPath = root + "/sessions/rollout-child-" + child + ".jsonl"
+    for _ in 0..<2 { _ = app.cachedRolloutSummary(childPath, Date(timeIntervalSince1970:1)) }
+    eq(fullReads, 0, "刷新侧栏跳过子代理正文")
+    app.hooks.codexFullRolloutRead = nil
+    app.hooks.geminiCliDir = root + "/gemini/cli"
+    let gemStore = app.geminiStores[0]
+    try! fm.createDirectory(atPath:gemStore.root + "/conversations", withIntermediateDirectories:true)
+    _ = fm.createFile(atPath:gemStore.database(child), contents:Data())
+    var summariesDB: OpaquePointer?
+    sqlite3_open(gemStore.summaries, &summariesDB)
+    sqlite3_exec(summariesDB, "CREATE TABLE conversation_summaries(conversation_id,title,preview,last_modified_time,workspace_uris,nesting_depth,parent_conversation_id); INSERT INTO conversation_summaries VALUES('\(child)','child','','','',1,'parent');",nil,nil,nil)
+    sqlite3_close(summariesDB)
+    check(!app.searchSources(agent:"gemini", files:nil).sources.contains { $0.cid == child }, "Gemini 搜索排除摘要已标记的子代理数据库")
+    let parent = "ordinary-legacy"
+    let logs = gemStore.brain + "/" + parent + "/.system_generated/logs"
+    try! fm.createDirectory(atPath:logs, withIntermediateDirectories:true)
+    _ = fm.createFile(atPath:logs + "/transcript.jsonl",contents:Data())
+    _ = fm.createFile(atPath:gemStore.database(parent),contents:Data())
+    check(app.searchSources(agent:"gemini",files:nil).sources.contains { $0.cid == parent }, "普通旧会话没有摘要标题时仍可搜索数据库")
     let escaped = write("escaped.jsonl", #"{"type":"user","message":{"content":"\u4e2d\u6587 Hello\nWorld \"quoted\""}}"# + "\n")
     eq(search("中文", [("escaped", escaped)])["ids"] as? [String], ["escaped"], "JSON 转义中文搜索")
     eq(search("Hello\nWorld", [("escaped", escaped)])["ids"] as? [String], ["escaped"], "JSON 转义换行搜索")
@@ -86,6 +223,14 @@ func testConversationSearch() {
     let changed: [[String: Any]] = [["role": "bot", "text": "`missing/file.swift`", "files": [["path": root + "/missing/file.swift"]]]]
     renderer.prepare(changed, cwd: root)
     check(!renderer.messages(changed).joined().contains("missing/"), "本轮改过的文件即使不在仍保留可打开的短标签")
+    // hunt9 uncovered：./x 按工作目录比完整路径，子目录里改过的同名文件不算它；不存在就和页面一样还原成写出的路径
+    let nestedOnly: [[String: Any]] = [["role": "bot", "text": "`./gone/file.swift`", "files": [["path": root + "/sub/gone/file.swift"]]]]
+    renderer.prepare(nestedOnly, cwd: root)
+    check(renderer.messages(nestedOnly).joined().contains("./gone/file.swift"), "子目录改过的同名文件不让根目录的 ./ 路径保留短标签，实际 \(renderer.messages(nestedOnly))")
+    // 相对子目录写的路径（工作目录下没有 gone2/，改的是 app/gone2/file.swift）仍按结尾配上改动，搜索也保留可打开的短标签
+    let subRelative: [[String: Any]] = [["role": "bot", "text": "`gone2/file.swift`", "files": [["path": root + "/app/gone2/file.swift"]]]]
+    renderer.prepare(subRelative, cwd: root)
+    check(!renderer.messages(subRelative).joined().contains("gone2/"), "子目录里改过的文件按结尾配上，保留短标签，实际 \(renderer.messages(subRelative))")
     let large = root + "/large.jsonl"
     fm.createFile(atPath: large, contents: nil)
     let fh = try! FileHandle(forWritingTo: URL(fileURLWithPath: large))
@@ -161,13 +306,9 @@ func testConversationSearch() {
     app.claudeQueue.sync { _ = app.claudeItem((cid: duplicateId, path: currentCopy, mtime: Date())) }
     eq(search("obsolete-copy-needle", [(duplicateId, currentCopy), (duplicateId, obsoleteCopy)])["ids"] as? [String], [], "同cid旧副本的正文不能冒充当前打开的会话")
     eq(search("current-copy-visible", [(duplicateId, obsoleteCopy), (duplicateId, currentCopy)])["ids"] as? [String], [duplicateId], "同cid只搜实际打开路径且命中ID不重复")
-    let copyLoaded = DispatchSemaphore(value: 0)
-    var openedCopy: [String: Any] = [:]
-    app.jsSink = { name, payload in if name == "onConversationLoaded" { openedCopy = payload; copyLoaded.signal() } }
-    app.loadClaude(cid: duplicateId)
-    check(copyLoaded.wait(timeout: .now() + 20) == .success, "同cid副本实际打开完成")
-    app.jsSink = nil
-    eq((openedCopy["messages"] as? [[String: Any]])?.first?["text"] as? String, "current-copy-visible", "搜索和实际打开仍是相同副本")
+    let openedCopy = awaitCallback(app, "onConversationLoaded") { app.loadClaude(cid: duplicateId) }
+    check(openedCopy != nil, "同cid副本实际打开完成")
+    eq((openedCopy?["messages"] as? [[String: Any]])?.first?["text"] as? String, "current-copy-visible", "搜索和实际打开仍是相同副本")
     let cache = ConversationSearchCache(limit: 100, disk: nil)
     cache.put("a", stamp: "one", texts: [String(repeating: "a", count: 60)], item: [:])
     cache.put("b", stamp: "two", texts: [String(repeating: "b", count: 60)], item: [:])
@@ -194,7 +335,7 @@ func runConversationSearchBenchmark() {
         app.hooks.conversationSearchLoaded = { agent, _ in
             lock.lock(); loads[agent, default: 0] += 1; lock.unlock()
         }
-        app.jsSink = { name, payload in
+        app.hooks.jsSink = { name, payload in
             guard name == "onConversationsSearched", let agent = payload["agent"] as? String else { return }
             lock.lock(); defer { lock.unlock() }
             let elapsed = Date().timeIntervalSince(start)
@@ -217,6 +358,6 @@ func runConversationSearchBenchmark() {
             print("disk_bytes=\(bytes) disk_limit=\(disk.limit)")
         }
     }
-    app.jsSink = nil
+    app.hooks.jsSink = nil
     app.hooks.conversationSearchLoaded = nil
 }

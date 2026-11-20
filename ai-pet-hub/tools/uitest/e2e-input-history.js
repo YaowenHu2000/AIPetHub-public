@@ -9,7 +9,7 @@ try {
   S[id].groupState[TASK_GROUP] = 0;
   S[id].model = MODEL; S[id].effort = 'low'; S[id].perm = FULL_PERM; renderComposer();
   type('看一下 @kee');
-  await until(() => document.querySelector('.suggest-box:not([hidden]) .suggest-row'), 6000, '@ 文件候选');
+  await until(() => document.querySelector('.suggest-box:not([hidden]) .suggest-row'), '@ 文件候选');
   const files = [...document.querySelectorAll('.suggest-row .suggest-name')].map(e => e.textContent);
   check('@ 候选包含工作区文件', files.some(n => n.includes('keep.txt')), files);
   key('Enter'); check('@ 选择将文件名写进输入框', els.input.value.includes('keep.txt'), els.input.value); type('');
@@ -18,11 +18,13 @@ try {
     check('尚无 Gemini 命令时显示说明', !!document.querySelector('.suggest-note')?.textContent.includes('Gemini'));
     type('');
   }
-  const firstPrompt = '请在回答里原样写出这个词：紫藤萝瀑布。只写这个词。', secondPrompt = '只回答：第二句';
+  // 搜索词每次运行都不同：几套同时跑、上次没清掉的会话都会搜出同一个固定词，结果混在一起看不出命中的是谁
+  const word = '藤萝' + Math.random().toString(36).slice(2, 8);
+  const firstPrompt = `请在回答里原样写出这个词：${word}。只写这个词。`, secondPrompt = '只回答：第二句';
   const first = await ask(firstPrompt), cid = S[id].conversationId;
   if (id === 'gemini') {
     type('/'); updateSuggest();
-    await until(() => document.querySelectorAll('.suggest-box:not([hidden]) .suggest-row:not(.suggest-note)').length > 0, 20000, 'Gemini 首轮返回的命令');
+    await until(() => document.querySelectorAll('.suggest-box:not([hidden]) .suggest-row:not(.suggest-note)').length > 0, 'Gemini 首轮返回的命令');
     check('Gemini 续聊前可用上一轮取得的命令', !viewBusy(id) && agentCommands[id].length > 0);
     type('');
   }
@@ -32,13 +34,13 @@ try {
   key('ArrowDown'); const down1 = els.input.value; key('ArrowDown'); const down2 = els.input.value;
   check('↑↑↓↓按顺序翻历史并回到空草稿', up1 === secondPrompt && up2 === firstPrompt && down1 === secondPrompt && down2 === '', [up1, up2, down1, down2]);
   type('/');
-  await until(() => document.querySelectorAll('.suggest-box:not([hidden]) .suggest-row:not(.suggest-note)').length > 0, 30000, 'CLI 命令候选');
+  await until(() => document.querySelectorAll('.suggest-box:not([hidden]) .suggest-row:not(.suggest-note)').length > 0, 'CLI 命令候选');
   const commands = [...document.querySelectorAll('.suggest-row .suggest-name')].map(e => e.textContent);
   check('/ 候选来自 CLI 报告的命令', commands.length > 0 && (agentCommands[id] || []).length > 0, commands);
   type('/comp'); updateSuggest();
   const compact = (agentCommands[id] || []).find(c => /^comp/.test(c.name));
   if (compact) {
-    await until(() => document.querySelector('.suggest-box:not([hidden]) .suggest-row .suggest-name'), 3000, '/comp 候选');
+    await until(() => document.querySelector('.suggest-box:not([hidden]) .suggest-row .suggest-name'), '/comp 候选');
     check('/comp 筛出相应命令', document.querySelector('.suggest-row .suggest-name')?.textContent === '/' + compact.name);
     key('Enter'); check('选择命令后写回输入框', els.input.value.trim() === '/' + compact.name, els.input.value);
   }
@@ -47,20 +49,29 @@ try {
 
   // 这是原 misc 的强制回归点：等原生回调后比较同一个对象，不能只看文字相等。
   const turn = lastTurn(), count = box.querySelectorAll('.msg.user, .msg.bot.turn').length;
-  turn.dataset.marker = 'same-node'; await load(true);
+  turn.dataset.marker = 'same-node'; const synced = await load(true);
   check('同步后回答还是原来的节点', lastTurn() === turn && turn.dataset.marker === 'same-node', { sameNode: lastTurn() === turn, marker: lastTurn()?.dataset.marker });
   check('同步后问答数量不变', box.querySelectorAll('.msg.user, .msg.bot.turn').length === count, { before: count, after: box.querySelectorAll('.msg.user, .msg.bot.turn').length });
   const search = document.getElementById('hist-search');
-  search.value = '藤萝瀑'; search.dispatchEvent(new Event('input', { bubbles: true }));
-  // 搜索分批返回，第一批可能先命中别的会话。等到当前会话出现，或搜完再判失败。
-  const searched = await until(() => events.find(e => e.name === 'onConversationsSearched' && e.data.query === '藤萝瀑' &&
-    (e.data.ids?.includes(cid) || e.data.complete))?.data, 60000, '正文搜索命中当前会话或结束');
-  check('搜索正文命中当前会话', S[id].bodyHits?.has(cid), { expected: cid, response: searched, bodyQuery: S[id].bodyQuery, hits: [...(S[id].bodyHits || [])] });
-  check('正文搜索结果显示在历史列表', document.querySelectorAll('#hist-sections .hist-item, #hist-sections .conv-row').length > 0);
+  // 正文搜索读的是 CLI 的记录。agy 1.5.11 新建会话时偶尔建不起会话库（它自己的日志记「failed to create persistent
+  // trajectory … database is locked」，几套同时跑时常见），第一轮只留在那次进程的内存里，记录从第二轮起头，
+  // 记录里本来就没有这个词。这时搜不到是对的，两条检查不判，记成跳过并带上 App 读到的记录
+  if (!(synced.messages || []).some(m => m.role === 'user' && m.text === firstPrompt)) {
+    const record = (synced.messages || []).map(m => [m.role, (m.text || '').slice(0, 30)]);
+    skip('搜索正文命中当前会话', 'CLI 的记录里没有第一轮', { cid, record });
+    skip('正文搜索结果显示在历史列表', 'CLI 的记录里没有第一轮', { cid, record });
+  } else {
+    search.value = word; search.dispatchEvent(new Event('input', { bubbles: true }));
+    // 搜索分批返回，第一批可能先命中别的会话。等到当前会话出现，或搜完再判失败。
+    const searched = await until(() => events.find(e => e.name === 'onConversationsSearched' && e.data.query === word &&
+      (e.data.ids?.includes(cid) || e.data.complete))?.data, 60000, '正文搜索命中当前会话或结束');
+    check('搜索正文命中当前会话', S[id].bodyHits?.has(cid), { expected: cid, response: searched, bodyQuery: S[id].bodyQuery, hits: [...(S[id].bodyHits || [])] });
+    check('正文搜索结果显示在历史列表', document.querySelectorAll('#hist-sections .hist-item, #hist-sections .conv-row').length > 0);
+  }
   note('第一条实际回答', first.reply); search.value = ''; search.dispatchEvent(new Event('input', { bubbles: true }));
 
   // CLI 报模型后从真实列表选择；不依赖某个新模型名称、也不额外消耗昂贵模型额度。
-  await until(() => events.some(e => e.name === 'onAgentModels'), 30000, 'CLI 模型列表');
+  await until(() => events.some(e => e.name === 'onAgentModels'), 'CLI 模型列表');
   const reportedModels = events.filter(e => e.name === 'onAgentModels').at(-1).data.models;
   check('CLI 报告的模型全部进入 App 模型列表', reportedModels?.length > 0 && reportedModels.every(m => AGENTS[id].models.some(x => x.v === m.v)), { reported: reportedModels, displayed: AGENTS[id].models.map(m => m.v) });
   check('CLI 模型列表包含所选模型', AGENTS[id].models.some(m => m.v === MODEL), MODEL);
@@ -84,7 +95,7 @@ try {
     check('fast 开关关闭后状态与菜单一致', !S[id].fast && !fastOn(id) && !els.popover.querySelector('.mp-fast').classList.contains('on'));
     closePopover(); chooseModel(id, MODEL, 'low'); openModelPopover();
   }
-  await until(() => agentUsage[id], 60000, '剩余用量回调');
+  await until(() => agentUsage[id], '剩余用量回调');
   const usageBox = els.popover.querySelector('.usage-box[data-agent="' + id + '"]');
   check('剩余用量显示数据或明确说明', !!usageBox && (!!usageBox.querySelector('.usage-row') || !!usageBox.querySelector('.usage-note')?.textContent.trim()), agentUsage[id]);
   const slide = frac => {
@@ -106,20 +117,20 @@ try {
   if (id === 'claude') {
     if (typeof FORK_SID !== 'string' || !FORK_SID) throw new Error('run.sh 没有准备真实分叉会话 FORK_SID');
     postNative('listConversations', { agent: id });
-    const item = await until(() => S[id].conversations?.find(c => c.id === FORK_SID), 15000, '外部会话出现在列表');
-    openConversation(id, item); await until(() => S[id].loadedId === FORK_SID, 15000, '载入外部会话');
+    const item = await until(() => S[id].conversations?.find(c => c.id === FORK_SID), '外部会话出现在列表');
+    openConversation(id, item); await until(() => S[id].loadedId === FORK_SID, '载入外部会话');
     openModelPopover();
     check('外部 Claude 会话直接显示记录估算，无虚构明细', ctx()?.used > 0 && ctx()?.estimated && !ctx()?.parts.length
       && els.popover.querySelector('.ctx-note')?.textContent.includes('估算'));
     closePopover();
-    await until(() => !document.getElementById('fork-hint').hidden, 15000, '分叉提示');
+    await until(() => !document.getElementById('fork-hint').hidden, '分叉提示');
     check('外部打开的会话显示分支提示', document.getElementById('fork-hint').textContent.includes('分支'));
     await ask('我上一句让你回复了哪个字？只回复那个字');
     const forked = S[id].conversationId;
     check('发送后创建独立会话', !!forked && forked !== FORK_SID, { source: FORK_SID, forked });
     check('分叉后显示系统说明且记录来源', !!box.querySelector('.fork-note') && convForks[id + ':' + forked] === FORK_SID);
     postNative('listConversations', { agent: id });
-    await until(() => S[id].conversations?.some(c => c.id === forked), 15000, '分支出现在列表');
+    await until(() => S[id].conversations?.some(c => c.id === forked), '分支出现在列表');
     check('分叉后源会话还在列表', S[id].conversations.some(c => c.id === FORK_SID));
     check('当前历史行显示分支标记', !!document.querySelector('.conv-row.active .conv-fork'));
   }

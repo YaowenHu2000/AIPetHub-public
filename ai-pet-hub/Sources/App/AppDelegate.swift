@@ -1,10 +1,12 @@
-// 应用本体：窗口、界面所在的 WebView、三位共用的状态；启动和退出。
+// 应用本体：窗口、界面所在的 WebView、四位共用的状态；启动和退出。
 import Cocoa
 import WebKit
 import PDFKit
 
 /// 一次回答从收到到答完的状态。键是「agent#reqId」，所有字段由 AppDelegate.procLock 保护。
 struct AskState {
+    // 即使 CLI 仍在握手，带图补充也要先冻结；队列换轮前须交付已经收到的附件。
+    let supplementQueue = DispatchQueue(label:"aipethub.supplements", qos:.userInitiated)
     var proc: Process?       // 准备期间、以及走共用服务的 DeepSeek 都没有自己的进程
     var live: LiveTurn?      // 当前交互式回答；重试、回退时可以换掉
     var cancelled = false   // 一旦停止就保持到这次回答结束
@@ -12,6 +14,14 @@ struct AskState {
 
 final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKScriptMessageHandler, WKNavigationDelegate, WKUIDelegate {
     // MARK: 窗口和界面
+    // 页面可以单独重载；在主队列按投递顺序保存每个活动回合的最新步骤和仍待答的卡。
+    struct PageTurn {
+        var request: [String: Any]
+        var steps: [Int: [String: Any]] = [:]
+        var cards: [[String: Any]] = []
+        var queue: [[String: Any]] = []
+    }
+    var pageTurns: [String: PageTurn] = [:]
     var window: HubWindow!
     var webView: HubWebView!                    // 界面本身（web/index.html）
     var indexURL: URL!
@@ -22,10 +32,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKSc
     var unseenReplies = 0                       // 在别的 App 里时回答完成的次数，显示在 Dock 图标上
     var terminationSignal: DispatchSourceSignal?   // SIGTERM 走正常退出流程（见 watchTerminationSignal）
     var terminationPrompting = false
-    /// 自测（build/selftest，源码在 tools/tests/）时接收原本发给网页的消息。
-    var jsSink: ((String, [String: Any]) -> Void)?
-
+    let historySender = UUID().uuidString
+    var historyNotification: Notification.Name?
     var hooks = TestHooks()   // 只有自测程序会改它（Runtime/TestHooks.swift）
+
+    override init() {
+        super.init()
+        // dsh 自己开的一轮里来问、App 没有回合在听时交给网页（DeepSeekRequests.swift）
+        dshServer.unattended = { [weak self] sid, id, frame in self?.dshUnattended(sid, id, frame) }
+    }
 
     // MARK: 内置浏览器和预览（Preview/）
     var browser: WKWebView?                     // 内置浏览器（预览本地网页、开发服务器）
@@ -64,7 +79,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKSc
     // MARK: 历史会话（Agents/*History.swift）
     /// 左栏每位最多列多少条历史会话（太少的话，隔一阵没碰的项目会整组从列表里消失）。
     let historyListLimit = 300
-    var usageCache: [String: (at: Date, items: [[String: Any]])] = [:]   // 三位的剩余用量：后台每 5 分钟查一次（Usage.swift）
+    var usageCache: [String: (at: Date, items: [[String: Any]])] = [:]   // 四位的剩余用量：后台每 5 分钟查一次（Usage.swift）
     var usageLoading: Set<String> = []
     var claudeLiveCache: (at: Date, sessions: [(sid: String, status: String, name: String)])?   // 别处开着的 Claude 会话（ClaudeSessions.swift）
     var pathLookupCache: [String: (path: String?, at: Date)] = [:]   // 在登录 shell 的 PATH 里找过的命令（AgentSetup.swift）
@@ -73,9 +88,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKSc
     var geminiModelsFromCLI = false                 // 已经从 `agy models` 拿到过模型列表（之后不再用会话报上来的那份，免得两份来回换）
     var claudeModelsComplete = false                // 已经拿到过 Claude 完整的模型列表（见 noteClaudeInitialize）
     var historyLimits: [String: Int] = [:]          // 点过「显示更早的」的会话：会话 ID → 显示最近多少条
+    var historySearchOpens = Set<String>()          // 从搜索结果点开、还没读的 DeepSeek 会话：这一次沿游标读到搜索给的范围（DeepSeekHistory.swift），由 procLock 保护
     var geminiResuming = Set<String>()   // 同一会话从检查到进程结束只能有一个发送者，由 procLock 保护
     var geminiProbes: [String: (at: Date, value: Bool?)] = [:]   // 打字预热、输入框提示用的进程扫描结果，2 秒内复用（GeminiSessions.swift），由 procLock 保护
     let geminiQueue = DispatchQueue(label: "aipethub.gemini")
+    var geminiLaunchLogs: [String: (mtime: Date, size: Int)] = [:]
+    var dshScriptOrigins: [String: Bool] = [:]
     var geminiCache: [String: (mtime: TimeInterval, item: [String: Any]?)] = [:]
     let claudeQueue = DispatchQueue(label: "aipethub.claude")
     var claudeCache: [String: (mtime: TimeInterval, item: [String: Any]?, path: String)] = [:]
@@ -86,6 +104,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKSc
     var dshApplied: [String: String] = [:]           // 会话 → 上次给它设的「模型|强度|权限」（一样就不用再设）
     var dshCwds: [String: String] = [:]              // 会话 → 工作目录（列表时记下，读会话时用）
     var deepseekHistoryWindow: DeepSeekHistoryWindow?   // 仅由 deepseekQueue 使用，换会话就释放旧页
+    var dshListChecks: [String: DshListCheck]?   // 会话 → 列表核对时的日志指纹和核实的标题、时间（DeepSeekHistory.swift）；nil 是还没从存档读回，仅由 deepseekQueue 使用
     let packedContextQueue = DispatchQueue(label: "aipethub.gpt.packed-context", qos: .utility)
     var packedContextCache: [String: (stamp: Date, context: [String: Any]?)] = [:]
     var codexRolloutCache: [String: (mtime: TimeInterval, item: [String: Any]?)] = [:]
@@ -93,7 +112,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKSc
     // MARK: 各位 CLI 的能力
     /// 旧版 Claude 不认 --include-partial-messages；按可执行文件指纹缓存，升级后重新探测。
     var partialSupport: [String: Bool] = [:]
-    var codexSkills: [String: String] = [:]         // Codex 的技能：名字 → 路径（/技能名 时用）
+    var codexSkills: [String: [String: String]] = [:]   // Codex 的技能：工作目录 → 名字 → 路径（/技能名 时用；项目级技能可以同名）
 }
 
 // MARK: - 启动和退出
@@ -101,6 +120,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKSc
 extension AppDelegate {
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSApp.setActivationPolicy(UITest.active ? .accessory : .regular)   // 自动化测试（UITest.swift）时不进 Dock
+
+        if !UITest.active { observeHistoryChanges(named:Notification.Name("AIPetHub.historyChanged")) }
 
         let visible = NSScreen.main?.visibleFrame ?? NSRect(x: 0, y: 0, width: 1440, height: 900)
         let size = NSSize(width: min(1280, visible.width - 60), height: min(800, visible.height - 40))
@@ -124,6 +145,9 @@ extension AppDelegate {
 
         let controller = WKUserContentController()
         controller.add(self, name: "hubBridge")
+        if let data = try? JSONEncoder().encode(home), let literal = String(data: data, encoding: .utf8) {
+            controller.addUserScript(WKUserScript(source: "window.hubHome = " + literal, injectionTime: .atDocumentStart, forMainFrameOnly: true))
+        }
         let config = WKWebViewConfiguration()
         if UITest.active { config.websiteDataStore = .nonPersistent() }   // 测试不动平时的设置和草稿
         if UITest.active {   // 页面知道自己在测试窗口里（第一次打开的引导页就不弹，否则每个测试都被它挡住；要测引导页的脚本自己打开）
@@ -235,7 +259,9 @@ extension AppDelegate {
     }
 
     func applicationWillTerminate(_ notification: Notification) {
+        DistributedNotificationCenter.default().removeObserver(self)
         terminateAllChildren()
+        GitContentSnapshot.removeActive()   // 先结束 git 子进程，免得它删完又往里写
         // 进程和套接字随 App 退出一起释放；不再等 DshServer 的启动锁，
         // 否则刚杀掉尚未报端口的服务，还要等 ensure 的 30 秒超时才能退出。
     }

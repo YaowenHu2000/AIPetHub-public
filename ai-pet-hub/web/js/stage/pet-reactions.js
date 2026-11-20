@@ -164,7 +164,7 @@ Pet.prototype.renderStatus = function () {
   let icon = '';   // 状态胶囊开头的小图标（和聊天区工作步骤用的是同一套线条图标，不用 emoji 充当图标）
   if (info) {
     const meta = info.meta;
-    const label = info.kind === 'text' ? '回答中' : meta.label;
+    const label = info.waiting ? info.title : (info.kind === 'text' ? '回答中' : meta.label);
     text = info.elsewhere ? `在别处 · ${label} ${elapsedSince(info.since)}`
       : `${label} ${elapsedSince(info.since)}${info.count > 1 ? ` · ${info.count} 个会话` : ''}`;
     icon = (info.fast ? UI.bolt : '') + phaseIcon(info.phase);

@@ -13,12 +13,25 @@ final class BrowserNavigationState {
             if let navigation = navigation { objc_setAssociatedObject(navigation, &browserGenerationKey, generation, .OBJC_ASSOCIATION_RETAIN_NONATOMIC) }
         }
     }
+    // 先让 WebKit 把原始提交送出去。204、下载和用户取消都还需要原表单。
+    var pendingForm: WKWebView?
     var finished = false
+    // 这一代里地址变过（含同文档换片段、页面脚本 replaceState）：browser_open 的同文档导航据此判断已经发生
+    var moved = false
+    // 最近一次主框架导航策略是页面脚本自己发起的（location.href、location.replace、meta refresh）：
+    // 需要登录的页面常这样整页转到登录页，算同一次打开的延续，browser_open 等跳转后的页面载入完再返回实际落点。
+    // 点链接、提交表单、后退前进、刷新和 App 自己发起的导航都不算，照旧开新的一代（等着的 browser_open 报被取代）
+    var pageInitiated = false
     var documentTask: DocumentPreviewTask?
     func begin() {
+        pendingForm?.navigationDelegate = nil
+        pendingForm?.uiDelegate = nil
+        pendingForm?.stopLoading()
+        pendingForm = nil
         generation += 1
         navigation = nil
         finished = false
+        moved = false
     }
 }
 
@@ -32,9 +45,17 @@ extension AppDelegate {
 
     func webView(_ webView: WKWebView, didStartProvisionalNavigation navigation: WKNavigation!) {
         guard webView === browser else { return }
+        let pageInitiated = browserNavigation.pageInitiated
+        browserNavigation.pageInitiated = false
         if navigation !== browserNavigation.navigation {
             // 已被取代的导航也可能迟到 didStart；不能反过来把新的请求作废。
             if let navigation = navigation, objc_getAssociatedObject(navigation, &browserGenerationKey) != nil { return }
+            // 生成文档预览中、新窗口表单待接管时仍按原来的取代处理，不让旧页面的跳转留下它们
+            if pageInitiated, docPreviewPending == nil, browserNavigation.pendingForm == nil {
+                browserNavigation.navigation = navigation
+                browserNavigation.finished = false
+                return
+            }
             cancelDocumentPreview()
             browserNavigation.begin()
             browserNavigation.navigation = navigation
@@ -55,19 +76,29 @@ extension AppDelegate {
         cfg.applicationNameForUserAgent = "Version/18.0 Safari/605.1.15"   // 让网站当成 Safari，不给降级页面
         // 记下控制台输出，智能体用 browser_console 读（BrowserTools.swift）
         cfg.userContentController.addUserScript(WKUserScript(source: browserConsoleHook, injectionTime: .atDocumentStart, forMainFrameOnly: true))
+        cfg.userContentController.addUserScript(WKUserScript(source: browserFormTarget, injectionTime: .atDocumentStart, forMainFrameOnly: true))
         let b = BrowserWebView(frame: .zero, configuration: cfg)
+        installBrowser(b)
+        return b
+    }
+
+    func installBrowser(_ b: WKWebView) {
+        let old = browser
+        b.frame = old?.frame ?? .zero
         b.navigationDelegate = self
         b.uiDelegate = self
         b.allowsBackForwardNavigationGestures = true
         if #available(macOS 13.3, *) { b.isInspectable = true }   // 右键「检查元素」
-        b.isHidden = true
+        b.isHidden = old?.isHidden ?? true
         container.addSubview(b)
+        old?.navigationDelegate = nil
+        old?.uiDelegate = nil
+        old?.removeFromSuperview()
         let push: (WKWebView) -> Void = { [weak self] _ in self?.sendBrowserState() }
-        browserKVO = [b.observe(\.url) { w, _ in push(w) }, b.observe(\.title) { w, _ in push(w) },
+        browserKVO = [b.observe(\.url) { [weak self] w, _ in self?.browserNavigation.moved = true; push(w) }, b.observe(\.title) { w, _ in push(w) },
                       b.observe(\.canGoBack) { w, _ in push(w) }, b.observe(\.canGoForward) { w, _ in push(w) },
                       b.observe(\.isLoading) { w, _ in push(w) }]
         browser = b
-        return b
     }
 
     /// 告诉网页浏览器现在的样子。显示的是我们自己的页面（生成预览中、打不开、文档预览）时，地址栏显示原来的文件或网址；
@@ -76,7 +107,7 @@ extension AppDelegate {
         guard let b = browser else { return }
         var url = b.url?.absoluteString ?? ""
         var title = b.title ?? ""
-        var loading = b.isLoading
+        var loading = b.isLoading || browserNavigation.pendingForm != nil
         var file = b.url?.isFileURL == true ? b.url!.path : ""
         var error = false
         let blank = url.isEmpty || url == "about:blank"
@@ -96,6 +127,13 @@ extension AppDelegate {
 
     /// 浏览器里有一次导航真的载入了：不是我们的错误页就清掉错误状态。
     func webView(_ webView: WKWebView, didCommit navigation: WKNavigation!) {
+        if webView === browserNavigation.pendingForm {
+            let source = browser
+            browserNavigation.pendingForm = nil
+            installBrowser(webView)
+            browserNavigation.navigation = navigation
+            if let source { preserveFormSource(source, result: webView) }
+        }
         guard webView === browser else { return }
         browserSimulating = nil
         if navigation !== browserErrorNav { browserFailedURL = ""; browserErrorNav = nil }
@@ -143,22 +181,45 @@ extension AppDelegate {
         syncPDF()
     }
 
+    /// 本地网页最终载入的地址。写成 file:// 的照原样（查询串、片段都在）；写成路径时 resolvePath 找不到字面文件名才去掉「#片段」，
+    /// 那就是锚点，要加回最终地址，否则页面停在开头（browser_open 等待同文档导航也按这个地址比）
+    func browserFileURL(_ raw: String, path: String, base: String) -> URL {
+        if let url = URL(string: raw), url.isFileURL { return url }
+        let fileURL = URL(fileURLWithPath: path)
+        guard let hash = raw.firstIndex(of: "#"), resolvePath(String(raw[..<hash]), base: base) == path else { return fileURL }
+        return URL(string: fileURL.absoluteString + raw[hash...]) ?? fileURL
+    }
+
     func openInBrowser(_ body: [String: Any]) {
         let b = browserView()
+        let failedPage = browserFailedURL.isEmpty ? nil : b.url
         browserFailedURL = ""
         cancelDocumentPreview()
         browserNavigation.begin()
+        // 「打不开」错误页是冒充原网址载入的：只换 #片段 时 WebKit 只在错误页里跳片段、不会真的请求，
+        // 页面仍是错误页却已没有错误状态。先把地址换成目标再刷新，才是真的重试（成功替换错误页，失败照旧报打不开）
+        let load = { [weak self] (url: URL, start: () -> WKNavigation?) in
+            guard let self else { return }
+            let strip = { (u: URL?) in u.flatMap { self.normalizedURL($0) }.map { String($0.split(separator: "#", maxSplits: 1, omittingEmptySubsequences: false)[0]) } }
+            guard let shown = failedPage, url.fragment != nil, strip(shown) == strip(url) else { self.browserNavigation.navigation = start(); return }
+            let generation = self.browserNavigation.generation
+            b.callAsyncJavaScript("history.replaceState(null, '', u)", arguments: ["u": url.absoluteString], in: nil, in: .defaultClient) { [weak self] _ in
+                guard let self, self.browser === b, self.browserNavigation.generation == generation else { return }
+                self.browserNavigation.navigation = b.reload()
+            }
+        }
         if let raw = body["url"] as? String, let url = URL(string: raw), ["http", "https"].contains(url.scheme?.lowercased() ?? "") {
-            browserNavigation.navigation = b.load(URLRequest(url: url))
+            load(url) { b.load(URLRequest(url: url)) }
         } else if let raw = body["path"] as? String {
             // 本地网页：允许读取所在工作空间（引用 ../css 之类也能加载），不在工作空间里就只允许它所在的文件夹
             let base = body["base"] as? String ?? ""
             let path = resolvePath(raw, base: base)
             if isPreviewDocument(path) { openDocumentPreview(path); placeBrowser(body); return }
-            let url = URL(fileURLWithPath: path)
+            let fileURL = URL(fileURLWithPath: path)
+            let url = browserFileURL(raw, path: path, base: base)
             let ws = validWorkspace(base).map { trimmedPath($0) }
-            let root = ws.flatMap { path.hasPrefix($0 + "/") ? URL(fileURLWithPath: $0, isDirectory: true) : nil } ?? url.deletingLastPathComponent()
-            browserNavigation.navigation = b.loadFileURL(url, allowingReadAccessTo: root)
+            let root = ws.flatMap { path.hasPrefix($0 + "/") ? URL(fileURLWithPath: $0, isDirectory: true) : nil } ?? fileURL.deletingLastPathComponent()
+            load(url) { b.loadFileURL(url, allowingReadAccessTo: root) }
         }
         placeBrowser(body)
     }
@@ -168,8 +229,23 @@ extension AppDelegate {
         let failed = URL(string: browserFailedURL)
         let pending = docPreviewPending
         switch cmd {
-        case "back": cancelDocumentPreview(); browserNavigation.begin(); browserNavigation.navigation = b.goBack()
-        case "forward": cancelDocumentPreview(); browserNavigation.begin(); browserNavigation.navigation = b.goForward()
+        case "close":
+            cancelDocumentPreview()
+            browserNavigation.begin()
+            browserKVO.removeAll()
+            b.navigationDelegate = nil; b.uiDelegate = nil
+            b.stopLoading(); b.removeFromSuperview(); browser = nil
+            browserPDF?.removeFromSuperview(); browserPDF = nil
+            browserFailedURL = ""; browserErrorNav = nil; browserSimulating = nil
+            sendToJS("onBrowserState", ["url":"", "file":"", "title":"", "loading":false, "error":false,
+                                        "canGoBack":false, "canGoForward":false])
+        case "back", "forward":
+            cancelDocumentPreview()
+            browserNavigation.begin()
+            let back = cmd == "back"
+            if !traverseFormHistory(b, item: back ? b.backForwardList.backItem : b.backForwardList.forwardItem) {
+                browserNavigation.navigation = back ? b.goBack() : b.goForward()
+            }
         case "reload":
             cancelDocumentPreview(); browserNavigation.begin()
             if let origin = documentPreviewOrigin(b.url) ?? pending {
@@ -183,7 +259,9 @@ extension AppDelegate {
                 if u.isFileURL { browserNavigation.navigation = b.loadFileURL(u, allowingReadAccessTo: u.deletingLastPathComponent()) } else { browserNavigation.navigation = b.load(URLRequest(url: u)) }
             } else { browserNavigation.navigation = b.reload() }
         case "stop":
+            let formPending = browserNavigation.pendingForm != nil
             browserNavigation.begin()
+            if formPending { sendBrowserState() }
             // 生成预览中：不再显示它，留在原来的页面
             if docPreviewPending != nil { cancelDocumentPreview(); sendBrowserState() } else { b.stopLoading() }
         case "external":
@@ -194,6 +272,56 @@ extension AppDelegate {
             let target = failed ?? b.url
             if let u = target, ["http", "https", "file"].contains(u.scheme?.lowercased() ?? "") { NSWorkspace.shared.open(u) }
         default: break
+        }
+    }
+
+    /// 回答改了文件、看着的网页本身没改：只在页面实际加载过其中某个本地文件（样式、脚本、图片、字体、@import 进来的样式）时刷新。
+    /// 按所在文件夹判断的话，改同目录的 README 也会重载、清空用户填了一半的表单，引用上层目录的样式改了却不刷新。
+    /// WebKit 不给 file:// 页面读外部样式表的规则，资源计时也不记 file:// 的加载，所以页面只交出 DOM 引用和内联样式，
+    /// 样式里的 @import、url() 由这里读文件展开；在 App 自己的脚本世界里取，不受页面脚本改写影响。
+    /// <picture> 和 srcset 选图时 img.src 只是备用图，显示的是 currentSrc；两者连同 srcset 里列出的候选都算，
+    /// 窗口宽度或深浅色变了换成别的候选时也不会拿到改动前留在缓存里的旧图。
+    func reloadBrowserIfUses(_ paths: [String], done: ((Bool) -> Void)? = nil) {
+        guard let b = browser, b.url?.isFileURL == true, browserFailedURL.isEmpty, docPreviewPending == nil, documentPreviewOrigin(b.url) == nil else { done?(false); return }
+        let js = """
+        const urls = [location.href];
+        document.querySelectorAll('[src], link[href]').forEach(n => { if (n.src) urls.push(n.src); if (n.href) urls.push(n.href); });
+        document.querySelectorAll('img, source[srcset]').forEach(n => {
+          if (n.currentSrc) urls.push(n.currentSrc);
+          for (const c of (n.getAttribute('srcset') || '').split(',')) { const u = c.trim().split(/\\s+/)[0]; if (u) try { urls.push(new URL(u, document.baseURI).href); } catch (e) {} }
+        });
+        const styles = [...document.querySelectorAll('style')].map(n => n.textContent).concat([...document.querySelectorAll('[style]')].map(n => n.getAttribute('style')));
+        return {urls, styles};
+        """
+        let target = b.url
+        b.callAsyncJavaScript(js, arguments: [:], in: nil, in: .defaultClient) { [weak self] result in
+            let norm = { (p: String) in (p as NSString).resolvingSymlinksInPath }
+            let found = (try? result.get()) as? [String: Any] ?? [:]
+            var used = Set((found["urls"] as? [String] ?? []).compactMap { URL(string: $0) }.filter { $0.isFileURL }.map { norm($0.path) })
+            // 样式引用的文件：内联样式相对页面，外部样式相对它自己；层数和文件数设上限，循环 @import 也停得下来
+            var queue: [(text: String, base: URL)] = (found["styles"] as? [String] ?? []).compactMap { text in target.map { (text, $0) } }
+            var read = Set<String>()
+            let pattern = try! NSRegularExpression(pattern: #"url\(\s*['"]?([^'")]+?)['"]?\s*\)|@import\s+['"]([^'"]+)['"]"#)
+            func cssFiles() -> [String] { used.filter { $0.lowercased().hasSuffix(".css") && !read.contains($0) } }
+            while read.count < 64 {
+                if queue.isEmpty, let css = cssFiles().first {
+                    read.insert(css)
+                    let size = (try? FileManager.default.attributesOfItem(atPath: css)[.size] as? Int) ?? 0
+                    if size <= 2_000_000, let text = try? String(contentsOfFile: css, encoding: .utf8) { queue.append((text, URL(fileURLWithPath: css))) }
+                    continue
+                }
+                guard let (text, base) = queue.popLast() else { break }
+                for m in pattern.matches(in: text, range: NSRange(text.startIndex..., in: text)) {
+                    guard let r = [1, 2].lazy.compactMap({ Range(m.range(at: $0), in: text) }).first else { continue }
+                    let ref = String(text[r]).trimmingCharacters(in: .whitespaces).components(separatedBy: CharacterSet(charactersIn: "?#"))[0]
+                    guard !ref.isEmpty, let u = URL(string: ref, relativeTo: base) ?? ref.removingPercentEncoding.flatMap({ URL(fileURLWithPath: $0, relativeTo: base.deletingLastPathComponent()) }),
+                          u.absoluteURL.isFileURL else { continue }
+                    used.insert(norm(u.absoluteURL.standardizedFileURL.path))
+                }
+            }
+            guard let self = self, self.browser === b, b.url == target, paths.contains(where: { used.contains(norm($0)) }) else { done?(false); return }
+            self.browserCommand("reload")
+            done?(true)
         }
     }
 
@@ -268,8 +396,12 @@ extension AppDelegate {
     }
 
     func webView(_ webView: WKWebView, didFailProvisionalNavigation navigation: WKNavigation!, withError error: Error) {
-        guard webView === browser, navigation === browserNavigation.navigation else { return }
         let ns = error as NSError
+        if webView === browserNavigation.pendingForm {
+            finishPendingBrowserForm()
+        } else {
+            guard webView === browser, navigation === browserNavigation.navigation else { return }
+        }
         if ns.code == NSURLErrorCancelled { return }   // 被新的跳转打断，不算失败
         if ns.domain == "WebKitErrorDomain", ns.code == 102 { return }   // 「帧加载被中断」：交给系统打开了（下载、文档），不算失败
         let failing = (ns.userInfo[NSURLErrorFailingURLErrorKey] as? URL)?.absoluteString ?? webView.url?.absoluteString ?? ""
@@ -280,21 +412,22 @@ extension AppDelegate {
 
     func webView(_ webView: WKWebView, decidePolicyFor navigationResponse: WKNavigationResponse) async -> WKNavigationResponsePolicy {
         // 内置浏览器显示不了的内容（下载文件等）交给系统浏览器
-        if webView === browser, !navigationResponse.canShowMIMEType, let url = navigationResponse.response.url {
+        if webView === browserNavigation.pendingForm,
+           let status = (navigationResponse.response as? HTTPURLResponse)?.statusCode, [204, 205].contains(status) {
+            finishPendingBrowserForm()
+            return .cancel
+        }
+        if (webView === browser || webView === browserNavigation.pendingForm), !navigationResponse.canShowMIMEType, let url = navigationResponse.response.url {
+            if webView === browserNavigation.pendingForm {
+                finishPendingBrowserForm()
+            }
             NSWorkspace.shared.open(url)
             return .cancel
         }
-        return .allow
-    }
-
-    /// 网页里的 target="_blank" 链接：在同一个内置浏览器里打开。
-    func webView(_ webView: WKWebView, createWebViewWith configuration: WKWebViewConfiguration,
-                 for navigationAction: WKNavigationAction, windowFeatures: WKWindowFeatures) -> WKWebView? {
-        if webView === browser, let url = navigationAction.request.url {
-            cancelDocumentPreview(); browserNavigation.begin()
-            browserNavigation.navigation = webView.load(URLRequest(url: url))
+        if webView === browserNavigation.pendingForm, navigationResponse.isForMainFrame {
+            copyFormHistory(to: webView)
         }
-        return nil
+        return .allow
     }
 
     func webView(_ webView: WKWebView, runJavaScriptAlertPanelWithMessage message: String,

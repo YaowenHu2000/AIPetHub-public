@@ -1,6 +1,6 @@
 'use strict';
 
-// 聊天区：文字渲染成 Markdown、一条条消息、用户消息里的图片和看图。
+// 聊天区：文字渲染成 Markdown、一条条消息、用户消息里的图片和看图（历史整页渲染和增量同步在 message-sync.js）。
 
 // ===== 文本渲染（回答里常见的 Markdown：代码块、行内代码、粗体、标题、列表） =====
 function escapeHtml(s) {
@@ -33,16 +33,15 @@ function renderRich(text) {
 // ===== 聊天区 =====
 function scrollToBottom(el) { el.scrollTop = el.scrollHeight; }
 
-function appendMessage(id, role, text, images) {
-  const box = S[id].msgEl;
+function appendMessage(id, role, text, images, box = S[id].msgEl, before = null, scroll = true) {
   box.querySelector('.chat-empty')?.remove();
   const div = document.createElement('div');
   div.className = `msg ${role}${role === 'bot' ? ' md' : ''}`;
   if (role === 'bot') div.innerHTML = renderRich(text);
   else if (role === 'user') { fillUserMessage(div, text, images); addEditButton(div, id, text); }
   else div.textContent = text;
-  box.appendChild(div);
-  scrollToBottom(box);
+  box.insertBefore(div,before);
+  if (scroll) scrollToBottom(box);
   return div;
 }
 
@@ -116,11 +115,12 @@ function renderMsgImages(imgs) {
 // 刚发出的消息：文字里写到的图片也配上缩略图（历史记录里的，原生载入时已经配好）
 const thumbReqs = new Map();
 
-function requestMessageImages(el, text, base) {
-  if (!hasBridge() || !IMG_PATH_HINT.test(text)) return;
+function requestMessageImages(el, text, base, snapshots = []) {
+  if (!hasBridge() || (!snapshots.length && !IMG_PATH_HINT.test(text))) return;
   const reqId = nextRequestId();
+  thumbReqs.delete(el._thumbReq); el._thumbReq = reqId;
   thumbReqs.set(reqId, { el, text });
-  postNative('chatThumbs', { reqId, text, base });
+  postNative('chatThumbs', { reqId, text, base, snapshots });
 }
 
 window.onChatThumbs = data => {
@@ -144,7 +144,15 @@ function viewerButton(icon, title, onClick) {
   return b;
 }
 
-function openImageViewer(im) {
+// 显示路径负责文件名和访达定位；有实际副本或记录引用时，查看、用默认应用打开和再发送都用同一个来源。
+function sentImageSource(im, copy) {
+  if (im.ref) return {ref:im.snapshot ? {...im.ref, snapshot:im.snapshot} : im.ref};
+  const path = im.snapshot || copy || im.path;
+  if (!path && im.missing) return {ref:{missing:true}};
+  return {path};
+}
+
+function openImageViewer(im, snapshot) {
   closeImageViewer();
   const el = document.createElement('div');
   el.className = 'img-viewer';
@@ -158,16 +166,16 @@ function openImageViewer(im) {
   cap.className = 'img-viewer-cap';
   cap.textContent = im.path ? prettyPath(im.path) : imageName(im);
   bar.appendChild(cap);
-  if (im.path) {
-    bar.append(viewerButton(UI.reveal, '在访达中显示', () => postNative('revealFile', { path: im.path })),
-               viewerButton(UI.external, '用默认应用打开', () => postNative('openFile', { path: im.path })));
-  }
+  const source = sentImageSource(im,snapshot);
+  // 访达只能定位真实路径；重开会话时内嵌图只有记录引用，原生层会先落成副本再交给默认应用，所以外部打开按来源显示
+  if (im.path) bar.append(viewerButton(UI.reveal, '在访达中显示', () => postNative('revealFile', { path: im.path })));
+  if (source.path || (source.ref && !source.ref.missing)) bar.append(viewerButton(UI.external, '用默认应用打开', () => postNative('openFile', source)));
   el.append(img, bar);
   el.addEventListener('click', closeImageViewer);
   document.body.appendChild(el);
   imageViewer = { el, img, cap, reqId: nextRequestId() };
   if (typeof syncBrowser === 'function') syncBrowser();   // 内置浏览器是原生视图，会盖住查看器，先藏起来
-  if (hasBridge() && (im.path || im.ref)) postNative('chatImage', { reqId: imageViewer.reqId, path: im.path || '', ref: im.ref || null });
+  if (hasBridge() && (source.path || source.ref)) postNative('chatImage', {reqId:imageViewer.reqId, ...source});
 }
 
 window.onChatImage = data => {
@@ -184,6 +192,7 @@ function closeImageViewer() {
 }
 
 function showEmpty(id, text) {
+  syncReturnedDraft(id);
   const box = S[id].msgEl;
   box.innerHTML = '';
   const empty = document.createElement('div');
@@ -210,12 +219,29 @@ function noteCodeDirectory(dirs, text) {
   if (t.length < 300 && !/\n/.test(t) && (/^(~\/|\/[^/\s])/.test(t) || /^[^\s`]+\/$/.test(t)) && !looksLikeFile(t)) noteFileDirectory(dirs, t);
 }
 
-function fileReferencePlan(path, isChip, files, dirs) {
+/** 回答里写的路径对应这一轮改动里的哪个文件（标签核对、点开预览、搜索正文共用）。./x、../x 写明了从工作目录起，
+ * 按本轮工作目录解析，完整路径相同才算：按结尾匹配的话，根目录的 ./README.md 会配上 pages/README.md 的改动、点开成子目录那份。
+ * a/b 先按工作目录比完整路径，配不上再按结尾找：回答里常写相对某个子目录的路径（工作目录 ai-pets-workspace，
+ * 写 tools/rig/README.md，改的是 ai-pet-hub/ 下那份），从工作目录找不到这个文件，只能靠结尾对上改动。
+ * 只写文件名的（README.md）回答里很常见，也按结尾找；不知道工作目录时也照旧。 */
+function turnFileChange(files, path, cwd) {
+  const clean = cleanPath(path);
+  const bare = clean.replace(/^\.\//, '');
+  const byTail = () => files.find(f => f.path === bare || f.path.endsWith('/' + bare));
+  if (cwd && clean.includes('/') && !/^(\/|~\/)/.test(clean)) {
+    const full = p => p.split('/').reduce((out, s) => { if (s === '..') { if (out.length > 1) out.pop(); } else if (s && s !== '.') out.push(s); return out; }, ['']).join('/');
+    const want = full(cwd + '/' + clean);
+    const exact = files.find(f => full(f.path.startsWith('/') ? f.path : cwd + '/' + f.path) === want);
+    return exact || (/^\.\.?\//.test(clean) ? undefined : byTail());
+  }
+  return byTail();
+}
+
+function fileReferencePlan(path, isChip, files, dirs, cwd = '') {
   const rooted = /^(file:|\/|~\/)/.test(path);
   const mine = dirs.slice();
   if (rooted) noteFileDirectory(dirs, dirOf(cleanPath(path)));
-  const clean = cleanPath(path).replace(/^\.\//, '');
-  const edited = isChip && files.some(f => f.path === clean || f.path.endsWith('/' + clean));
+  const edited = isChip && !!turnFileChange(files, path, cwd);
   const paths = [path];
   if (!isChip) {
     const tail = path.match(/[A-Za-z0-9_\-.\/~]+(:\d+(:\d+)?)?$/);
@@ -237,12 +263,12 @@ function verifyFileChips(root, fallbackBase = '') {
       return;
     }
     const path = el.dataset.path;
-    const plan = fileReferencePlan(path, el.classList.contains('file-chip'), turn?._files || [], dirs);
+    const base = turn?.dataset.cwd || fallbackBase;
+    const plan = fileReferencePlan(path, el.classList.contains('file-chip'), turn?._files || [], dirs, base);
     if (el.dataset.checked) return;
     el.dataset.checked = '1';
     if (plan.edited) return;   // 改过的文件能带着 diff 打开
     const { paths } = plan;
-    const base = turn?.dataset.cwd || fallbackBase;
     if (!byBase.has(base)) byBase.set(base, new Map());
     const items = byBase.get(base);
     const key = [path, ...plan.dirs].join('\n');
@@ -269,8 +295,8 @@ window.onFilesChecked = data => {
         const shown = it.paths[hit.index] || it.paths[0];
         const holder = document.createElement('span');
         // 这一轮改过的文件：留着回答里的写法，点开时能对上它的改动
-        const clean = cleanPath(shown).replace(/^\.\//, '');
-        const edited = (el.closest('.turn')?._files || []).some(f => f.path === clean || f.path.endsWith('/' + clean));
+        const turn = el.closest('.turn');
+        const edited = !!turnFileChange(turn?._files || [], shown, turn?.dataset.cwd || '');
         holder.innerHTML = fileChip(escapeHtml(edited ? shown : hit.path), escapeHtml(shown), 'text');
         const chip = holder.firstChild;
         chip.dataset.checked = '1';
@@ -288,116 +314,3 @@ window.onFilesChecked = data => {
   // 不存在的文件标签会在核对后还原完整路径；仅补做先前未找到正文的那次定位。
   if (typeof retryPendingSearchHit === 'function') retryPendingSearchHit();
 };
-
-/** 一条消息放到聊天区最后。ex：这次运行里记下的这一轮的改动（live.js），没有就是 undefined。 */
-function renderOneMessage(id, m, ex, cwd) {
-  if (m.role === 'compact') {
-    const note = document.createElement('div');
-    note.className = 'msg sys fork-note compact-note';
-    note.dataset.historyCompact = '1';
-    note.textContent = m.text;
-    note._historySig = messageSignature(m);
-    S[id].msgEl.appendChild(note);
-    return note;
-  }
-  if (m.role === 'user') {
-    const el = appendMessage(id, 'user', m.text || '', m.images);
-    el._historySig = messageSignature(m);
-    // 后面那一轮若停下或出错，「重试」用这句的原文；记录里内嵌的图片没有文件路径，只能带上有路径的
-    el._retry = { text: m.text || '', images: (m.images || []).map(im => im.path).filter(Boolean) };
-    return el;
-  }
-  // CLI 的记录里没有「命令改的文件」（那是回答前后比 git 得来的）：用当时记下的补上
-  const turn = renderTurn(ex && ex.files.length > (m.files || []).length ? { ...m, files: ex.files } : m, cwd);
-  S[id].msgEl.appendChild(turn);
-  if (ex) decorateTurn(turn, id, ex);
-  turn._historySig = messageSignature(m);
-  // 重开会话：停下或出错的那一轮和实时时一样有「重试」（native-callbacks.js 实时那条路），问的是它前面那句
-  if ((m.outcome === 'interrupted' || m.outcome === 'failed') && !turn.querySelector('.answer-copy.retry')) {
-    const ask = [...S[id].msgEl.querySelectorAll('.msg.user')].at(-1)?._retry;
-    if (ask) addRetry(turn, id, ask.text, ask.images);
-  }
-  return turn;
-}
-
-/**
- * 切回窗口时的同步：页面上已有的消息和 CLI 的记录对得上（条数一样，或者记录只是在后面多了几条——在终端里接着聊过），
- * 就保留稳定的前缀：末轮变了局部更新，多出来的接在后面；展开状态和翻到的位置留着。对不上才返回 false。
- */
-function syncAppend(id, messages, cwd, omitted, hasMore = false, afterSteer = false) {
-  const box = S[id].msgEl;
-  if ((S[id].shownOmitted || 0) !== omitted) return false;
-  if (!!S[id].shownHasMore !== hasMore) return false;
-  const shown = [...box.children].filter(n => n.matches('.msg.user:not(.queued), .msg.bot.turn, .compact-note[data-history-compact]'));
-  // 角色的顺序得一样（中途补充过的回答，记录里是拆开的，对不上就重画）
-  // 这里刚发的话、刚答完（或刚停下）的那一轮，CLI 的记录里可能还没有、或者永远不会有（停得早的回答它不记）。
-  // 记录比页面少、少的又正好是末尾这些自己的节点时，按前面对得上的部分对账，末尾的留着不动——
-  // 否则整页按记录重画，刚停下的回答和它的重试按钮就没了。
-  const mine = n => n.classList.contains('user') ? n._historySig === undefined : !!n._answeredHere;
-  let known = shown.length;
-  while (known > messages.length && known > 0 && mine(shown[known - 1])) known--;
-  const more = syncPlan(shown.slice(0, known).map(n => n.classList.contains('user')), messages);
-  if (more < 0 || shown.slice(0, known).some((n, i) =>
-    n.classList.contains('compact-note') !== (messages[i].role === 'compact'))) return false;
-  const keep = nearBottom(box) ? null : box.scrollTop;   // 正在往上翻看：留在原处
-  const extras = matchTurnExtras(id, messages);
-  // 只有最后一轮还可能在写。前面的节点保留，末轮变了才替换，并保留展开状态。
-  let tail = shown.length - 1;
-  while (tail > 0 && !shown[tail].classList.contains('user')) tail--;
-  shown.slice(tail).forEach((old, k) => {
-    const i = tail + k, m = messages[i];
-    if (!m) return;   // 记录里还没有的（上面说的自己的节点）
-    const sig = messageSignature(m);
-    if (old._historySig === sig) return;
-    // 这里自己答出来的那一轮是实时画的（native-callbacks.js 里标了 _answeredHere）。CLI 的记录要晚几秒才写全，
-    // 前后两次读到的也不一样，照着记录换节点会把刚答完的回答重画一两遍、把重试按钮弄丢。
-    // 答完的一轮不会再被别处续写，所以对账时不动它；整个会话重新打开时自然按记录画。
-    if (old._answeredHere && m.role !== 'user') {
-      // 补充后的回读只核对刚完成的普通回答；停止节点上的重试仍属于这个页面。
-      if (!afterSteer || m.role !== 'bot' || old.querySelector('.retry')) return;
-    }
-    const fresh = renderOneMessage(id, m, extras.get(i), cwd);
-    if (old.querySelector('.work.open')) fresh.querySelector('.work')?.classList.add('open');
-    const bodies = fresh.querySelectorAll('.step-body');
-    old.querySelectorAll('.step-body').forEach((body, j) => { if (bodies[j]) bodies[j].hidden = body.hidden; });
-    old.replaceWith(fresh);
-  });
-  messages.slice(shown.length).forEach((m, k) => renderOneMessage(id, m, extras.get(shown.length + k), cwd));
-  verifyFileChips(box, cwd);
-  if (keep !== null) box.scrollTop = keep; else scrollToBottom(box);
-  return true;
-}
-
-function renderMessages(id, messages, cwd = '', omitted = 0, hasMore = false) {
-  const box = S[id].msgEl;
-  // 这个会话正在回答：CLI 的记录里可能已经有这次的提问和部分过程，截到这次提问之前，再接上正在进行的回答
-  const running = runsOf(id, viewKey(id));
-  if (running.length) {
-    const cut = liveHistoryCut(running[0], messages, omitted);
-    if (cut >= 0) messages = messages.slice(0, cut);
-  }
-  box.innerHTML = '';
-  if (omitted > 0 || hasMore) {   // 服务尚有未取回的旧页时，不能把已知条数当作整个会话的开头。
-    const note = document.createElement('button');
-    note.className = 'msg sys load-earlier';
-    note.textContent = hasMore ? '还有更早的消息 · 点这里继续显示'
-      : `还有较早的 ${omitted} 条消息没显示 · 点这里再显示 ${Math.min(300, omitted)} 条`;
-    note.addEventListener('click', () => {
-      const st = S[id];
-      st.histLimit = (st.shownLimit || 300) + 300;
-      st.keepFromBottom = box.scrollHeight - box.scrollTop;   // 载入后停在原来看的那条上
-      st.loadedSig = '';
-      note.textContent = '正在读取更早的消息…';
-      postNative('loadConversation', { agent: id, conversationId: st.conversationId, limit: st.histLimit });
-    });
-    box.appendChild(note);
-  }
-  const extras = matchTurnExtras(id, messages);   // 这次运行里答的那几轮：把改动卡片接回去（live.js）
-  messages.forEach((m, i) => renderOneMessage(id, m, extras.get(i), cwd));
-  S[id].shownOmitted = omitted;
-  S[id].shownHasMore = hasMore;
-  running.forEach(r => r.nodes.forEach(n => box.appendChild(n)));
-  if (!box.children.length) showEmpty(id);
-  verifyFileChips(box, cwd);
-  scrollToBottom(box);
-}

@@ -9,7 +9,10 @@ extension AppDelegate {
         procLock.lock()
         let cached = pathLookupCache[name]
         procLock.unlock()
-        if let c = cached, c.path != nil || Date().timeIntervalSince(c.at) < 60 { return c.path }
+        if let c = cached {
+            if let path = c.path, fm.isExecutableFile(atPath: path) { return path }
+            if c.path == nil, Date().timeIntervalSince(c.at) < 60 { return nil }
+        }
         let shell = ProcessInfo.processInfo.environment["SHELL"].flatMap { fm.isExecutableFile(atPath: $0) ? $0 : nil } ?? "/bin/zsh"
         let res = runTool(shell, ["-lc", "command -v \(name)"], cwd: home, timeout: 8)
         let found = res.out.split(separator: "\n").map { $0.trimmingCharacters(in: .whitespaces) }
@@ -42,7 +45,12 @@ extension AppDelegate {
     }
 
     /// 每一位装没装：网页打开「添加」菜单、以及第一次启动时问。
-    func probeAgents(_ agents: [String]) {
+    func probeAgents(_ agents: [String], refresh: Bool = false) {
+        if refresh {
+            procLock.lock()
+            pathLookupCache = pathLookupCache.filter { $0.value.path != nil }
+            procLock.unlock()
+        }
         DispatchQueue.global(qos: .userInitiated).async {
             let items: [[String: Any]] = agents.map { a in
                 let p = self.agentProbe(a)

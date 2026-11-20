@@ -74,7 +74,15 @@ extension AppDelegate {
                         sendToJS("onFileRead", payload)
                         return
                     }
-                    if data.contains(0) {
+                    // 带 BOM 的 UTF-16 文本（Windows 记事本「Unicode」存的）每个 ASCII 字符都带零字节，先按 BOM 认出来，免得判成二进制
+                    if data.count >= 2, (data[0] == 0xFF && data[1] == 0xFE) || (data[0] == 0xFE && data[1] == 0xFF) {
+                        let bytes = data.dropFirst(2)
+                        let units = stride(from: bytes.startIndex, to: bytes.endIndex - 1, by: 2).map {
+                            data[0] == 0xFF ? UInt16(bytes[$0]) | UInt16(bytes[$0 + 1]) << 8 : UInt16(bytes[$0]) << 8 | UInt16(bytes[$0 + 1])
+                        }
+                        payload["content"] = String(decoding: units, as: UTF16.self)
+                        payload["truncated"] = size > limit
+                    } else if data.contains(0) {
                         payload["error"] = "二进制文件，无法预览"
                     } else {
                         payload["content"] = String(decoding: data, as: UTF8.self)

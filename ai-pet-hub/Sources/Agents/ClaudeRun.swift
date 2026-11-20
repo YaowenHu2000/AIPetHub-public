@@ -1,4 +1,6 @@
 // 向 Claude Code 提问：找到命令、拼参数、交互式回答（stream-json 双向）、预热；CLI 太旧时退回一问一答。
+//
+// Claude 立即排入提问，不走这项回退期限；其参数能力按可执行文件指纹缓存，包装器每次探测，CLI 升级后会刷新。
 import Cocoa
 
 /// 开场的 initialize 请求（预热时发，没预热就在提问前发）：答复里带着命令和模型列表。
@@ -47,7 +49,8 @@ extension AppDelegate {
         }
         let res = runTool(executable, prefix + ["--help"], cwd: home,
                           environment: ProcessInfo.processInfo.environment, timeout: 15)
-        let ok = res.status != -1 && res.status != -2 && res.out.contains("--include-partial-messages")
+        guard res.status == 0, !trimmed(res.out).isEmpty else { return false }
+        let ok = res.out.contains("--include-partial-messages")
         if let key = key {
             procLock.lock()
             partialSupport[key] = ok
@@ -63,15 +66,40 @@ extension AppDelegate {
         }
         // 这个会话正开在别的程序里（Claude 桌面端、终端）：不往同一个会话里再塞一个副本，分叉出一个新会话来答
         var req = req
-        if !req.conversationId.isEmpty, let live = claudeLiveElsewhere(req.conversationId) {
+        var unavailable = false
+        if !req.conversationId.isEmpty, let live = claudeLiveElsewhere(req.conversationId, fresh: true, unavailable: { unavailable = true }) {
             req.fork = true
             let from = req.conversationId, reqId = req.reqId
             DispatchQueue.main.async {
                 self.sendToJS("onAgentForked", ["agent": "claude", "reqId": reqId, "from": from, "status": live.status, "name": live.name])
             }
         }
+        if unavailable {
+            // 还没起 CLI，这句不在会话记录里：原话和附件退回原会话草稿，切走再回来、重开都还在
+            return AgentReply(reply: "⚠️ 无法确认这个 Claude 会话是否在别处打开，请稍后重试。", conversationId: req.conversationId, restoreDraft: true)
+        }
         // 交互式（能审批、提问、中途补充）；这个版本的 CLI 不认交互式的参数时，退回一问一答
-        return runLive({ ClaudeLiveTurn(app: self, req: req, command: cmd) }) { $0.run() } ?? runClaudeOneShot(req, cmd)
+        let journal: FileHandle? = req.conversationId.isEmpty || req.fork ? nil : claudeQueue.sync {
+            findClaudeSession(cid: req.conversationId).flatMap(FileHandle.init(forReadingAtPath:))
+        }
+        defer { journal?.closeFile() }
+        journal?.seekToEndOfFile()
+        var result = runLive({ ClaudeLiveTurn(app: self, req: req, command: cmd) }) { $0.run() } ?? runClaudeOneShot(req, cmd)
+        let appended = journal?.readDataToEndOfFile() ?? Data()
+        // 停止时退回草稿的前提是这句没进会话记录：记录里多了 user 行（或者找不到记录没法确认），重开会看到它，不能再退回一份
+        if result.cancelled, result.restoreDraft, journal == nil || appended.range(of: Data("\"type\":\"user\"".utf8)) != nil {
+            result.restoreDraft = false
+            result.reply = ""
+        }
+        if !appended.isEmpty {
+            let notes = claudeBranchNotes(appended, ids: claudeSideBranch(appended))
+            if !notes.isEmpty {
+                var turn = result.turn ?? ["text":result.reply]
+                turn["steps"] = (turn["steps"] as? [[String:Any]] ?? []) + [claudeBranchStep(notes.map(\.text))]
+                result.turn = turn
+            }
+        }
+        return result
     }
 
     func claudeArgs(_ req: AskRequest, _ cmd: (executable: String, prefix: [String], reclaude: Bool), live: Bool) -> [String] {
@@ -84,9 +112,17 @@ extension AppDelegate {
         if live { args += ["--input-format", "stream-json", "--replay-user-messages", "--permission-prompt-tool", "stdio"] }
         if claudeSupportsPartial(cmd.executable, prefix: cmd.prefix) { args.append("--include-partial-messages") }   // 回答文字流式输出
         args += ["--model", claudeCliModel(req.model), "--effort", effort,
-                 "--permission-mode", live || perm != "manual" ? perm : "acceptEdits"]
+                 "--permission-mode", perm]
+        // 计划卡的「批准，直接做完」要在回答中途切到 bypassPermissions；CLI 只在启动时允许过才肯切（否则回 bypass_not_launched）。
+        // 这个参数只放开切换，不改变计划模式本身：计划卡照样先出现
+        if live && perm == "plan" { args.append("--allow-dangerously-skip-permissions") }
         if req.fast { args += ["--settings", #"{"fastMode":true}"#] }   // fast 模式：只管这一次，不写进它的设置文件
-        if !req.conversationId.isEmpty { args += ["--resume", req.conversationId] + (req.fork ? ["--fork-session"] : []) }
+        if !req.conversationId.isEmpty {
+            let firstFailed = localEndings(agent:"claude", cid:req.conversationId).last?["newWorkspace"] != nil
+            if !firstFailed || claudeQueue.sync(execute: { findClaudeSession(cid:req.conversationId) != nil }) {
+                args += ["--resume", req.conversationId] + (req.fork ? ["--fork-session"] : [])
+            }
+        }
         if let ws = validWorkspace(req.workspace) { args += ["--add-dir", ws] }
         // 内置浏览器的工具（BrowserTools.swift）：在用户自己配的 MCP 之外再加这一个
         if let mcp = browserMCP(req),
@@ -140,7 +176,8 @@ extension AppDelegate {
 
     /// 预热：起好进程，先做 initialize（读配置、列出命令这些它平时等到第一句话才做的事）。
     func warmClaude(_ req: AskRequest) -> CLIProcess? {
-        guard let cmd = claudeCommand() else { return nil }
+        // --resume 会占用会话并固定上下文，发送前终端仍可能续写。
+        guard req.conversationId.isEmpty, let cmd = claudeCommand() else { return nil }
         let cli = CLIProcess(input: LiveInput())
         cli.warmFilter = { [weak self] line in
             guard line.contains(claudeInitializeId), let brace = line.firstIndex(of: "{"), let obj = self?.jsonObject(line[brace...]),
@@ -157,28 +194,38 @@ extension AppDelegate {
     func claudeReply(_ req: AskRequest, res: CLIResult, parser: ClaudeStreamParser, turn: TurnBuilder) -> AgentReply {
         let convId = parser.sessionId.isEmpty ? req.conversationId : parser.sessionId
         let failedExit = !parser.completed && res.status != 0
-        let outcome = res.cancelled ? "interrupted" : (failedExit || parser.isError ? "failed" : (parser.completed || parser.compactNote != nil ? "completed" : "incomplete"))
-        let error = failedExit ? "⚠️ Claude Code 出错（退出码 \(res.status)）：\n" + (trimmed(res.err).isEmpty ? "进程在本轮完成前退出了。" : String(trimmed(res.err).suffix(1500)))
+        let outcome = res.cancelled ? "interrupted" : (failedExit || parser.isError || parser.outputLimited ? "failed" : (parser.completed || parser.compactNote != nil ? "completed" : "incomplete"))
+        let error = parser.outputLimited ? outputLimitHint : failedExit ? "⚠️ Claude Code 出错（退出码 \(res.status)）：\n" + (trimmed(res.err).isEmpty ? "进程在本轮完成前退出了。" : String(trimmed(res.err).suffix(1500)))
             : (parser.isError ? (parser.result ?? parser.subtype) : nil)
         // 压缩上下文的那一轮没有回答正文：结果那句话就是回答
-        var built = turn.finish(finalText: (parser.result ?? "").isEmpty ? (parser.compactNote ?? parser.result) : parser.result,
+        let finalText = (parser.result ?? "").isEmpty ? (parser.compactNote ?? parser.result) : parser.result
+        var built = turn.finish(finalText: res.cancelled && (finalText ?? "").hasPrefix("[ede_diagnostic]") ? nil : finalText,
                                 outcome: outcome, error: res.cancelled ? nil : error)
+        built["compacted"] = parser.compacted
         var reply = built["text"] as? String ?? ""
-        if res.cancelled { return AgentReply(reply: reply, conversationId: convId, cancelled: true, turn: built) }
-        if reply.isEmpty, !parser.subtype.isEmpty, parser.subtype != "success" { reply = "Claude Code 提前结束：\(parser.subtype)" }
-        if reply.isEmpty && ((built["steps"] as? [Any]) ?? []).isEmpty {
-            reply = fallbackReply(res, cli: "Claude Code", preferStderr: true)
-        } else if parser.isError && !reply.isEmpty {
-            reply = "⚠️ " + reply
+        if !res.cancelled && !parser.outputLimited {
+            if reply.isEmpty, !parser.subtype.isEmpty, parser.subtype != "success" { reply = "Claude Code 提前结束：\(parser.subtype)" }
+            if reply.isEmpty && ((built["steps"] as? [Any]) ?? []).isEmpty {
+                reply = fallbackReply(res, cli: "Claude Code", preferStderr: true)
+            } else if parser.isError && !reply.isEmpty { reply = "⚠️ " + reply }
         }
         built["text"] = reply
-        return AgentReply(reply: reply, conversationId: convId, turn: built)
+        let result = AgentReply(reply:reply, conversationId:convId, cancelled:res.cancelled, turn:built)
+        if !parser.sessionId.isEmpty || !turn.isEmpty || parser.completed || parser.outputLimited {
+            rememberReplyEnding(req, result, reason:res.cancelled ? nil : error)
+        }
+        return result
     }
 
     /// 一问一答（标准输入关着，中途不能审批、提问、补充）：只在 CLI 不支持交互式时用。
     func runClaudeOneShot(_ req: AskRequest, _ cmd: (executable: String, prefix: [String], reclaude: Bool)) -> AgentReply {
+        if req.permissionMode == "manual" {
+            return AgentReply(reply: "⚠️ 当前 Claude 单次模式无法使用「每次询问」。已退回草稿，请检查权限设置后重发。", conversationId: req.conversationId, restoreDraft: true)
+        }
         let executable = cmd.executable
-        let args = claudeArgs(req, cmd, live: false)
+        var oneShot = req
+        oneShot.images = durableImagePaths(req.images)   // 历史里只剩提问中的路径
+        let args = claudeArgs(oneShot, cmd, live: false)
         let workspace = validWorkspace(req.workspace)
 
         let turn = turnBuilder(for: req)

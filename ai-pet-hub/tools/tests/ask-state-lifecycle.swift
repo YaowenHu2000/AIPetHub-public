@@ -1,4 +1,4 @@
-// AskState：用真实 ask() 卡在各个停止阶段上，确认登记和自己起的进程都收干净；build/selftest offline 和 ask-state。
+// AskState：用真实 ask() 卡在各个停止阶段上，确认登记和自己起的进程都收干净；build/selftest offline（只跑这组：tools/test.sh --only askstate）。
 import Foundation
 
 // 用真实 ask() 跑生命周期；回调只收集证据，所有断言在测试线程执行。
@@ -22,12 +22,6 @@ private final class AskStateProbe {
     func count(_ key: String) -> Int { lock.lock(); defer { lock.unlock() }; return counts[key] ?? 0 }
 }
 
-private func awaitAskState(_ condition: () -> Bool, timeout: TimeInterval = 8) -> Bool {
-    let deadline = Date().addingTimeInterval(timeout)
-    while !condition(), Date() < deadline { Thread.sleep(forTimeInterval: 0.002) }
-    return condition()
-}
-
 private func askStateRequest(_ agent: String, _ id: Int, _ workspace: String) -> AskRequest {
     AskRequest(agent: agent, reqId: id, prompt: "fixture", model: "model", effort: "low",
                permissionMode: "default", workspace: workspace, conversationId: "", browserTools: false)
@@ -35,15 +29,15 @@ private func askStateRequest(_ agent: String, _ id: Int, _ workspace: String) ->
 
 private func assertAskFinished(_ app: AppDelegate, _ req: AskRequest, _ probe: AskStateProbe,
                                cancelled: Bool, label: String) {
-    let finished = awaitAskState { probe.reply(req.key) != nil && testAskState(app, req.key) == nil }
+    let finished = waitUntil(interval: 0.002) { probe.reply(req.key) != nil && testAskState(app, req.key) == nil }
     if !finished {
         app.cancel(agent: req.agent, reqId: req.reqId)
         probe.procs(req.key).filter { $0.isRunning }.forEach { terminateTree($0.processIdentifier) }
-        _ = awaitAskState({ testAskState(app, req.key) == nil }, timeout: 6)
+        _ = waitUntil(interval: 0.002) { testAskState(app, req.key) == nil }
     }
     check(finished, "\(label)：最终响应并由 ask() 删除记录")
     eq(probe.reply(req.key)?["cancelled"] as? Bool, cancelled, "\(label)：cancelled")
-    let gone = awaitAskState { probe.procs(req.key).allSatisfy { !$0.isRunning && kill($0.processIdentifier, 0) != 0 } }
+    let gone = waitUntil(interval: 0.002) { probe.procs(req.key).allSatisfy { !$0.isRunning && kill($0.processIdentifier, 0) != 0 } }
     check(gone, "\(label)：自己启动的进程均已退出")
     check(testAskState(app, req.key) == nil, "\(label)：asks 不留键")
 }
@@ -58,11 +52,44 @@ func testAskStateStages() {
     let path = dir + "/cli"
     try! installFakeCLI(at: path, behavior: "backend")
     try! "ok".write(toFile: dir + "/mode", atomically: true, encoding: .utf8)
+    for (i, agent) in ["claude","gpt","gemini","deepseek"].enumerated() {
+        let app = AppDelegate(), probe = AskStateProbe()
+        app.hooks.sentImagesDir = dir + "/aipethub-sent-images/"
+        var req = askStateRequest(agent, 7100+i, dir+"/已改名")
+        // 同一个原图引用可以从历史重试交给任一助手。早于图片准备的失败也要按原索引退还。
+        let image = dir + "/原图.png"
+        try! Data(base64Encoded:"iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+jNy8AAAAASUVORK5CYII=")!.write(to: URL(fileURLWithPath: image))
+        var info = stat()
+        _ = stat(image, &info)
+        req.imageRefs = [["agent":"gpt","path":image,"index":0,
+                          "stamp":"\(info.st_ino):\(info.st_ctimespec.tv_sec):\(info.st_ctimespec.tv_nsec)"]]
+        app.hooks.jsSink = probe.receive
+        app.ask(req)
+        assertAskFinished(app, req, probe, cancelled:false, label:"B2-16 工作空间失效")
+        eq(probe.reply(req.key)?["restoreDraft"] as? Bool, true, "B2-16 \(agent) 未启动时退回草稿")
+        eq(probe.reply(req.key)?["draftImagePaths"] as? [String], [image], "\(agent) 目录失效仍取回重试的历史原图")
+        let frozen = (probe.reply(req.key)?["draftImageCopies"] as? [String])?.first
+        let original = FileManager.default.contents(atPath:image)
+        try! Data("替换".utf8).write(to:URL(fileURLWithPath:image))
+        check(frozen.flatMap { FileManager.default.contents(atPath:$0) } == original, "\(agent) 目录失效时，退还的图也可隔一段时间再发")
+
+    }
+    let forbidden = dir + "/不能进入"
+    try! FileManager.default.createDirectory(atPath: forbidden, withIntermediateDirectories: false)
+    try! FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: forbidden)
+    if access(forbidden, X_OK) != 0 {
+        let app = AppDelegate(), probe = AskStateProbe(), req = askStateRequest("gemini", 7200, forbidden)
+        app.hooks.cliExecutable = path; app.hooks.geminiCliDir = dir
+        app.hooks.jsSink = probe.receive
+        app.ask(req); assertAskFinished(app, req, probe, cancelled:false, label:"B2-16 工作空间无进入权限")
+        eq(probe.reply(req.key)?["restoreDraft"] as? Bool, true, "B2-16 目录存在但没有进入权限也退回草稿")
+    }
+    try! FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: forbidden)
     // 每条路径重复 20 次；复用 AppDelegate，旧键如果留下来会累积在同一本 asks 里。
     for stage in ["received", "live", "registered", "started", "exited", "finishing", "launch-failed", "normal"] {
         let d = AppDelegate(), probe = AskStateProbe()
         d.hooks.cliExecutable = stage == "launch-failed" ? dir + "/missing" : path
-        d.jsSink = probe.receive
+        d.hooks.jsSink = probe.receive
         d.hooks.cliStarted = { key, proc in probe.started(key, proc) }
         for iteration in 0..<3 {
             let req = askStateRequest("gemini", 5000 + iteration, dir)
@@ -137,14 +164,14 @@ func testAskStateParallel() {
         for iteration in 0..<3 {
             let d = AppDelegate(), probe = AskStateProbe()
             let entered = DispatchSemaphore(value: 0), release = DispatchSemaphore(value: 0)
-            d.jsSink = probe.receive; d.hooks.cliExecutable = path
+            d.hooks.jsSink = probe.receive; d.hooks.cliExecutable = path
             d.hooks.cliStarted = { key, proc in
-                probe.started(key, proc); entered.signal(); _ = release.wait(timeout: .now() + 8)
+                probe.started(key, proc); entered.signal(); _ = release.wait(timeout: .now() + testHoldLimit)
             }
             let a = askStateRequest("gemini", 6000 + iteration * 2, dir)
             let b = askStateRequest("gemini", 6001 + iteration * 2, dir)
             d.ask(a); d.ask(b)
-            let bothStarted = entered.wait(timeout: .now() + 5) == .success && entered.wait(timeout: .now() + 5) == .success
+            let bothStarted = waitSignal(entered) && waitSignal(entered)
             check(bothStarted, "双请求都已启动，固定在接手前")
             if stopAll { d.cancel(agent: "gemini") } else { d.cancel(agent: "gemini", reqId: a.reqId) }
             check(testAskState(d, a.key)?.cancelled == true, "A 已停止")
@@ -169,7 +196,7 @@ func testAskStateFallback() {
         try! mode.write(toFile: dir + "/mode", atomically: true, encoding: .utf8)
         for stage in ["exited", "unregistered"] {
             let d = AppDelegate(), probe = AskStateProbe()
-            d.jsSink = probe.receive; d.hooks.cliExecutable = path; d.partialSupport[path] = true
+            d.hooks.jsSink = probe.receive; d.hooks.cliExecutable = path; d.partialSupport[path] = true
             d.hooks.cliStarted = { key, proc in probe.started(key, proc) }
             for iteration in 0..<3 {
                 let req = askStateRequest(agent, 7000 + iteration, dir)
@@ -201,7 +228,7 @@ func testAskStateWarmRetry() {
     for agent in ["claude", "gpt", "gemini"] {
         for stopBeforeRetry in [true, false] {
             let d = AppDelegate(), probe = AskStateProbe()
-            d.jsSink = probe.receive; d.hooks.cliExecutable = path; d.partialSupport[path] = true
+            d.hooks.jsSink = probe.receive; d.hooks.cliExecutable = path; d.partialSupport[path] = true
             d.hooks.cliStarted = { key, proc in probe.started(key, proc) }
             for iteration in 0..<3 {
                 let req = askStateRequest(agent, 8000 + iteration, dir)
@@ -235,7 +262,7 @@ func testAskStateWarmRetry() {
 
 func testAskStateNoProcess() {
     print("· AskState：DeepSeek 无独立进程及 runCLI 自有临时记录")
-    let d = AppDelegate(); d.jsSink = { _, _ in }
+    let d = AppDelegate(); d.hooks.jsSink = { _, _ in }
     for iteration in 0..<5 {
         let req = askStateRequest("deepseek", 9000 + iteration, "")
         withTestAsk(d, req.key) {
@@ -277,10 +304,4 @@ func testAskStateLifecycle() {
     testAskStateFallback()
     testAskStateWarmRetry()
     testAskStateNoProcess()
-}
-
-func runAskStateTests() -> Never {
-    testAskStateLifecycle()
-    print(failures == 0 ? "AskState 全部通过（\(checks) 项）" : "AskState：\(failures) / \(checks) 项没通过")
-    exit(failures == 0 ? 0 : 1)
 }

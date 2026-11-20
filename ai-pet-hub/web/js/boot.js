@@ -40,7 +40,7 @@ makeDragRegion(els.stage, true);
 
 els.chatStack.addEventListener('click', e => {
   const shot = e.target.closest('.msg-img, .msg-imgref');
-  if (shot && shot._image) { openImageViewer(shot._image); return; }
+  if (shot && shot._image) { openImageViewer(shot._image, shot.closest('.msg.user')?._run?.sentPaths?.[shot._image.path]); return; }
   const chip = e.target.closest('.file-chip');
   if (chip) { previewFromTurn(chip.dataset.path, chip.closest('.turn')); return; }
   const link = e.target.closest('.ext-link');
@@ -49,7 +49,7 @@ els.chatStack.addEventListener('click', e => {
   if (fileRow) {
     const turnEl = fileRow.closest('.turn');
     const f = turnEl._files[Number(fileRow.dataset.index)];
-    if (f) openPreview({ path: f.path, base: turnEl.dataset.cwd, diff: f.diff || '' });
+    if (f) openPreview({ path: f.path, base: turnEl.dataset.cwd, diff: f.diff || '', change: f });
     return;
   }
   const head = e.target.closest('.step-head');
@@ -79,13 +79,26 @@ els.wsCrumb.addEventListener('click', () => {
   const ws = wsKey(S[active].workspace);
   if (ws) postNative('openFolder', { path: ws });
 });
+// 同一来源的其他窗口读完或删掉了一条，只同步未读；当前聊天页仍由自己的载入请求决定。
+const unreadUpdates = new Set();
+window.addEventListener('storage', e => {
+  const id = ALL_AGENT_IDS.find(id => e.key?.startsWith('aihub_'+id+'_unread:') || e.key === 'aihub_'+id+'_unread');
+  if (!id || unreadUpdates.has(id)) return;
+  unreadUpdates.add(id);
+  requestAnimationFrame(() => {
+    unreadUpdates.delete(id);
+    S[id].unreadConvs = readUnreadConversations(id);
+    refreshUnread(id);
+    renderHistory(id);
+  });
+});
 // 切回窗口时顺手刷新历史列表（在别处新建的会话也能看到）
 let lastAutoRefresh = Date.now();
 window.addEventListener('focus', () => {
   if (Date.now() - lastAutoRefresh < 15000) return;
   lastAutoRefresh = Date.now();
   AGENT_IDS.forEach(id => {
-    postNative('listConversations', { agent: id });
+    refreshHistory(id);
     // 打开着的会话也重新读一遍（在终端里接着聊过的话，这里会同步过来）
     const st = S[id];
     if (st.conversationId && st.loadedId === st.conversationId && !viewBusy(id)) {
@@ -139,6 +152,7 @@ els.input.addEventListener('keydown', e => {
 });
 
 document.addEventListener('keydown', e => {
+  if (!welcome.hidden) return;
   if (e.key === 'Escape' && imageViewer) { closeImageViewer(); return; }
   if (e.key === 'Escape' && pop) { closePopover(); return; }
   if (e.key === 'Escape' && document.body.classList.contains('preview-max')) {
@@ -183,9 +197,10 @@ setInterval(() => {
 }, 1000);
 setInterval(renderAllHistory, 60000);   // 刷新「几分钟前」
 
+ALL_AGENT_IDS.forEach(recoverReadyFiles);
 setDraft(active, S[active].draft || '');   // 启动时恢复上次没发出去的草稿
 autosize();
-setActive(active, true);
+setActive(active, true, false);
 AGENT_IDS.forEach(id => {
   postNative('listConversations', { agent: id });
   if (S[id].conversationId) postNative('loadConversation', { agent: id, conversationId: S[id].conversationId });

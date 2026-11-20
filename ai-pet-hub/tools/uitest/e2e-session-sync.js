@@ -1,7 +1,6 @@
 // 不用 CLI：会话同步、图片重试/编辑、实时轮身份、队列顺序、旧页面响应。
 // tools/uitest/run.sh claude e2e-session-sync.js
-const {out, check, finish} = makeSuite('session-sync');
-const test = async (name, f) => { try { await f(); } catch (e) { check(name, false, String(e.message || e) + '\n' + String(e.stack || '')); } };
+const {out, check, section, finish} = makeSuite('session-sync');
 const sent = [], originalPost = postNative;
 postNative = (action, payload = {}) => {
   if (action === 'loadConversation' && !payload.reqId) payload = { ...payload, reqId: nextRequestId() };
@@ -31,7 +30,7 @@ const sync = messages => {
 const runNow = () => [...st.runs.values()][0];
 const asks = () => sent.filter(x => x.action === 'askAgent');
 
-await test('F03', () => {
+await section('F03', () => {
   reset(); loaded([u('old'), b('abcdef')]);
   const reqId = nextRequestId();
   postNative('loadConversation', { agent: id, conversationId: 'fixture', sync: true, reqId });
@@ -41,7 +40,7 @@ await test('F03', () => {
   check('F03 切会话后相同形状的历史正常显示', box.textContent.includes('uvwxyz') && !box.querySelector('.chat-empty'), box.textContent);
 });
 
-await test('F02', () => {
+await section('F02', () => {
   reset();
   const old = [u('first'), b('stable'), u('last'), b('partial', [{ kind: 'command', title: 'cmd', status: 'running', output: 'a' }])];
   loaded(old);
@@ -59,7 +58,7 @@ await test('F02', () => {
 });
 
 // 完成回调真实创建末轮，再模拟迟到的 CLI 记录对账；保护节点和重试按钮。
-await test('刚答完的末轮对账', () => {
+await section('刚答完的末轮对账', () => {
   reset(); loaded([u('前一问'), b('前一答')]);
   startRun(id, '本轮问题', []); const run = runNow();
   window.onAgentResponse({agent:id,reqId:run.reqId,conversationId:st.conversationId,reply:'⚠️ 本轮已停止',cancelled:true});
@@ -73,7 +72,7 @@ await test('刚答完的末轮对账', () => {
   check('同步后消息没有重复', box.querySelectorAll('.msg.user,.msg.bot.turn').length === 4, box.querySelectorAll('.msg.user,.msg.bot.turn').length);
 });
 
-await test('失败结局和 checkpoint', () => {
+await section('失败结局和 checkpoint', () => {
   reset(); loaded([u('前一问'), b('前一答')]);
   startRun(id, '再试这句', []); const run = runNow();
   window.onAgentResponse({agent:id, reqId:run.reqId, conversationId:st.conversationId, reply:'已有的半句', outcome:'failed'});
@@ -87,14 +86,16 @@ await test('失败结局和 checkpoint', () => {
     note?.previousElementSibling?._text === '旧答' && note?.nextElementSibling?.textContent.includes('新问'));
 });
 
-await test('补充回读只核对本轮', () => {
+await section('补充回读只核对本轮', () => {
   reset();
   const history = [u('旧问'), b('旧答')];
   loaded(history);
   startRun(id, '/compact', []);
-  window.onAgentResponse({agent:id,reqId:runNow().reqId,conversationId:st.conversationId,reply:'压缩提示'});
+  // Claude 手动压缩、Gemini 压缩压成了在记录里都有一条压缩提示（和原生读历史一致），原生回答里带 compacted
+  const recorded = id === 'gemini' || id === 'claude';
+  window.onAgentResponse({agent:id,reqId:runNow().reqId,conversationId:st.conversationId,reply:'压缩提示', ...(recorded ? {compacted:true} : {})});
   const note = box.querySelector('.compact-note');
-  if (id === 'gemini') history.push({role:'compact', text:'已压缩上下文'});
+  if (recorded) history.push({role:'compact', text:'已压缩上下文'});
   for (const cancelled of [false, true]) {
     const question = cancelled ? '这轮叫停' : '正常完成';
     startRun(id, question, []); const run = runNow(); run.steered = true;
@@ -110,7 +111,7 @@ await test('补充回读只核对本轮', () => {
   }
 });
 
-await test('F05', () => {
+await section('F05', () => {
   reset(); const text = 'look /tmp/fixture.png';
   const el = appendMessage(id, 'user', text); requestMessageImages(el, text, '');
   const req = sent.find(x => x.action === 'chatThumbs');
@@ -120,7 +121,7 @@ await test('F05', () => {
   check('F05 缩略图到达后仍可编辑原文', !!el.querySelector('.msg-img') && !!el.querySelector('.msg-edit') && els.input.value === text, { before: !!edit, after: !!el.querySelector('.msg-edit'), input: els.input.value });
 });
 
-for (const text of ['', 'describe image']) await test('F06 ' + text, () => {
+for (const text of ['', 'describe image']) await section('F06 ' + text, () => {
   reset(); const images = ['/tmp/original.png']; startRun(id, text, images);
   const run = runNow(); images.push('/tmp/mutated.png');
   check('F06 请求独立保存原附件 ' + JSON.stringify(text), JSON.stringify(run.images) === '["/tmp/original.png"]', run.images);
@@ -132,7 +133,7 @@ for (const text of ['', 'describe image']) await test('F06 ' + text, () => {
   check('F06 重试不消耗输入框附件 ' + JSON.stringify(text), st.attach[0]?.path === '/tmp/draft.png', st.attach);
 });
 
-await test('F10', () => {
+await section('F10', () => {
   reset(); const previous = [u('repeat'), b('previous answer')]; renderMessages(id, previous);
   startRun(id, 'repeat', []); renderMessages(id, previous);
   check('F10 本轮尚未写入记录时保留旧同句回答', box.textContent.includes('previous answer') && box.children.length === 4, box.textContent);
@@ -148,7 +149,7 @@ await test('F10', () => {
   check('F10 加载更早历史后仍按绝对起始位置接回', box.textContent.includes('previous answer') && !box.textContent.includes('history partial'), box.textContent);
 });
 
-await test('F15', () => {
+await section('F15', () => {
   reset(); startRun(id, 'working', []); const run = runNow();
   ['first', 'held', 'second'].forEach(text => queueMessage(id, text));
   run.queue.forEach(q => setQueuedState(q, q.text === 'held' ? 'sent' : 'waiting'));
@@ -162,7 +163,7 @@ await test('F15', () => {
   check('F15 renderMessages 接回顺序符合队列', JSON.stringify(order()) === expected, order());
 });
 
-await test('N10', async () => {
+await section('N10', async () => {
   reset();
   let read; const promise = readLocalFile('/tmp/new', '').then(d => { read = d; });
   const req = sent.find(x => x.action === 'readFile');

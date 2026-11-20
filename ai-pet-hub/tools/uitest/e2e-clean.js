@@ -1,10 +1,8 @@
 // 模拟一台干净的机器（用 tools/uitest/clean-machine.sh 跑：空的主目录、最小的 PATH）。MODEL 传进来的是场景：
 //   none：一个 CLI 都没装；path：装在登录 shell 的 PATH 里（像 nvm 那样），但都没登录。
-const sleep = ms => new Promise(r => setTimeout(r, ms));
-const until = async (cond, ms, what) => { const t0 = Date.now(); while (Date.now() - t0 < ms) { const v = cond(); if (v) return v; await sleep(200); } throw new Error('等不到：' + what); };
-const out = { steps: [], ok: true, errors: [], scene: MODEL };
+const { out, check, until, finish } = makeSuite('clean-' + MODEL);
+out.scene = MODEL; out.errors = [];
 window.addEventListener('error', e => out.errors.push(String(e.message) + ' @' + (e.filename || '').split('/').pop() + ':' + e.lineno));
-const check = (name, pass, got) => { out.steps.push(`${pass ? '✓' : '✗'} ${name}：${JSON.stringify(got)}`); if (!pass) out.ok = false; };
 const verify = id => new Promise(res => {
   const prev = window.onAgentVerified;
   window.onAgentVerified = d => { if (d.agent === id) { window.onAgentVerified = prev; res(d); } else prev && prev(d); };
@@ -12,11 +10,10 @@ const verify = id => new Promise(res => {
   setTimeout(() => res({ timeout: true }), 115000);
 });
 try {
-  await sleep(1500);
   check('页面起来了，四位都认得', ALL_AGENT_IDS.join() === 'gemini,claude,gpt,deepseek', ALL_AGENT_IDS);
   openWelcome();
-  await until(() => ALL_AGENT_IDS.every(id => agentProbe[id]), 30000, '检测完');
-  await sleep(400);
+  await until(() => ALL_AGENT_IDS.every(id => agentProbe[id]), '检测完');
+  await until(() => document.querySelectorAll('#welcome .wl-agent').length === 4, '引导页列出四位');
   const states = Object.fromEntries(ALL_AGENT_IDS.map(id => [id, agentProbe[id]]));
   const rows = [...document.querySelectorAll('#welcome .wl-agent')].map(r => r.textContent.trim());
   const hows = [...document.querySelectorAll('#welcome .wl-how')].map(r => r.textContent.trim().slice(0, 60));
@@ -29,7 +26,9 @@ try {
     check('引导页：没装的标「没有装」并带安装说明，装了的标「已找到」', rows.length === 4 && hows.length === missing.length
       && ALL_AGENT_IDS.every((id, i) => rows[i].includes(agentProbe[id].found ? '已找到' : '没有装')), { rows, hows });
     const note = document.querySelector('#welcome .wl-note').textContent;
-    check('底部提示和找到的个数对得上', missing.length === 4 ? note.includes('一位都没找到') : note.includes(`${4 - missing.length} 位`), note);
+    // 启动时的检测比 openWelcome 先回来就已经存好了名单，这时提示说名单不变
+    check('底部提示和找到的个数对得上', missing.length === 4 ? note.includes('一位都没找到')
+      : lsGet('enabled_agents') ? note.includes('启用名单不变') : note.includes(`${4 - missing.length} 位`), note);
   } else {
     check('四位都找到了（在登录 shell 的 PATH 里，或 App 自带的）', ALL_AGENT_IDS.every(id => agentProbe[id].found && (agentProbe[id].path.includes('/fakebin/') || inApp(id))), states);
     check('引导页四位都标「已找到」', rows.length === 4 && rows.every(t => t.includes('已找到')) && hows.length === 0, rows);
@@ -38,14 +37,18 @@ try {
   // 选「保守」再开始
   document.querySelector('#welcome .wl-opt[data-safe="1"]').click();
   document.querySelector('#welcome .wl-go').click();
-  await sleep(800);
+  await until(() => document.getElementById('welcome').hidden, '引导页关掉');
   check('引导页关掉了，记住看过', document.getElementById('welcome').hidden && lsGet('welcomed') === '1', { hidden: document.getElementById('welcome').hidden });
   check('权限换成了各位的保守档', ALL_AGENT_IDS.every(id => S[id].perm === AGENTS[id].safePerm), Object.fromEntries(ALL_AGENT_IDS.map(id => [id, S[id].perm])));
   if (MODEL === 'none') check('只启用找到的那几位（一位都没有就保持默认三位）', AGENT_IDS.join() === (ALL_AGENT_IDS.filter(id => agentProbe[id].found).join() || 'gemini,claude,gpt'), AGENT_IDS);
   else check('四位都启用', AGENT_IDS.join() === 'gemini,claude,gpt,deepseek' && document.querySelectorAll('.hist-section').length === 4, AGENT_IDS);
   // 历史：没有任何数据目录时也不出错，列表是空的
+  // 启动时那批回包早就把 conversations 设成数组了，只看数组会立刻放行；要等的是这里刚发出去的这批回包
+  const listedNow = new Set(), onListed = window.onConversationsListed;
+  window.onConversationsListed = d => { listedNow.add(d.agent); return onListed(d); };
   AGENT_IDS.forEach(id => postNative('listConversations', { agent: id }));
-  await sleep(4000);
+  try { await until(() => AGENT_IDS.every(id => listedNow.has(id)), '历史列表都回来了'); }
+  finally { window.onConversationsListed = onListed; }
   check('历史列表都是空的、没报错', AGENT_IDS.every(id => Array.isArray(S[id].conversations) && S[id].conversations.length === 0), Object.fromEntries(AGENT_IDS.map(id => [id, (S[id].conversations || 'null').length])));
   // 桌宠的图都在包里
   const imgs = AGENT_IDS.map(id => [id, pets[id].front.naturalWidth]);
@@ -63,11 +66,11 @@ try {
   // 发一句话：没装 / 没登录时，回答里是一句能看懂的提示，不是一直转圈
   setActive('claude'); S.claude.model = 'haiku';
   els.input.value = '只回复：甲'; send();
-  await until(() => !isBusy('claude') && S.claude.msgEl.querySelector('.msg.bot'), 120000, '回答结束');
-  await sleep(600);
+  await until(() => !isBusy('claude') && S.claude.msgEl.querySelector('.msg.bot'), '回答结束');
+  await until(() => S.claude.msgEl.querySelector('.msg.bot:last-child')?.textContent.trim(), '回答有文字');
   const reply = (S.claude.msgEl.querySelector('.msg.bot:last-child')?.textContent || '').replace(/\s+/g, ' ').slice(0, 200);
   check('没装 / 没登录时发话：给出提示，不卡住', reply.includes('⚠️') && /登录|login|api key|找到/i.test(reply) && !reply.includes('reclaude'), reply);
   await realShot('after-' + MODEL);
   check('没有脚本报错', out.errors.length === 0, out.errors);
-} catch (e) { out.ok = false; out.error = String(e) + ' | ' + String(e && e.stack).slice(0, 300); }
-return out;
+} catch (e) { out.error = String(e) + ' | ' + String(e && e.stack).slice(0, 300); }
+return finish();

@@ -1,11 +1,14 @@
 #!/usr/bin/env python3
-"""e2e-lifecycle.js 的外部观察器：各阶段独立 App，按 PID 证明停止和退出无残留。"""
+"""e2e-lifecycle.js 的外部观察器：各阶段独立 App，按 PID 证明停止和退出无残留。
+
+python3 tools/uitest/lifecycle.py [agent] [模型] [秒数] [--exit-only]
+--exit-only 只跑 exit-automatic、exit-signal 两段，辅助 CLI 是 fake-cli.py 的 exit-pending，不花模型额度。
+"""
 import importlib.util
 import json
 import os
 from pathlib import Path
 import shlex
-import shutil
 import signal
 import subprocess
 import sys
@@ -29,19 +32,6 @@ def fixture(path, behavior, real=None):
         text += 'exec ' + shlex.join(command) + ' "$@"\n'
     path.write_text(text)
     path.chmod(0o755)
-
-
-def real_claude():
-    forced = os.environ.get('AIPETHUB_CLAUDE')
-    if forced:
-        return [forced]
-    reclaude = Path.home() / '.local/bin/reclaude'
-    if reclaude.is_file():
-        return [str(reclaude), 'cli']
-    found = shutil.which('claude')
-    if not found:
-        raise RuntimeError('找不到真实 Claude CLI，无法验证辅助探测超时')
-    return [found]
 
 
 def phase(directory, name, agent, model, seconds, helper=None):
@@ -161,7 +151,7 @@ def main():
         if not exit_only:
             results['main'] = phase(directory / 'aipethub-uitest.main', 'main', agent, model, seconds)
             helper = directory / 'hung-help'
-            fixture(helper, 'hung-tree', real_claude())
+            fixture(helper, 'hung-tree', runner_tools.real_claude())
             results['helper'] = phase(directory / 'aipethub-uitest.helper', 'helper', 'claude', 'haiku', 130, helper)
         for name in ['exit-automatic', 'exit-signal']:
             helper = directory / (name + '-cli')

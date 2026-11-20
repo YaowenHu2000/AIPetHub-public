@@ -7,7 +7,7 @@ function renderComposer() {
   const c = AGENTS[active];
   const st = S[active];
   const m = find(c.models, st.model);
-  const e = find(c.efforts, st.effort);
+  const e = find(modelEfforts(active, m), st.effort);
   els.chipModel.innerHTML = `<span class="chip-label"></span><span class="chip-sub"></span>${UI.caret}`;
   els.chipModel.querySelector('.chip-label').textContent = m.name;
   const fast = fastOn(active);
@@ -43,11 +43,12 @@ function chooseModel(id, v, effort) {
   lsSet(`${id}_model`, v);
   lsSet(`${id}_efforts`, JSON.stringify(st.effortByModel));
   if (id === active) renderComposer();
-  if (changed) pets[id].say(`${m.name} · ${find(AGENTS[id].efforts, e).name}`, 1800);
+  if (changed) pets[id].say(`${m.name} · ${find(modelEfforts(id, m), e).name}`, 1800);
 }
 
 function setWorkspace(id, path, announce = true) {
   S[id].workspace = path || '';
+  syncReturnedDraft(id);
   lsSet(`${id}_workspace`, S[id].workspace);
   if (id === active) renderHeader();
   renderHistory(id);
@@ -209,7 +210,7 @@ function openPermPopover() {
     return [{ title: '权限模式', items: AGENTS[id].perms.map(p => ({ name: p.name, desc: p.desc, selected: p.v === S[id].perm,
       onPick: () => updateSetting(id, 'perm', p.v, `权限模式：${p.name}`) })) },
     // 三位共用的开关：不做网页时可以关掉，每轮少带一组工具的说明（省一点上下文）
-    { title: '内置浏览器工具', items: [
+    id === 'deepseek' ? { title: '内置浏览器工具 · 暂不支持', items: [] } : { title: '内置浏览器工具', items: [
       { name: '带上', desc: '智能体能自己打开网页、截图、看控制台', selected: on, onPick: () => setTools(true) },
       { name: '不带', desc: '不做网页时可以关掉，省一点上下文', selected: !on, onPick: () => setTools(false) }] }];
   });
